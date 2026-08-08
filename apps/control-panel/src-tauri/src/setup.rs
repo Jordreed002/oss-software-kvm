@@ -218,7 +218,7 @@ impl SetupService {
             .take(8)
             .collect();
         let discovery =
-            NearbyDiscovery::start(&stored.draft_peer_id, discovery_addresses, KVM_PORT).ok();
+            NearbyDiscovery::start(&stored.draft_peer_id, &discovery_addresses, KVM_PORT).ok();
         if let Some(discovery) = &discovery {
             let advertised_name = stored
                 .local

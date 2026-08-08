@@ -70,12 +70,13 @@ struct Advertisement {
 pub(crate) struct NearbyDiscovery {
     socket: UdpSocket,
     peer_id: String,
+    runtime_port: u16,
     advertised: Mutex<Option<Advertisement>>,
     records: Mutex<BTreeMap<String, NearbyRecord>>,
 }
 
 impl NearbyDiscovery {
-    pub(crate) fn start(peer_id: &str, addresses: Vec<IpAddr>, _port: u16) -> Result<Self, ()> {
+    pub(crate) fn start(peer_id: &str, addresses: &[IpAddr], runtime_port: u16) -> Result<Self, ()> {
         if !valid_peer_id(peer_id)
             || addresses.is_empty()
             || addresses.len() > 8
@@ -83,6 +84,7 @@ impl NearbyDiscovery {
                 .iter()
                 .copied()
                 .any(|address| !private_address(address))
+            || runtime_port == 0
         {
             return Err(());
         }
@@ -92,6 +94,7 @@ impl NearbyDiscovery {
         Ok(Self {
             socket,
             peer_id: peer_id.to_owned(),
+            runtime_port,
             advertised: Mutex::new(None),
             records: Mutex::new(BTreeMap::new()),
         })
@@ -142,7 +145,9 @@ impl NearbyDiscovery {
         for _ in 0..MAX_RECEIVE_DRAIN {
             match self.socket.recv_from(&mut buffer) {
                 Ok((length, source)) => {
-                    if let Some(record) = parse_beacon(&buffer[..length], source, now) {
+                    if let Some(record) =
+                        parse_beacon(&buffer[..length], source, self.runtime_port, now)
+                    {
                         if record.peer_id != self.peer_id
                             && (records.contains_key(&record.peer_id)
                                 || records.len() < MAX_NEARBY_MACHINES)
@@ -194,7 +199,12 @@ fn encode_beacon(peer_id: &str, state: &AdvertisementState) -> String {
     )
 }
 
-fn parse_beacon(bytes: &[u8], source: SocketAddr, now: Instant) -> Option<NearbyRecord> {
+fn parse_beacon(
+    bytes: &[u8],
+    source: SocketAddr,
+    runtime_port: u16,
+    now: Instant,
+) -> Option<NearbyRecord> {
     if bytes.is_empty() || bytes.len() > MAX_BEACON_BYTES || !private_address(source.ip()) {
         return None;
     }
@@ -230,7 +240,7 @@ fn parse_beacon(bytes: &[u8], source: SocketAddr, now: Instant) -> Option<Nearby
         name: name.to_owned(),
         platform: platform.to_owned(),
         presence,
-        address: SocketAddr::new(source.ip(), 24_800),
+        address: SocketAddr::new(source.ip(), runtime_port),
         last_seen: now,
     })
 }
@@ -278,6 +288,7 @@ mod tests {
         let parsed = parse_beacon(
             encoded.as_bytes(),
             "192.168.1.20:24801".parse().unwrap(),
+            24_800,
             Instant::now(),
         )
         .unwrap();
@@ -287,12 +298,14 @@ mod tests {
         assert!(parse_beacon(
             format!("{encoded}extra\n").as_bytes(),
             "192.168.1.20:24801".parse().unwrap(),
+            24_800,
             Instant::now(),
         )
         .is_none());
         assert!(parse_beacon(
             encoded.as_bytes(),
             "203.0.113.20:24801".parse().unwrap(),
+            24_800,
             Instant::now(),
         )
         .is_none());
