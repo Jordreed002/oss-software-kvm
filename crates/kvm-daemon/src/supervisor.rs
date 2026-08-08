@@ -188,10 +188,15 @@ impl fmt::Debug for PeerSessionSupervisorError {
             Self::InvalidBoundEvent => "InvalidBoundEvent",
             Self::Workspace(_) => "Workspace",
         };
-        formatter
-            .debug_struct("PeerSessionSupervisorError")
-            .field("kind", &kind)
-            .finish_non_exhaustive()
+        let mut debug = formatter.debug_struct("PeerSessionSupervisorError");
+        debug.field("kind", &kind);
+        match self {
+            Self::Generation(error) => debug.field("detail", error),
+            Self::Coordinator(error) => debug.field("detail", error),
+            Self::Workspace(error) => debug.field("detail", error),
+            Self::Unavailable | Self::NoActiveGeneration | Self::InvalidBoundEvent => &mut debug,
+        };
+        debug.finish_non_exhaustive()
     }
 }
 

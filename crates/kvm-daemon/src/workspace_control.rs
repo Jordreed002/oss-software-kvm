@@ -51,10 +51,20 @@ impl fmt::Debug for WorkspaceControlError {
             Self::InvalidConfiguration => "InvalidConfiguration",
             Self::Topology(_) => "Topology",
         };
-        formatter
-            .debug_struct("WorkspaceControlError")
-            .field("kind", &kind)
-            .finish()
+        let mut debug = formatter.debug_struct("WorkspaceControlError");
+        debug.field("kind", &kind);
+        match self {
+            Self::Inventory(error) => debug.field("detail", error),
+            Self::DeviceInventory(error) => debug.field("detail", error),
+            Self::Pointer(error) => debug.field("detail", error),
+            Self::Coordinator(error) => debug.field("detail", error),
+            Self::Topology(error) => debug.field("detail", error),
+            Self::WrongPointerPeer
+            | Self::AlreadyAttached
+            | Self::Unavailable
+            | Self::InvalidConfiguration => &mut debug,
+        };
+        debug.finish()
     }
 }
 
