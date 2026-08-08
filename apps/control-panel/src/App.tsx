@@ -60,7 +60,9 @@ function App() {
     if (!snapshot?.local) return "Identity needed";
     if (!snapshot.peer) return "Waiting for peer";
     if (!snapshot.validated) return "Needs validation";
-    return snapshot.runtime === "running" ? "Connected mode" : "Ready to start";
+    if (snapshot.runtime === "running") return "Connected mode";
+    if (snapshot.runtime === "faulted") return "Needs attention";
+    return "Ready to start";
   }, [snapshot]);
 
   if (!snapshot) return <Loading error={error} />;
@@ -159,6 +161,7 @@ function DisplayTile({ label, name, display, local = false }: { label: string; n
 
 function ReadyStep({ snapshot, busy, onValidate, onStart, onStop }: { snapshot: SetupSnapshot; busy: string | null; onValidate: () => void; onStart: () => void; onStop: () => void }) {
   const running = snapshot.runtime === "running";
+  const runtimeFault = snapshot.runtime === "faulted" ? runtimeFaultMessage(snapshot.runtimeFault) : null;
   return <div className="step-content enter">
     <SectionHeading number="04" kicker="ACTIVATE" title={running ? "Your desk is linked." : "One last safety check."} copy={running ? "Pointer and keyboard routing are active. Closing this console does not terminate the runtime." : "Validate identities, certificates, network addresses, topology, and file protections before capture can start."} />
     <div className="checklist">
@@ -167,9 +170,20 @@ function ReadyStep({ snapshot, busy, onValidate, onStart, onStop }: { snapshot: 
       <CheckRow label="Display topology" detail="Bidirectional edge link configured" good={snapshot.configured}/>
       <CheckRow label="Runtime validation" detail={snapshot.validated ? "All safety checks passed" : "Not checked yet"} good={snapshot.validated}/>
     </div>
+    {runtimeFault && <div className="error-banner"><CircleAlert size={18}/><div><strong>{runtimeFault.title}</strong><br/><span>{runtimeFault.detail}</span></div></div>}
     {snapshot.setupDirectory && <div className="path-note"><span>Setup stored securely</span><code>{snapshot.setupDirectory}</code></div>}
+    {runtimeFault && snapshot.runtimeLogPath && <div className="path-note"><span>Private diagnostic log</span><code>{snapshot.runtimeLogPath}</code></div>}
     {!snapshot.validated ? <PrimaryButton busy={busy === "validate"} onClick={onValidate}>Validate this setup</PrimaryButton> : running ? <button className="stop-button" disabled={!!busy} onClick={onStop}><Square size={16} fill="currentColor"/> Stop routing safely</button> : <PrimaryButton busy={busy === "start"} onClick={onStart}><Play size={17} fill="currentColor"/> Start Software KVM</PrimaryButton>}
   </div>;
+}
+
+function runtimeFaultMessage(fault: SetupSnapshot["runtimeFault"]) {
+  switch (fault) {
+    case "native_capture": return { title: "Native input capture stopped.", detail: "Check Accessibility and Input Monitoring permissions, then try again." };
+    case "authenticated_transport": return { title: "The authenticated peer link stopped.", detail: "Keep both computers on the same Wi-Fi and start Software KVM on both." };
+    case "runtime_task": return { title: "A runtime service stopped unexpectedly.", detail: "The diagnostic log contains the coarse failure category." };
+    default: return { title: "Software KVM stopped unexpectedly.", detail: "Open the private diagnostic log shown below for the failure category." };
+  }
 }
 
 function CheckRow({ label, detail, good }: { label: string; detail: string; good: boolean }) { return <div className="check-row"><span className={good ? "good" : "pending"}>{good ? <Check size={16}/> : "·"}</span><div><strong>{label}</strong><small>{detail}</small></div><em>{good ? "READY" : "PENDING"}</em></div>; }

@@ -4,7 +4,7 @@
 
 use std::collections::HashSet;
 use std::fs;
-use std::io::Write;
+use std::io::{Read, Write};
 use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -34,12 +34,15 @@ const CERT_FILE: &str = "local.der";
 const KEY_FILE: &str = "local-key.pk8";
 const TRUST_FILE: &str = "selected-peer.der";
 const CONTROL_FILE: &str = "runtime.control";
+const RUNTIME_LOG_FILE: &str = "runtime.log";
+const MAX_RUNTIME_LOG_READ: u64 = 16 * 1024;
 
 #[derive(Debug)]
 pub(crate) struct SetupService {
     directory: PathBuf,
     inner: Mutex<StoredSetup>,
     runtime: Mutex<Option<Child>>,
+    last_runtime_fault: Mutex<Option<RuntimeFault>>,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -136,6 +139,15 @@ enum RuntimeState {
     Faulted,
 }
 
+#[derive(Clone, Copy, Debug, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum RuntimeFault {
+    NativeCapture,
+    AuthenticatedTransport,
+    RuntimeTask,
+    Unknown,
+}
+
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct SetupSnapshot {
@@ -149,6 +161,8 @@ pub(crate) struct SetupSnapshot {
     configured: bool,
     validated: bool,
     runtime: RuntimeState,
+    runtime_fault: Option<RuntimeFault>,
+    runtime_log_path: Option<String>,
     setup_directory: Option<String>,
     profile_path: Option<String>,
 }
@@ -173,6 +187,7 @@ impl SetupService {
             directory,
             inner: Mutex::new(stored),
             runtime: Mutex::new(None),
+            last_runtime_fault: Mutex::new(None),
         })
     }
 
@@ -183,19 +198,23 @@ impl SetupService {
 
     fn snapshot(&self) -> Result<SetupSnapshot, ()> {
         let mut runtime = self.runtime.lock().map_err(|_| ())?;
+        let mut last_fault = self.last_runtime_fault.lock().map_err(|_| ())?;
         let runtime_state = match runtime.as_mut() {
             Some(child) => match child.try_wait().map_err(|_| ())? {
                 None => RuntimeState::Running,
                 Some(status) if status.success() => {
                     *runtime = None;
+                    *last_fault = None;
                     RuntimeState::Stopped
                 }
                 Some(_) => {
                     *runtime = None;
+                    *last_fault = Some(read_runtime_fault(&self.directory));
                     RuntimeState::Faulted
                 }
             },
             None if runtime_lock_held(&self.directory) => RuntimeState::Running,
+            None if last_fault.is_some() => RuntimeState::Faulted,
             None => RuntimeState::Stopped,
         };
         let setup = self.inner.lock().map_err(|_| ())?.clone();
@@ -221,6 +240,13 @@ impl SetupService {
             configured: setup.configured,
             validated: setup.validated,
             runtime: runtime_state,
+            runtime_fault: *last_fault,
+            runtime_log_path: setup.configured.then(|| {
+                self.directory
+                    .join(RUNTIME_LOG_FILE)
+                    .to_string_lossy()
+                    .into_owned()
+            }),
             setup_directory: setup
                 .configured
                 .then(|| self.directory.to_string_lossy().into_owned()),
@@ -428,13 +454,24 @@ pub(crate) fn start_runtime(service: State<'_, SetupService>) -> Result<SetupSna
     let binary = runtime_binary().ok_or_else(coarse_error)?;
     let control = service.directory.join(CONTROL_FILE);
     secure_write(&control, b"run\n", true).map_err(|()| coarse_error())?;
+    let log_path = service.directory.join(RUNTIME_LOG_FILE);
+    secure_write(&log_path, b"", true).map_err(|()| coarse_error())?;
+    let stdout_log = fs::OpenOptions::new()
+        .append(true)
+        .open(&log_path)
+        .map_err(|_| coarse_error())?;
+    let stderr_log = stdout_log.try_clone().map_err(|_| coarse_error())?;
+    *service
+        .last_runtime_fault
+        .lock()
+        .map_err(|_| coarse_error())? = None;
     let child = Command::new(binary)
         .arg("run-managed")
         .arg(service.directory.join(PROFILE_FILE))
         .arg(control)
         .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stdout(Stdio::from(stdout_log))
+        .stderr(Stdio::from(stderr_log))
         .spawn()
         .map_err(|_| coarse_error())?;
     *active = Some(child);
@@ -470,6 +507,10 @@ pub(crate) fn stop_runtime(service: State<'_, SetupService>) -> Result<SetupSnap
         }
     }
     *active = None;
+    *service
+        .last_runtime_fault
+        .lock()
+        .map_err(|_| coarse_error())? = None;
     drop(active);
     service.snapshot().map_err(|()| coarse_error())
 }
@@ -633,6 +674,29 @@ fn peer_dto(peer: PairingBundle) -> PeerIdentityDto {
 }
 fn coarse_error() -> String {
     "setup operation failed safely".to_owned()
+}
+
+fn read_runtime_fault(directory: &Path) -> RuntimeFault {
+    let Ok(file) = fs::File::open(directory.join(RUNTIME_LOG_FILE)) else {
+        return RuntimeFault::Unknown;
+    };
+    let mut message = String::new();
+    if file
+        .take(MAX_RUNTIME_LOG_READ)
+        .read_to_string(&mut message)
+        .is_err()
+    {
+        return RuntimeFault::Unknown;
+    }
+    if message.contains("native capture lifecycle failed") {
+        RuntimeFault::NativeCapture
+    } else if message.contains("authenticated transport service failed") {
+        RuntimeFault::AuthenticatedTransport
+    } else if message.contains("runtime service task failed") {
+        RuntimeFault::RuntimeTask
+    } else {
+        RuntimeFault::Unknown
+    }
 }
 
 fn ensure_runtime_stopped(service: &SetupService) -> Result<(), String> {

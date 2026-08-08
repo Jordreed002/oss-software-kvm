@@ -16,6 +16,8 @@ const mock: SetupSnapshot = {
   configured: false,
   validated: false,
   runtime: "stopped",
+  runtimeFault: null,
+  runtimeLogPath: null,
   setupDirectory: null,
   profilePath: null,
 };
@@ -58,8 +60,14 @@ const invokeOrPreview = async <T>(command: string, args?: Record<string, unknown
     previewState.validated = true;
     return structuredClone(previewState) as T;
   }
-  if (command === "start_runtime") previewState.runtime = "running";
-  if (command === "stop_runtime") previewState.runtime = "stopped";
+  if (command === "start_runtime") {
+    previewState.runtime = "running";
+    previewState.runtimeFault = null;
+  }
+  if (command === "stop_runtime") {
+    previewState.runtime = "stopped";
+    previewState.runtimeFault = null;
+  }
   return structuredClone(previewState) as T;
 };
 

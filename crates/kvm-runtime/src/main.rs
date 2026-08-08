@@ -8,6 +8,9 @@ use kvm_runtime::{execute_with_shutdown, RuntimeCommandOutcome};
 #[tokio::main]
 async fn main() -> ExitCode {
     let mut arguments: Vec<_> = std::env::args().skip(1).collect();
+    if arguments.len() == 1 && arguments[0] == "diagnose-native" {
+        return diagnose_native();
+    }
     let managed_control = if arguments
         .first()
         .is_some_and(|command| command == "run-managed")
@@ -68,6 +71,65 @@ async fn main() -> ExitCode {
             ExitCode::FAILURE
         }
     }
+}
+
+#[cfg(target_os = "macos")]
+fn diagnose_native() -> ExitCode {
+    use std::sync::Arc;
+
+    use kvm_daemon::{CaptureDisposition, CaptureLifecycleState, InputCaptureBackend};
+    use kvm_macos::MacInputBackend;
+    use kvm_types::HostId;
+
+    let Ok(status) = kvm_macos::probe_permissions() else {
+        return ExitCode::FAILURE;
+    };
+    println!("accessibility={}", status.accessibility);
+    println!("input_monitoring={}", status.input_monitoring);
+    if !status.accessibility || !status.input_monitoring {
+        return ExitCode::FAILURE;
+    }
+
+    let mut backend = MacInputBackend::new_whole_host_alpha(HostId::from_bytes([1; 16]));
+    let callback = Arc::new(|_| CaptureDisposition::AllowLocal);
+    if let Err(error) = backend.start_capture(callback) {
+        eprintln!("capture_start={error}");
+        return ExitCode::FAILURE;
+    }
+    for _ in 0..150 {
+        if backend.capture_lifecycle() != CaptureLifecycleState::Running {
+            let statistics = backend.capture_statistics();
+            eprintln!("capture_lifecycle={:?}", statistics.health);
+            eprintln!("tap_disables={}", statistics.tap_disables);
+            eprintln!("callback_panics={}", statistics.callback_panics);
+            eprintln!(
+                "transition_discontinuities={}",
+                statistics.transition_discontinuities
+            );
+            if let Err(error) = backend.stop_capture() {
+                eprintln!("capture_stop={error}");
+            }
+            return ExitCode::FAILURE;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    if let Err(error) = backend.stop_capture() {
+        eprintln!("capture_stop={error}");
+        return ExitCode::FAILURE;
+    }
+    println!("capture_lifecycle=ready");
+    ExitCode::SUCCESS
+}
+
+#[cfg(windows)]
+fn diagnose_native() -> ExitCode {
+    println!("native_permissions=not_required");
+    ExitCode::SUCCESS
+}
+
+#[cfg(not(any(target_os = "macos", windows)))]
+fn diagnose_native() -> ExitCode {
+    ExitCode::FAILURE
 }
 
 fn acquire_managed_lock(control: &Path) -> Result<std::fs::File, ()> {

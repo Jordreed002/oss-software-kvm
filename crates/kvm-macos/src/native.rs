@@ -1101,9 +1101,12 @@ fn run_whole_host_capture_thread(
             return Ok(());
         }
     };
-    // Creation enables a tap by default. Keep it inert until the owner has
-    // accepted the retained controller and acknowledges activation.
-    unsafe { CGEventTapEnable(tap_ptr, false) };
+    // Creation enables the tap, but the callback cannot run until this thread
+    // enters the run loop below. Do not disable it during setup: Quartz queues
+    // that deliberate disable through the same terminal callback used for a
+    // system-disabled tap, which would make a healthy generation fault as soon
+    // as the run loop starts. `active` remains false until owner activation, so
+    // even an unexpected callback before then is fail-open.
     // SAFETY: The tap is live and the returned create-rule source is checked.
     let source_ptr = unsafe { CFMachPortCreateRunLoopSource(ptr::null(), tap_ptr, 0) };
     let source = match OwnedCF::new(source_ptr.cast_const(), "CFMachPortCreateRunLoopSource") {
@@ -1132,9 +1135,6 @@ fn run_whole_host_capture_thread(
 
     if ready.send(Ok(Arc::clone(&controller))).is_ok() && activation.recv().is_ok() {
         active.store(true, Ordering::Release);
-        // SAFETY: Activation occurs on the owning run-loop thread after the
-        // callback authority and source lifetime are fully established.
-        unsafe { CGEventTapEnable(tap_ptr, true) };
         while active.load(Ordering::Acquire) {
             // SAFETY: The tap source is installed on this live run loop. The
             // bounded interval also detects invalidation without relying on an
@@ -1194,6 +1194,12 @@ extern "C" fn quartz_event_tap_callback(
         event_type,
         CG_EVENT_TAP_DISABLED_BY_TIMEOUT | CG_EVENT_TAP_DISABLED_BY_USER_INPUT
     ) {
+        // Owner-initiated shutdown revokes callback authority before disabling
+        // the tap. Quartz may still deliver that expected disable notification;
+        // it is not a lifecycle fault.
+        if !context.active.load(Ordering::Acquire) {
+            return event;
+        }
         context
             .counters
             .tap_disables

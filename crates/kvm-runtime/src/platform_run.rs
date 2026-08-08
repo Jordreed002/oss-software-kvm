@@ -16,7 +16,9 @@ pub enum NativeRuntimeErrorKind {
     Preparation,
     Inventory,
     Composition,
-    Service,
+    Capture,
+    Transport,
+    Task,
 }
 
 /// Path-, identity-, endpoint-, native-detail-, and payload-redacted runtime
@@ -55,7 +57,9 @@ impl fmt::Display for NativeRuntimeError {
             NativeRuntimeErrorKind::Preparation => "secure runtime preparation failed",
             NativeRuntimeErrorKind::Inventory => "native display or input inventory failed",
             NativeRuntimeErrorKind::Composition => "runtime authority composition failed",
-            NativeRuntimeErrorKind::Service => "native capture or authenticated transport failed",
+            NativeRuntimeErrorKind::Capture => "native capture lifecycle failed",
+            NativeRuntimeErrorKind::Transport => "authenticated transport service failed",
+            NativeRuntimeErrorKind::Task => "runtime service task failed",
         })
     }
 }
@@ -114,7 +118,7 @@ async fn run_windows(
     runtime
         .run_with_capture(input, shutdown)
         .await
-        .map_err(|_| NativeRuntimeError::new(NativeRuntimeErrorKind::Service))
+        .map_err(native_service_error)
 }
 
 #[cfg(target_os = "macos")]
@@ -140,5 +144,17 @@ async fn run_macos(
     runtime
         .run_with_capture(input, shutdown)
         .await
-        .map_err(|_| NativeRuntimeError::new(NativeRuntimeErrorKind::Service))
+        .map_err(native_service_error)
+}
+
+#[cfg(any(target_os = "macos", windows))]
+fn native_service_error(error: crate::active::RuntimeServiceError) -> NativeRuntimeError {
+    use crate::active::RuntimeServiceErrorKind;
+
+    let kind = match error.kind() {
+        RuntimeServiceErrorKind::Capture => NativeRuntimeErrorKind::Capture,
+        RuntimeServiceErrorKind::Transport => NativeRuntimeErrorKind::Transport,
+        RuntimeServiceErrorKind::Task => NativeRuntimeErrorKind::Task,
+    };
+    NativeRuntimeError::new(kind)
 }
