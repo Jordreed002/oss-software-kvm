@@ -131,13 +131,22 @@ impl NearbyDiscovery {
         }
         let packet = encode_beacon(&self.peer_id, &next);
         let limited_broadcast = SocketAddr::from((Ipv4Addr::BROADCAST, DISCOVERY_PORT));
-        let sent = packet.len() <= MAX_BEACON_BYTES
-            && self
+        let mut sent = false;
+        if packet.len() <= MAX_BEACON_BYTES {
+            for target in self
                 .broadcast_targets
                 .iter()
                 .copied()
                 .chain(std::iter::once(limited_broadcast))
-                .any(|target| self.socket.send_to(packet.as_bytes(), target).is_ok());
+            {
+                // Always attempt every interface. Short-circuiting after a
+                // successful Hyper-V/VPN/WSL send can hide the beacon from
+                // the physical Wi-Fi LAN.
+                if self.socket.send_to(packet.as_bytes(), target).is_ok() {
+                    sent = true;
+                }
+            }
+        }
         if sent {
             *advertised = Some(Advertisement {
                 state: next,
