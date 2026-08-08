@@ -212,11 +212,7 @@ impl SetupService {
             secure_write(&state_path, &bytes, true)
                 .map_err(|()| std::io::Error::other("credential upgrade failed"))?;
         }
-        let discovery_addresses: Vec<IpAddr> = private_addresses()
-            .into_iter()
-            .filter_map(|address| address.parse().ok())
-            .take(8)
-            .collect();
+        let discovery_addresses = private_broadcast_addresses();
         let discovery =
             NearbyDiscovery::start(&stored.draft_peer_id, &discovery_addresses, KVM_PORT).ok();
         if let Some(discovery) = &discovery {
@@ -930,6 +926,29 @@ fn private_addresses() -> Vec<String> {
     addresses.sort();
     addresses.dedup();
     addresses
+}
+
+fn private_broadcast_addresses() -> Vec<IpAddr> {
+    let mut broadcasts: Vec<_> = if_addrs::get_if_addrs()
+        .unwrap_or_default()
+        .into_iter()
+        .filter(if_addrs::Interface::is_oper_up)
+        .filter_map(|interface| match interface.addr {
+            if_addrs::IfAddr::V4(address) if address.ip.is_private() => {
+                let broadcast = address.broadcast.unwrap_or_else(|| {
+                    let ip = u32::from(address.ip);
+                    let netmask = u32::from(address.netmask);
+                    std::net::Ipv4Addr::from(ip | !netmask)
+                });
+                Some(IpAddr::V4(broadcast))
+            }
+            _ => None,
+        })
+        .collect();
+    broadcasts.sort_unstable();
+    broadcasts.dedup();
+    broadcasts.truncate(8);
+    broadcasts
 }
 
 fn is_private_ip(ip: IpAddr) -> bool {

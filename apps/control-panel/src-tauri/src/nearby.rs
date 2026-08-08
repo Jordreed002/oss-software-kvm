@@ -71,6 +71,7 @@ pub(crate) struct NearbyDiscovery {
     socket: UdpSocket,
     peer_id: String,
     runtime_port: u16,
+    broadcast_targets: Vec<SocketAddr>,
     advertised: Mutex<Option<Advertisement>>,
     records: Mutex<BTreeMap<String, NearbyRecord>>,
 }
@@ -78,13 +79,13 @@ pub(crate) struct NearbyDiscovery {
 impl NearbyDiscovery {
     pub(crate) fn start(
         peer_id: &str,
-        addresses: &[IpAddr],
+        broadcast_addresses: &[IpAddr],
         runtime_port: u16,
     ) -> Result<Self, ()> {
         if !valid_peer_id(peer_id)
-            || addresses.is_empty()
-            || addresses.len() > 8
-            || addresses
+            || broadcast_addresses.is_empty()
+            || broadcast_addresses.len() > 8
+            || broadcast_addresses
                 .iter()
                 .copied()
                 .any(|address| !private_address(address))
@@ -99,6 +100,11 @@ impl NearbyDiscovery {
             socket,
             peer_id: peer_id.to_owned(),
             runtime_port,
+            broadcast_targets: broadcast_addresses
+                .iter()
+                .copied()
+                .map(|address| SocketAddr::new(address, DISCOVERY_PORT))
+                .collect(),
             advertised: Mutex::new(None),
             records: Mutex::new(BTreeMap::new()),
         })
@@ -124,15 +130,15 @@ impl NearbyDiscovery {
             return;
         }
         let packet = encode_beacon(&self.peer_id, &next);
-        if packet.len() <= MAX_BEACON_BYTES
+        let limited_broadcast = SocketAddr::from((Ipv4Addr::BROADCAST, DISCOVERY_PORT));
+        let sent = packet.len() <= MAX_BEACON_BYTES
             && self
-                .socket
-                .send_to(
-                    packet.as_bytes(),
-                    SocketAddr::from((Ipv4Addr::BROADCAST, DISCOVERY_PORT)),
-                )
-                .is_ok()
-        {
+                .broadcast_targets
+                .iter()
+                .copied()
+                .chain(std::iter::once(limited_broadcast))
+                .any(|target| self.socket.send_to(packet.as_bytes(), target).is_ok());
+        if sent {
             *advertised = Some(Advertisement {
                 state: next,
                 last_sent: Some(now),
@@ -182,6 +188,7 @@ impl fmt::Debug for NearbyDiscovery {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("NearbyDiscovery")
+            .field("broadcast_target_count", &self.broadcast_targets.len())
             .field(
                 "advertisement_present",
                 &matches!(self.advertised.lock().as_deref(), Ok(Some(_))),
