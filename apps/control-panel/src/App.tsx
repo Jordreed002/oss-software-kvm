@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useState } from "react";
 import {
   ArrowLeftRight, Check, ChevronRight, CircleAlert, Copy, KeyRound,
-  Handshake, Laptop, Link2, LoaderCircle, Monitor, Play, Radio, ShieldCheck, Square, X,
+  Handshake, Laptop, Link2, LoaderCircle, Monitor, Play, Radio, ShieldCheck, Square, Unplug, X,
 } from "lucide-react";
 import { api } from "./bridge";
 import type { Placement, SetupSnapshot } from "./types";
@@ -102,7 +102,7 @@ function App() {
         <section className="panel">
           {error && <div className="error-banner"><CircleAlert size={18} />{error}</div>}
           {step === 0 && <LocalStep snapshot={snapshot} name={name} setName={setName} address={address} setAddress={setAddress} busy={busy} onContinue={() => perform("identity", () => api.createIdentity(name, address), 1)} />}
-          {step === 1 && <PairStep snapshot={snapshot} bundle={bundle} setBundle={setBundle} copied={copied} onCopy={async () => { await navigator.clipboard.writeText(snapshot.local?.publicBundle ?? ""); setCopied(true); window.setTimeout(() => setCopied(false), 1800); }} busy={busy} onImport={() => perform("pair", () => api.importPeer(bundle), 2)} onRequest={(peerId) => perform("pair-request", () => api.requestNearbyPairing(peerId))} onAccept={(requestId) => perform("pair-accept", () => api.acceptNearbyPairing(requestId))} onConfirm={(requestId) => perform("pair-confirm", () => api.confirmNearbyPairing(requestId), 2)} onDecline={(requestId) => perform("pair-decline", () => api.declineNearbyPairing(requestId))} />}
+          {step === 1 && <PairStep snapshot={snapshot} bundle={bundle} setBundle={setBundle} copied={copied} onCopy={async () => { await navigator.clipboard.writeText(snapshot.local?.publicBundle ?? ""); setCopied(true); window.setTimeout(() => setCopied(false), 1800); }} busy={busy} onImport={() => perform("pair", () => api.importPeer(bundle), 2)} onRequest={(peerId) => perform("pair-request", () => api.requestNearbyPairing(peerId))} onAccept={(requestId) => perform("pair-accept", () => api.acceptNearbyPairing(requestId))} onConfirm={(requestId) => perform("pair-confirm", () => api.confirmNearbyPairing(requestId), 2)} onDecline={(requestId) => perform("pair-decline", () => api.declineNearbyPairing(requestId))} onForget={() => perform("forget-pair", api.forgetPairedComputer)} />}
           {step === 2 && <ArrangeStep snapshot={snapshot} placement={placement} setPlacement={setPlacement} busy={busy} onContinue={() => perform("arrange", () => api.finalize(placement), 3)} />}
           {step === 3 && <ReadyStep snapshot={snapshot} busy={busy} onValidate={() => perform("validate", api.validate)} onStart={() => perform("start", api.start)} onStop={() => perform("stop", api.stop)} />}
         </section>
@@ -131,11 +131,18 @@ function LocalStep({ snapshot, name, setName, address, setAddress, busy, onConti
   </div>;
 }
 
-function PairStep({ snapshot, bundle, setBundle, copied, onCopy, busy, onImport, onRequest, onAccept, onConfirm, onDecline }: { snapshot: SetupSnapshot; bundle: string; setBundle: (v: string) => void; copied: boolean; onCopy: () => void; busy: string | null; onImport: () => void; onRequest: (peerId: string) => void; onAccept: (requestId: string) => void; onConfirm: (requestId: string) => void; onDecline: (requestId: string) => void }) {
+function PairStep({ snapshot, bundle, setBundle, copied, onCopy, busy, onImport, onRequest, onAccept, onConfirm, onDecline, onForget }: { snapshot: SetupSnapshot; bundle: string; setBundle: (v: string) => void; copied: boolean; onCopy: () => void; busy: string | null; onImport: () => void; onRequest: (peerId: string) => void; onAccept: (requestId: string) => void; onConfirm: (requestId: string) => void; onDecline: (requestId: string) => void; onForget: () => void }) {
+  const [confirmForget, setConfirmForget] = useState(false);
+  const replacing = !!snapshot.peer;
   return <div className="step-content enter">
-    <SectionHeading number="02" kicker="MUTUAL TRUST" title="Pair with one request." copy="Choose the nearby computer. The other person must accept, then both screens show the same verification code before trust is saved." />
-    <NearbyPanel snapshot={snapshot} busy={busy} onRequest={onRequest} onAccept={onAccept} onConfirm={onConfirm} onDecline={onDecline}/>
-    <details className="manual-pairing">
+    <SectionHeading number="02" kicker="MUTUAL TRUST" title={replacing ? "A computer is already trusted." : "Pair with one request."} copy={replacing ? "Remove the old peer trust before starting a new mutual pairing. This computer’s private identity will stay intact." : "Choose the nearby computer. The other person must accept, then both screens show the same verification code before trust is saved."} />
+    {snapshot.peer && <section className="existing-pair">
+      <span className="existing-pair-icon"><ShieldCheck size={19}/></span>
+      <div><small>CURRENTLY PAIRED</small><strong>{snapshot.peer.displayName}</strong><span>{snapshot.peer.platform === "macos" ? "macOS" : "Windows"} · certificate pinned</span></div>
+      {!confirmForget ? <button onClick={() => setConfirmForget(true)}><Unplug size={14}/>Replace pairing</button> : <div className="replace-confirm"><span>This stops routing and forgets only the old peer.</span><button className="cancel-replace" onClick={() => setConfirmForget(false)}>Keep it</button><button className="confirm-replace" disabled={!!busy} onClick={onForget}>{busy === "forget-pair" ? <LoaderCircle className="spin" size={14}/> : <Unplug size={14}/>}Forget peer</button></div>}
+    </section>}
+    <NearbyPanel snapshot={snapshot} busy={busy} onRequest={replacing ? undefined : onRequest} onAccept={replacing ? undefined : onAccept} onConfirm={replacing ? undefined : onConfirm} onDecline={replacing ? undefined : onDecline}/>
+    {!replacing && <details className="manual-pairing">
       <summary>Can’t see the other computer? Use a public link card</summary>
       <div className="bundle-card">
         <div><span className="card-label">This computer’s public card</span><strong>{snapshot.local?.displayName}</strong><small>Certificate + address + display inventory</small></div>
@@ -144,7 +151,7 @@ function PairStep({ snapshot, bundle, setBundle, copied, onCopy, busy, onImport,
       <div className="link-divider"><span /><Link2 size={18}/><span /></div>
       <label className="bundle-input"><span>Other computer’s public card</span><textarea value={bundle} onChange={(e) => setBundle(e.target.value)} placeholder="Paste the pairing card from the other machine…" /></label>
       <PrimaryButton busy={busy === "pair"} disabled={bundle.trim().length < 16} onClick={onImport}>Verify and pair</PrimaryButton>
-    </details>
+    </details>}
   </div>;
 }
 

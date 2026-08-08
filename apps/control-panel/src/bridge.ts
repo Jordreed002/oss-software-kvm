@@ -83,6 +83,14 @@ const invokeOrPreview = async <T>(command: string, args?: Record<string, unknown
     previewState.nearbyPairing = null;
     return structuredClone(previewState) as T;
   }
+  if (command === "forget_paired_computer") {
+    previewState.peer = null;
+    previewState.configured = false;
+    previewState.validated = false;
+    previewState.runtime = "stopped";
+    previewState.nearbyPairing = null;
+    return structuredClone(previewState) as T;
+  }
   if (command === "finalize_setup") {
     previewState.configured = true;
     previewState.placement = args?.placement as Placement;
@@ -114,6 +122,7 @@ export const api = {
   acceptNearbyPairing: (requestId: string) => invokeOrPreview<SetupSnapshot>("accept_nearby_pairing", { requestId }),
   confirmNearbyPairing: (requestId: string) => invokeOrPreview<SetupSnapshot>("confirm_nearby_pairing", { requestId }),
   declineNearbyPairing: (requestId: string) => invokeOrPreview<SetupSnapshot>("decline_nearby_pairing", { requestId }),
+  forgetPairedComputer: () => invokeOrPreview<SetupSnapshot>("forget_paired_computer"),
   finalize: (placement: Placement) => invokeOrPreview<SetupSnapshot>("finalize_setup", { placement }),
   validate: () => invokeOrPreview<SetupSnapshot>("validate_setup"),
   start: () => invokeOrPreview<SetupSnapshot>("start_runtime"),

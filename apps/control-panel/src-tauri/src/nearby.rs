@@ -487,6 +487,23 @@ impl NearbyDiscovery {
         self.completed_bundle.lock().ok()?.take()
     }
 
+    pub(crate) fn clear_pairing(&self) {
+        if let Ok(mut pairing) = self.pairing.lock() {
+            if let Some(session) = pairing.as_ref() {
+                let packet = PairingPacket::Decline {
+                    request_id: session.request_id().to_owned(),
+                    from_peer_id: self.peer_id.clone(),
+                    to_peer_id: session.peer_id().to_owned(),
+                };
+                let _ = send_pairing_packet(&self.socket, session.address(), &packet);
+            }
+            *pairing = None;
+        }
+        if let Ok(mut completed) = self.completed_bundle.lock() {
+            *completed = None;
+        }
+    }
+
     fn handle_pairing_packet(
         &self,
         packet: PairingPacket,

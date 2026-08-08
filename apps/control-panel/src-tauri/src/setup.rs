@@ -675,6 +675,36 @@ pub(crate) fn decline_nearby_pairing(
 }
 
 #[tauri::command]
+pub(crate) fn forget_paired_computer(
+    service: State<'_, SetupService>,
+) -> Result<SetupSnapshot, String> {
+    ensure_runtime_stopped(&service)?;
+    let mut setup = service.inner.lock().map_err(|_| coarse_error())?;
+    if setup.local.is_none() || setup.peer.is_none() {
+        return Err(coarse_error());
+    }
+    setup.peer = None;
+    setup.configured = false;
+    setup.validated = false;
+    service.save(&setup).map_err(|()| coarse_error())?;
+    drop(setup);
+
+    // The local private identity remains intact. Only peer-derived public
+    // trust and runtime configuration are discarded and can be regenerated.
+    for name in [TRUST_FILE, CONFIG_FILE, PROFILE_FILE] {
+        match fs::remove_file(service.directory.join(name)) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_) => return Err(coarse_error()),
+        }
+    }
+    if let Some(discovery) = &service.discovery {
+        discovery.clear_pairing();
+    }
+    service.snapshot().map_err(|()| coarse_error())
+}
+
+#[tauri::command]
 pub(crate) fn finalize_setup(
     placement: Placement,
     service: State<'_, SetupService>,

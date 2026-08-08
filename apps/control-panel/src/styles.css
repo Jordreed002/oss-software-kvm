@@ -154,6 +154,18 @@ select { appearance: none; background-image: linear-gradient(45deg, transparent 
 .manual-pairing summary { padding: 16px 2px; font-size: 9px; letter-spacing: .04em; cursor: pointer; }
 .manual-pairing[open] summary { color: #aeb6b1; }
 .manual-pairing .bundle-card { margin-top: 5px; }
+.existing-pair { width: min(780px, 100%); margin: -5px auto 18px; padding: 16px; display: grid; grid-template-columns: 40px minmax(0,1fr) auto; align-items: center; gap: 13px; border: 1px solid rgba(255,107,53,.24); background: linear-gradient(115deg, rgba(255,107,53,.08), rgba(13,20,17,.78)); }
+.existing-pair-icon { width: 40px; height: 40px; display: grid; place-items: center; border-radius: 50%; color: var(--mint); border: 1px solid rgba(169,229,200,.24); background: rgba(169,229,200,.045); }
+.existing-pair > div:not(.replace-confirm) { display: grid; gap: 3px; }
+.existing-pair small { color: var(--signal); font-size: 7px; font-weight: 800; letter-spacing: .17em; }
+.existing-pair strong { font-size: 12px; }
+.existing-pair span { color: #7d8982; font-size: 9px; }
+.existing-pair > button, .cancel-replace, .confirm-replace { min-height: 34px; border: 1px solid rgba(255,107,53,.28); background: transparent; color: #ff9a75; padding: 0 11px; display: inline-flex; align-items: center; justify-content: center; gap: 7px; font-size: 8px; font-weight: 800; letter-spacing: .09em; text-transform: uppercase; cursor: pointer; }
+.replace-confirm { display: grid; grid-template-columns: auto auto; gap: 7px; justify-items: stretch; max-width: 295px; }
+.replace-confirm > span { grid-column: 1 / -1; line-height: 1.35; }
+.cancel-replace { border-color: rgba(255,255,255,.1); color: #909a95; }
+.confirm-replace { background: var(--signal); color: #16110f; }
+.confirm-replace:disabled { opacity: .45; cursor: wait; }
 @keyframes radarPulse { from { opacity: .8; transform: scale(.78); } to { opacity: 0; transform: scale(1.3); } }
 footer { height: 44px; border-top: 1px solid var(--line); display: flex; align-items: center; justify-content: space-between; padding: 0 42px; color: #59635e; font-size: 8px; letter-spacing: .13em; }
 .escape { display: flex; gap: 7px; align-items: center; color: #77817c; }
@@ -162,5 +174,5 @@ footer { height: 44px; border-top: 1px solid var(--line); display: flex; align-i
 .loading h1 { font-family: "Newsreader Variable", serif; font-weight: 450; margin: 0; }
 .loading p { color: #b38b7c; }
 @media (max-width: 820px) {
-  .topbar { padding: 0 20px; }.brand small { display: none; }.workspace { grid-template-columns: 1fr; }.rail { padding: 34px 24px 18px; border-right: 0; border-bottom: 1px solid var(--line); }.rail h1 { font-size: 40px; }.rail > p, .safety-note { display: none; }.rail nav { grid-template-columns: repeat(4, 1fr); margin-top: 25px; }.rail nav button { display: grid; gap: 6px; }.panel { padding: 36px 22px 55px; }.form-grid { grid-template-columns: 1fr; }.section-heading { grid-template-columns: 42px 1fr; }.display-row { gap: 8px; padding: 20px; }.display-tile { width: min(34vw, 190px); }.handoff { width: 18px; }.pairing-request { grid-template-columns: 34px minmax(0,1fr); }.verification-code, .pairing-actions { grid-column: 2; }.nearby-machine { grid-template-columns: 26px minmax(0,1fr); }.nearby-badges { grid-column: 2; flex-wrap: wrap; } footer { padding: 0 20px; }.escape { display: none; }
+  .topbar { padding: 0 20px; }.brand small { display: none; }.workspace { grid-template-columns: 1fr; }.rail { padding: 34px 24px 18px; border-right: 0; border-bottom: 1px solid var(--line); }.rail h1 { font-size: 40px; }.rail > p, .safety-note { display: none; }.rail nav { grid-template-columns: repeat(4, 1fr); margin-top: 25px; }.rail nav button { display: grid; gap: 6px; }.panel { padding: 36px 22px 55px; }.form-grid { grid-template-columns: 1fr; }.section-heading { grid-template-columns: 42px 1fr; }.display-row { gap: 8px; padding: 20px; }.display-tile { width: min(34vw, 190px); }.handoff { width: 18px; }.pairing-request, .existing-pair { grid-template-columns: 34px minmax(0,1fr); }.verification-code, .pairing-actions, .existing-pair > button, .replace-confirm { grid-column: 2; }.nearby-machine { grid-template-columns: 26px minmax(0,1fr); }.nearby-badges { grid-column: 2; flex-wrap: wrap; } footer { padding: 0 20px; }.escape { display: none; }
 }
