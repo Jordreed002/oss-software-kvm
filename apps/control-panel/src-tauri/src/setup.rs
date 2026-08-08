@@ -19,15 +19,17 @@ use kvm_config::{
 #[cfg(any(target_os = "macos", windows))]
 use kvm_daemon::DisplayBackend;
 use kvm_types::{Display, DisplayId, Edge, HostId, PeerId, Platform};
-use rcgen::{BasicConstraints, CertificateParams, IsCa, KeyPair};
+use rcgen::{CertificateParams, ExtendedKeyUsagePurpose, IsCa, KeyPair};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tauri::{AppHandle, Manager, State};
 use uuid::Uuid;
 
 const KVM_PORT: u16 = 24_800;
-const PAIRING_VERSION: u16 = 1;
+const PAIRING_VERSION: u16 = 2;
+const CREDENTIAL_VERSION: u16 = 2;
 const STATE_FILE: &str = "setup-state.json";
+const LEGACY_STATE_BACKUP_FILE: &str = "setup-state.pre-tls-v2.json";
 const PROFILE_FILE: &str = "runtime.toml";
 const CONFIG_FILE: &str = "config.toml";
 const CERT_FILE: &str = "local.der";
@@ -69,6 +71,8 @@ struct StoredSetup {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct StoredLocal {
+    #[serde(default)]
+    credential_version: u16,
     host_id: String,
     peer_id: String,
     display_name: String,
@@ -198,6 +202,13 @@ impl SetupService {
         if stored.draft_peer_id.is_empty() {
             stored.draft_peer_id = Uuid::new_v4().to_string();
         }
+        if !runtime_lock_held(&directory)
+            && reset_legacy_credentials(&directory, &mut stored)?
+        {
+            let bytes = serde_json::to_vec_pretty(&stored)?;
+            secure_write(&state_path, &bytes, true)
+                .map_err(|()| std::io::Error::other("credential upgrade failed"))?;
+        }
         Ok(Self {
             directory,
             inner: Mutex::new(stored),
@@ -303,6 +314,33 @@ impl SetupService {
             public_bundle: URL_SAFE_NO_PAD.encode(encoded),
         })
     }
+}
+
+fn reset_legacy_credentials(
+    directory: &Path,
+    setup: &mut StoredSetup,
+) -> Result<bool, std::io::Error> {
+    if setup
+        .local
+        .as_ref()
+        .is_none_or(|local| local.credential_version == CREDENTIAL_VERSION)
+    {
+        return Ok(false);
+    }
+    let backup_path = directory.join(LEGACY_STATE_BACKUP_FILE);
+    if !backup_path.exists() {
+        let backup = serde_json::to_vec_pretty(setup)
+            .map_err(|_| std::io::Error::other("credential backup failed"))?;
+        secure_write(&backup_path, &backup, true)
+            .map_err(|()| std::io::Error::other("credential backup failed"))?;
+    }
+    setup.draft_host_id = Uuid::new_v4().to_string();
+    setup.draft_peer_id = Uuid::new_v4().to_string();
+    setup.local = None;
+    setup.peer = None;
+    setup.configured = false;
+    setup.validated = false;
+    Ok(true)
 }
 
 #[cfg(windows)]
@@ -416,7 +454,11 @@ pub(crate) fn create_local_identity(
         let key = KeyPair::generate().map_err(|_| coarse_error())?;
         let mut parameters =
             CertificateParams::new(vec![server_name.clone()]).map_err(|_| coarse_error())?;
-        parameters.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        parameters.is_ca = IsCa::NoCa;
+        parameters.extended_key_usages = vec![
+            ExtendedKeyUsagePurpose::ServerAuth,
+            ExtendedKeyUsagePurpose::ClientAuth,
+        ];
         let certificate = parameters.self_signed(&key).map_err(|_| coarse_error())?;
         let certificate_der = certificate.der().to_vec();
         let fingerprint = hex::encode(Sha256::digest(&certificate_der));
@@ -429,6 +471,7 @@ pub(crate) fn create_local_identity(
         )
         .map_err(|()| coarse_error())?;
         setup.local = Some(StoredLocal {
+            credential_version: CREDENTIAL_VERSION,
             host_id: setup.draft_host_id.clone(),
             peer_id: setup.draft_peer_id.clone(),
             display_name: display_name.trim().to_owned(),
@@ -1001,7 +1044,10 @@ fn runtime_lock_held(directory: &Path) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{build_config, validate_bundle, DisplayDto, PairingBundle, Placement, PlatformDto};
+    use super::{
+        build_config, validate_bundle, DisplayDto, PairingBundle, Placement, PlatformDto,
+        PAIRING_VERSION,
+    };
     #[cfg(windows)]
     use super::{rewrite_windows_profile_paths, CONFIG_FILE, KEY_FILE};
     use base64::engine::general_purpose::URL_SAFE_NO_PAD;
@@ -1031,7 +1077,7 @@ mod tests {
             .der()
             .to_vec();
         PairingBundle {
-            software_kvm_pairing: 1,
+            software_kvm_pairing: PAIRING_VERSION,
             host_id: "00000000-0000-4000-8000-000000000001".to_owned(),
             peer_id: "00000000-0000-4000-8000-000000000002".to_owned(),
             display_name: "Windows desk".to_owned(),

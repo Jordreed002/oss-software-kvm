@@ -765,6 +765,86 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn self_signed_dual_purpose_peers_authenticate_each_other() {
+        fn peer(name: &str, host: u8, peer: u8) -> (Vec<u8>, Vec<u8>, TransportPeerIdentity) {
+            let key = KeyPair::generate().unwrap();
+            let mut parameters = CertificateParams::new(vec![name.to_owned()]).unwrap();
+            parameters.is_ca = IsCa::NoCa;
+            parameters.extended_key_usages = vec![
+                ExtendedKeyUsagePurpose::ServerAuth,
+                ExtendedKeyUsagePurpose::ClientAuth,
+            ];
+            let certificate = parameters.self_signed(&key).unwrap().der().to_vec();
+            let identity = TransportPeerIdentity {
+                host_id: WireHostId([host; 16]),
+                peer_id: WirePeerId([peer; 16]),
+                credential_fingerprint: Sha256::digest(&certificate).into(),
+            };
+            (certificate, key.serialize_der(), identity)
+        }
+
+        let (server_certificate, server_key, server_identity) = peer("server.kvm.test", 1, 2);
+        let (client_certificate, client_key, client_identity) = peer("client.kvm.test", 3, 4);
+        let acceptor = RustlsTcpAcceptor::new(
+            RustlsServerCredentials::new(vec![server_certificate.clone()], server_key),
+            RustlsClientTrust::new(vec![client_certificate.clone()]),
+            FixedResolver::accepted(client_identity),
+            RustlsAcceptorConfig::default(),
+        )
+        .unwrap();
+        let mut connector = RustlsTcpConnector::new(
+            RustlsClientCredentials::new(vec![client_certificate.clone()], client_key),
+            RustlsServerTrust::new(vec![server_certificate]),
+            "server.kvm.test".to_owned(),
+            server_identity,
+            RustlsConnectorConfig::default(),
+        )
+        .unwrap();
+        let (address, server) = bind_server(acceptor).await;
+
+        assert!(connector.connect(address).await.is_ok());
+        assert!(server.await.unwrap().is_ok());
+    }
+
+    #[tokio::test]
+    async fn ca_certificates_without_tls_purposes_cannot_authenticate_as_peers() {
+        fn peer(name: &str, host: u8, peer: u8) -> (Vec<u8>, Vec<u8>, TransportPeerIdentity) {
+            let key = KeyPair::generate().unwrap();
+            let mut parameters = CertificateParams::new(vec![name.to_owned()]).unwrap();
+            parameters.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+            let certificate = parameters.self_signed(&key).unwrap().der().to_vec();
+            let identity = TransportPeerIdentity {
+                host_id: WireHostId([host; 16]),
+                peer_id: WirePeerId([peer; 16]),
+                credential_fingerprint: Sha256::digest(&certificate).into(),
+            };
+            (certificate, key.serialize_der(), identity)
+        }
+
+        let (server_certificate, server_key, server_identity) = peer("server.kvm.test", 1, 2);
+        let (client_certificate, client_key, client_identity) = peer("client.kvm.test", 3, 4);
+        let acceptor = RustlsTcpAcceptor::new(
+            RustlsServerCredentials::new(vec![server_certificate.clone()], server_key),
+            RustlsClientTrust::new(vec![client_certificate.clone()]),
+            FixedResolver::accepted(client_identity),
+            RustlsAcceptorConfig::default(),
+        )
+        .unwrap();
+        let mut connector = RustlsTcpConnector::new(
+            RustlsClientCredentials::new(vec![client_certificate], client_key),
+            RustlsServerTrust::new(vec![server_certificate]),
+            "server.kvm.test".to_owned(),
+            server_identity,
+            RustlsConnectorConfig::default(),
+        )
+        .unwrap();
+        let (address, server) = bind_server(acceptor).await;
+
+        let _ = connector.connect(address).await;
+        assert!(server.await.unwrap().is_err());
+    }
+
+    #[tokio::test]
     async fn resolver_failures_and_identity_mismatch_are_coarsely_rejected() {
         for resolution_error in [
             ClientIdentityResolutionError::Unavailable,
