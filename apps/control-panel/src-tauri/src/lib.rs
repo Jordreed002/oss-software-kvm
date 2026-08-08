@@ -25,6 +25,7 @@ pub fn run() {
             setup::confirm_nearby_pairing,
             setup::decline_nearby_pairing,
             setup::forget_paired_computer,
+            setup::repair_lan_binding,
             setup::finalize_setup,
             setup::validate_setup,
             setup::start_runtime,

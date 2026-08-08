@@ -322,6 +322,14 @@ impl NearbyDiscovery {
             .map(|session| session.dto(self.runtime_port))
     }
 
+    pub(crate) fn observed_runtime_address(&self, peer_id: &str) -> Option<SocketAddr> {
+        self.records
+            .lock()
+            .ok()?
+            .get(peer_id)
+            .map(|record| record.address)
+    }
+
     pub(crate) fn request_pairing(&self, peer_id: &str, local_bundle: &str) -> Result<(), ()> {
         if !valid_peer_id(peer_id) || local_bundle.is_empty() {
             return Err(());

@@ -21,6 +21,11 @@ const mock: SetupSnapshot = {
   discoveryAvailable: true,
   nearbyMachines: [],
   nearbyPairing: null,
+  developerDiagnostics: import.meta.env.DEV ? {
+    lanBinding: "healthy", configuredListener: "192.168.1.24:24800",
+    routedListener: "192.168.1.24:24800", configuredPeer: "192.168.1.31:24800",
+    observedPeer: "192.168.1.31:24800", recentEvents: ["[dev] listener=ready", "[dev] capture=armed"],
+  } : null,
   setupDirectory: null,
   profilePath: null,
 };
@@ -91,6 +96,13 @@ const invokeOrPreview = async <T>(command: string, args?: Record<string, unknown
     previewState.nearbyPairing = null;
     return structuredClone(previewState) as T;
   }
+  if (command === "repair_lan_binding" && previewState.developerDiagnostics) {
+    previewState.developerDiagnostics.lanBinding = "healthy";
+    previewState.developerDiagnostics.configuredListener = previewState.developerDiagnostics.routedListener;
+    previewState.developerDiagnostics.configuredPeer = previewState.developerDiagnostics.observedPeer;
+    previewState.validated = true;
+    return structuredClone(previewState) as T;
+  }
   if (command === "finalize_setup") {
     previewState.configured = true;
     previewState.placement = args?.placement as Placement;
@@ -123,6 +135,7 @@ export const api = {
   confirmNearbyPairing: (requestId: string) => invokeOrPreview<SetupSnapshot>("confirm_nearby_pairing", { requestId }),
   declineNearbyPairing: (requestId: string) => invokeOrPreview<SetupSnapshot>("decline_nearby_pairing", { requestId }),
   forgetPairedComputer: () => invokeOrPreview<SetupSnapshot>("forget_paired_computer"),
+  repairLanBinding: () => invokeOrPreview<SetupSnapshot>("repair_lan_binding"),
   finalize: (placement: Placement) => invokeOrPreview<SetupSnapshot>("finalize_setup", { placement }),
   validate: () => invokeOrPreview<SetupSnapshot>("validate_setup"),
   start: () => invokeOrPreview<SetupSnapshot>("start_runtime"),

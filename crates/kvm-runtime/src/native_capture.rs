@@ -2,7 +2,7 @@
 
 use std::fmt;
 use std::panic::{catch_unwind, AssertUnwindSafe};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use kvm_daemon::{
@@ -91,6 +91,24 @@ pub enum NativeCaptureErrorKind {
     Stop,
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct NativeCaptureMetrics {
+    pub(crate) observed: u64,
+    pub(crate) suppressed: u64,
+    pub(crate) allowed_local: u64,
+    pub(crate) lock_contention: u64,
+    pub(crate) callback_panics: u64,
+}
+
+#[derive(Default)]
+struct SharedCaptureMetrics {
+    observed: AtomicU64,
+    suppressed: AtomicU64,
+    allowed_local: AtomicU64,
+    lock_contention: AtomicU64,
+    callback_panics: AtomicU64,
+}
+
 /// Native-error-, input-, identity-, and timing-redacted supervisor failure.
 #[derive(Clone, Copy, Eq, PartialEq)]
 pub struct NativeCaptureError {
@@ -139,6 +157,7 @@ pub struct NativeCaptureSupervisor<B, R> {
     backend: B,
     router: Arc<Mutex<R>>,
     callback_armed: Arc<AtomicBool>,
+    metrics: Arc<SharedCaptureMetrics>,
     state: NativeCaptureState,
 }
 
@@ -175,6 +194,7 @@ where
             backend,
             router,
             callback_armed: Arc::new(AtomicBool::new(false)),
+            metrics: Arc::new(SharedCaptureMetrics::default()),
             state: NativeCaptureState::LocalOnly,
         }
     }
@@ -182,6 +202,17 @@ where
     #[must_use]
     pub const fn state(&self) -> NativeCaptureState {
         self.state
+    }
+
+    #[must_use]
+    pub(crate) fn metrics(&self) -> NativeCaptureMetrics {
+        NativeCaptureMetrics {
+            observed: self.metrics.observed.load(Ordering::Relaxed),
+            suppressed: self.metrics.suppressed.load(Ordering::Relaxed),
+            allowed_local: self.metrics.allowed_local.load(Ordering::Relaxed),
+            lock_contention: self.metrics.lock_contention.load(Ordering::Relaxed),
+            callback_panics: self.metrics.callback_panics.load(Ordering::Relaxed),
+        }
     }
 
     /// Starts a fresh native generation, verifies it, then opens routing.
@@ -203,7 +234,11 @@ where
         self.callback_armed.store(false, Ordering::Release);
         self.gate_router(now_ns)?;
 
-        let callback = capture_callback(Arc::clone(&self.router), Arc::clone(&self.callback_armed));
+        let callback = capture_callback(
+            Arc::clone(&self.router),
+            Arc::clone(&self.callback_armed),
+            Arc::clone(&self.metrics),
+        );
         if self.backend.start_capture(callback).is_err() {
             self.state = if self.backend.stop_capture().is_ok() {
                 NativeCaptureState::LocalOnly
@@ -315,26 +350,55 @@ where
     }
 }
 
-fn capture_callback<R>(router: Arc<Mutex<R>>, armed: Arc<AtomicBool>) -> CaptureCallback
+fn capture_callback<R>(
+    router: Arc<Mutex<R>>,
+    armed: Arc<AtomicBool>,
+    metrics: Arc<SharedCaptureMetrics>,
+) -> CaptureCallback
 where
     R: NativeCaptureRouter + 'static,
 {
     Arc::new(move |captured| {
+        increment(&metrics.observed);
         if !armed.load(Ordering::Acquire) {
+            increment(&metrics.allowed_local);
             return CaptureDisposition::AllowLocal;
         }
         let Ok(mut router) = router.try_lock() else {
+            increment(&metrics.lock_contention);
+            increment(&metrics.allowed_local);
             return CaptureDisposition::AllowLocal;
         };
         if !armed.load(Ordering::Acquire) {
+            increment(&metrics.allowed_local);
             return CaptureDisposition::AllowLocal;
         }
 
-        catch_unwind(AssertUnwindSafe(|| {
+        let disposition = catch_unwind(AssertUnwindSafe(|| {
             router.route_capture(captured, captured.event.timestamp_ns)
-        }))
-        .unwrap_or(CaptureDisposition::AllowLocal)
+        }));
+        match disposition {
+            Ok(CaptureDisposition::SuppressLocal) => {
+                increment(&metrics.suppressed);
+                CaptureDisposition::SuppressLocal
+            }
+            Ok(CaptureDisposition::AllowLocal) => {
+                increment(&metrics.allowed_local);
+                CaptureDisposition::AllowLocal
+            }
+            Err(_) => {
+                increment(&metrics.callback_panics);
+                increment(&metrics.allowed_local);
+                CaptureDisposition::AllowLocal
+            }
+        }
     })
+}
+
+fn increment(counter: &AtomicU64) {
+    let _ = counter.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+        Some(value.saturating_add(1))
+    });
 }
 
 #[cfg(test)]
@@ -726,7 +790,11 @@ mod tests {
         }
 
         let armed = Arc::new(AtomicBool::new(true));
-        let callback = capture_callback(Arc::new(Mutex::new(PanickingRouter)), Arc::clone(&armed));
+        let callback = capture_callback(
+            Arc::new(Mutex::new(PanickingRouter)),
+            Arc::clone(&armed),
+            Arc::new(SharedCaptureMetrics::default()),
+        );
         assert_eq!(callback(captured()), CaptureDisposition::AllowLocal);
     }
 
@@ -745,5 +813,22 @@ mod tests {
             CaptureDisposition::AllowLocal
         );
         assert!(lock(&router_events).is_empty());
+    }
+
+    #[test]
+    fn callback_metrics_are_count_only_and_track_suppression() {
+        let (mut supervisor, backend, _, _) = fixture(CaptureDisposition::SuppressLocal);
+        supervisor.start(10).unwrap();
+        let before = supervisor.metrics();
+        assert_eq!(
+            callback(&backend)(captured()),
+            CaptureDisposition::SuppressLocal
+        );
+        let after = supervisor.metrics();
+        assert_eq!(after.observed, before.observed + 1);
+        assert_eq!(after.suppressed, before.suppressed + 1);
+        assert_eq!(after.allowed_local, before.allowed_local);
+        assert_eq!(after.lock_contention, before.lock_contention);
+        assert_eq!(after.callback_panics, before.callback_panics);
     }
 }

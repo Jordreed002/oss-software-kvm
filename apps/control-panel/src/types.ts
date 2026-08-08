@@ -4,6 +4,7 @@ export type RuntimeFault = "native_capture" | "authenticated_transport" | "runti
 export type NearbyPresence = "setting_up" | "runtime_active";
 export type NearbyPairingStatus = "incoming_request" | "waiting_for_acceptance" | "verify_code" | "waiting_for_confirmation";
 export type Placement = "local_left" | "local_right";
+export type LanBindingState = "healthy" | "mismatch" | "waiting_for_peer" | "not_configured";
 
 export interface DisplayInfo {
   id: string;
@@ -51,6 +52,7 @@ export interface SetupSnapshot {
   discoveryAvailable: boolean;
   nearbyMachines: NearbyMachine[];
   nearbyPairing: NearbyPairing | null;
+  developerDiagnostics: DeveloperDiagnostics | null;
   setupDirectory: string | null;
   profilePath: string | null;
 }
@@ -72,4 +74,13 @@ export interface NearbyPairing {
   address: string;
   status: NearbyPairingStatus;
   verificationCode: string | null;
+}
+
+export interface DeveloperDiagnostics {
+  lanBinding: LanBindingState;
+  configuredListener: string | null;
+  routedListener: string | null;
+  configuredPeer: string | null;
+  observedPeer: string | null;
+  recentEvents: string[];
 }

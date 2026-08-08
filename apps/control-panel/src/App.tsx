@@ -104,7 +104,7 @@ function App() {
           {step === 0 && <LocalStep snapshot={snapshot} name={name} setName={setName} address={address} setAddress={setAddress} busy={busy} onContinue={() => perform("identity", () => api.createIdentity(name, address), 1)} />}
           {step === 1 && <PairStep snapshot={snapshot} bundle={bundle} setBundle={setBundle} copied={copied} onCopy={async () => { await navigator.clipboard.writeText(snapshot.local?.publicBundle ?? ""); setCopied(true); window.setTimeout(() => setCopied(false), 1800); }} busy={busy} onImport={() => perform("pair", () => api.importPeer(bundle), 2)} onRequest={(peerId) => perform("pair-request", () => api.requestNearbyPairing(peerId))} onAccept={(requestId) => perform("pair-accept", () => api.acceptNearbyPairing(requestId))} onConfirm={(requestId) => perform("pair-confirm", () => api.confirmNearbyPairing(requestId), 2)} onDecline={(requestId) => perform("pair-decline", () => api.declineNearbyPairing(requestId))} onForget={() => perform("forget-pair", api.forgetPairedComputer)} />}
           {step === 2 && <ArrangeStep snapshot={snapshot} placement={placement} setPlacement={setPlacement} busy={busy} onContinue={() => perform("arrange", () => api.finalize(placement), 3)} />}
-          {step === 3 && <ReadyStep snapshot={snapshot} busy={busy} onValidate={() => perform("validate", api.validate)} onStart={() => perform("start", api.start)} onStop={() => perform("stop", api.stop)} onReplace={() => perform("forget-pair", async () => { if (snapshot.runtime === "running") await api.stop(); return api.forgetPairedComputer(); }, 1)} />}
+          {step === 3 && <ReadyStep snapshot={snapshot} busy={busy} onValidate={() => perform("validate", api.validate)} onStart={() => perform("start", api.start)} onStop={() => perform("stop", api.stop)} onReplace={() => perform("forget-pair", async () => { if (snapshot.runtime === "running") await api.stop(); return api.forgetPairedComputer(); }, 1)} onRepair={() => perform("repair-lan", async () => { const restart = snapshot.runtime === "running"; if (restart) await api.stop(); const repaired = await api.repairLanBinding(); return restart ? api.start() : repaired; })} />}
         </section>
       </section>
       <footer><span>ALPHA · TWO HOSTS · LOCAL NETWORK ONLY</span><span className="escape"><KeyRound size={13} /> Emergency: Ctrl + Alt + Shift + Backspace</span></footer>
@@ -179,7 +179,7 @@ function DisplayTile({ label, name, display, local = false }: { label: string; n
   return <div className={`display-tile ${local ? "is-local" : ""}`}><div className="screen"><div className="screen-glow"/><Monitor size={24}/><span>{display?.width ?? "—"} × {display?.height ?? "—"}</span></div><div className="stand"/><small>{label}</small><strong>{name}</strong><span>{display?.name ?? "Display"}</span></div>;
 }
 
-function ReadyStep({ snapshot, busy, onValidate, onStart, onStop, onReplace }: { snapshot: SetupSnapshot; busy: string | null; onValidate: () => void; onStart: () => void; onStop: () => void; onReplace: () => void }) {
+function ReadyStep({ snapshot, busy, onValidate, onStart, onStop, onReplace, onRepair }: { snapshot: SetupSnapshot; busy: string | null; onValidate: () => void; onStart: () => void; onStop: () => void; onReplace: () => void; onRepair: () => void }) {
   const running = snapshot.runtime === "running";
   const runtimeFault = snapshot.runtime === "faulted" ? runtimeFaultMessage(snapshot.runtimeFault) : null;
   const [confirmReplace, setConfirmReplace] = useState(false);
@@ -191,7 +191,17 @@ function ReadyStep({ snapshot, busy, onValidate, onStart, onStop, onReplace }: {
       <CheckRow label="Selected peer" detail="Public certificate is pinned" good={!!snapshot.peer}/>
       <CheckRow label="Display topology" detail="Bidirectional edge link configured" good={snapshot.configured}/>
       <CheckRow label="Runtime validation" detail={snapshot.validated ? "All safety checks passed" : "Not checked yet"} good={snapshot.validated}/>
+      {snapshot.developerDiagnostics && (
+        <CheckRow
+          label="LAN binding"
+          detail={snapshot.developerDiagnostics.lanBinding === "healthy" ? "Listener and observed peer use the active LAN" : "Configured addresses do not match the active LAN"}
+          good={snapshot.developerDiagnostics.lanBinding === "healthy"}
+        />
+      )}
     </div>
+    {import.meta.env.DEV && snapshot.developerDiagnostics && (
+      <DeveloperDiagnosticsPanel diagnostics={snapshot.developerDiagnostics} busy={busy} onRepair={onRepair}/>
+    )}
     {snapshot.peer && <section className="ready-pair-management">
       <div><span>Paired with</span><strong>{snapshot.peer.displayName}</strong><small>Replace this peer if the other computer does not show the same pairing.</small></div>
       {!confirmReplace ? <button onClick={() => setConfirmReplace(true)}><Unplug size={14}/>Replace paired computer</button> : <div className="ready-replace-confirm"><span>{running ? "Routing will stop first. " : ""}The local private identity will be preserved.</span><button onClick={() => setConfirmReplace(false)}>Keep pairing</button><button className="danger" disabled={!!busy} onClick={onReplace}>{busy === "forget-pair" ? <LoaderCircle className="spin" size={14}/> : <Unplug size={14}/>}Replace now</button></div>}
@@ -199,8 +209,30 @@ function ReadyStep({ snapshot, busy, onValidate, onStart, onStop, onReplace }: {
     {runtimeFault && <div className="error-banner"><CircleAlert size={18}/><div><strong>{runtimeFault.title}</strong><br/><span>{runtimeFault.detail}</span></div></div>}
     {snapshot.setupDirectory && <div className="path-note"><span>Setup stored securely</span><code>{snapshot.setupDirectory}</code></div>}
     {runtimeFault && snapshot.runtimeLogPath && <div className="path-note"><span>Private diagnostic log</span><code>{snapshot.runtimeLogPath}</code></div>}
-    {!snapshot.validated ? <PrimaryButton busy={busy === "validate"} onClick={onValidate}>Validate this setup</PrimaryButton> : running ? <button className="stop-button" disabled={!!busy} onClick={onStop}><Square size={16} fill="currentColor"/> Stop routing safely</button> : <PrimaryButton busy={busy === "start"} onClick={onStart}><Play size={17} fill="currentColor"/> Start Software KVM</PrimaryButton>}
+    {running ? <button className="stop-button" disabled={!!busy} onClick={onStop}><Square size={16} fill="currentColor"/> Stop routing safely</button> : !snapshot.validated ? <PrimaryButton busy={busy === "validate"} onClick={onValidate}>Validate this setup</PrimaryButton> : <PrimaryButton busy={busy === "start"} onClick={onStart}><Play size={17} fill="currentColor"/> Start Software KVM</PrimaryButton>}
   </div>;
+}
+
+function DeveloperDiagnosticsPanel({ diagnostics, busy, onRepair }: { diagnostics: NonNullable<SetupSnapshot["developerDiagnostics"]>; busy: string | null; onRepair: () => void }) {
+  const mismatch = diagnostics.lanBinding === "mismatch";
+  return <details className={`developer-diagnostics ${mismatch ? "has-mismatch" : ""}`} open={mismatch}>
+    <summary><span><i/>Developer diagnostics</span><em>{mismatch ? "LAN MISMATCH" : diagnostics.lanBinding.replaceAll("_", " ")}</em></summary>
+    <div className="diagnostic-grid">
+      <DiagnosticValue label="Configured listener" value={diagnostics.configuredListener}/>
+      <DiagnosticValue label="Routed listener" value={diagnostics.routedListener}/>
+      <DiagnosticValue label="Configured peer" value={diagnostics.configuredPeer}/>
+      <DiagnosticValue label="Observed peer" value={diagnostics.observedPeer}/>
+    </div>
+    {mismatch && <div className="diagnostic-repair"><div><strong>The runtime is bound to the wrong network interface.</strong><span>Repair rewrites the listener and peer addresses using the active LAN route, revalidates, and restarts if necessary.</span></div><button disabled={!!busy} onClick={onRepair}>{busy === "repair-lan" ? <LoaderCircle className="spin" size={14}/> : <Radio size={14}/>}Repair LAN binding</button></div>}
+    <div className="event-console" aria-label="Recent redacted runtime events">
+      <div><span>Recent runtime events</span><em>REDACTED · LIVE</em></div>
+      {diagnostics.recentEvents.length === 0 ? <p>No detailed events yet. Restart the runtime from this development build.</p> : <ol>{diagnostics.recentEvents.map((event, index) => <li key={`${index}-${event}`}>{event}</li>)}</ol>}
+    </div>
+  </details>;
+}
+
+function DiagnosticValue({ label, value }: { label: string; value: string | null }) {
+  return <div><span>{label}</span><code>{value ?? "Waiting…"}</code></div>;
 }
 
 function NearbyPanel({ snapshot, busy = null, onRequest, onAccept, onConfirm, onDecline }: { snapshot: SetupSnapshot; busy?: string | null; onRequest?: (peerId: string) => void; onAccept?: (requestId: string) => void; onConfirm?: (requestId: string) => void; onDecline?: (requestId: string) => void }) {

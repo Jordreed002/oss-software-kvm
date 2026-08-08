@@ -273,6 +273,7 @@ where
     where
         B: InputCaptureBackend + 'static,
     {
+        developer_event("service=starting");
         let manager = Arc::clone(&self.manager);
         let started = Instant::now();
         let (transport_shutdown, transport_receiver) = tokio::sync::watch::channel(false);
@@ -295,6 +296,7 @@ where
         }
 
         if *shutdown.borrow() {
+            developer_event("service=stopped_before_capture");
             let _ = transport_shutdown.send(true);
             return transport_task
                 .await
@@ -304,11 +306,15 @@ where
 
         let mut capture = NativeCaptureSupervisor::new(backend, manager);
         if capture.start(now_ns(started)).is_err() {
+            developer_event("capture=start_failed");
             let _ = transport_shutdown.send(true);
             let _ = transport_task.await;
             return Err(RuntimeServiceError::new(RuntimeServiceErrorKind::Capture));
         }
+        developer_event("capture=armed");
         let mut lifecycle_tick = tokio::time::interval(SERVICE_TICK);
+        let mut last_capture_metrics = capture.metrics();
+        let mut next_capture_report = Instant::now() + Duration::from_secs(1);
         let mut transport_finished = false;
         let service_result = loop {
             tokio::select! {
@@ -326,7 +332,23 @@ where
                 }
                 _ = lifecycle_tick.tick() => {
                     if capture.poll_lifecycle(now_ns(started)).is_err() {
+                        developer_event("capture=lifecycle_fault");
                         break Err(RuntimeServiceError::new(RuntimeServiceErrorKind::Capture));
+                    }
+                    if Instant::now() >= next_capture_report {
+                        let metrics = capture.metrics();
+                        if metrics != last_capture_metrics {
+                            developer_event(&format!(
+                                "capture=activity observed:{} suppressed:{} local:{} contention:{} panics:{}",
+                                metrics.observed,
+                                metrics.suppressed,
+                                metrics.allowed_local,
+                                metrics.lock_contention,
+                                metrics.callback_panics,
+                            ));
+                            last_capture_metrics = metrics;
+                        }
+                        next_capture_report = Instant::now() + Duration::from_secs(1);
                     }
                 }
             }
@@ -336,6 +358,7 @@ where
             .shutdown(now_ns(started))
             .map_err(|_| RuntimeServiceError::new(RuntimeServiceErrorKind::Capture));
         let _ = transport_shutdown.send(true);
+        developer_event("service=stopping");
         let transport_result = if transport_finished {
             Ok(())
         } else {
@@ -361,15 +384,14 @@ where
         )
         .await
         .map_err(|_| RuntimeTransportError::new(RuntimeTransportErrorKind::Bind))?;
-        if let Some(ready) = ready {
-            let _ = ready.send(());
-        }
+        announce_listener_ready(ready);
         let (internal_shutdown, internal_receiver) = tokio::sync::watch::channel(false);
         let listener_task = tokio::spawn(listener.run(internal_receiver.clone()));
         let connector = Arc::new(tokio::sync::Mutex::new(self.connector));
         let mut dial_tasks = tokio::task::JoinSet::new();
         let mut session_tasks = tokio::task::JoinSet::new();
         let mut tick = tokio::time::interval(SERVICE_TICK);
+        let mut last_manager_snapshot = None;
 
         let run_result = async {
             loop {
@@ -384,6 +406,7 @@ where
                         let Some(LanListenerEvent::Accepted { stream }) = event else {
                             return Err(RuntimeTransportError::new(RuntimeTransportErrorKind::Task));
                         };
+                        developer_event("transport=inbound_tcp_accepted");
                         if let Some(installed) = prepare_inbound(
                                 &self.manager,
                                 &self.admission_factory,
@@ -420,11 +443,14 @@ where
                         joined
                             .ok_or_else(|| RuntimeTransportError::new(RuntimeTransportErrorKind::Task))?
                             .map_err(|_| RuntimeTransportError::new(RuntimeTransportErrorKind::Task))??;
+                        developer_event("session=task_finished");
                     }
                     _ = tick.tick() => {
                         service_manager(&self.manager, started)?;
+                        report_manager_snapshot(&self.manager, &mut last_manager_snapshot)?;
                         if dial_tasks.is_empty() {
                             if let Some(task) = poll_dial(&self.manager, now_duration(started))? {
+                                developer_event("transport=outbound_dial_started");
                                 let connector = Arc::clone(&connector);
                                 dial_tasks.spawn(async move {
                                     let address = task.address();
@@ -450,6 +476,31 @@ where
         .await;
         run_result.and(cleanup_result)
     }
+}
+
+fn announce_listener_ready(ready: Option<tokio::sync::oneshot::Sender<()>>) {
+    developer_event("listener=ready");
+    if let Some(ready) = ready {
+        let _ = ready.send(());
+    }
+}
+
+fn report_manager_snapshot<I>(
+    manager: &Arc<Mutex<PeerManager<I, ManagedSessionOutbound>>>,
+    previous: &mut Option<PeerManagerSnapshot>,
+) -> Result<(), RuntimeTransportError>
+where
+    I: OutputInjectionBackend,
+{
+    let snapshot = lock_manager(manager)?.snapshot();
+    if *previous != Some(snapshot) {
+        developer_event(&format!(
+            "manager=state candidates:{} connecting:{} sessions:{}",
+            snapshot.peers_with_candidates, snapshot.connecting_tasks, snapshot.session_tasks,
+        ));
+        *previous = Some(snapshot);
+    }
+    Ok(())
 }
 
 struct DialResult {
@@ -528,6 +579,7 @@ where
     I: OutputInjectionBackend + 'static,
 {
     if let Ok(stream) = dial.result {
+        developer_event("transport=outbound_tls_connected");
         let start = {
             let mut manager = lock_manager(manager)?;
             manager
@@ -536,6 +588,7 @@ where
         };
         prepare_session(manager, admission_factory, start, duration_ns(now)).map(Some)
     } else {
+        developer_event("transport=outbound_connect_failed");
         lock_manager(manager)?
             .outbound_failed(dial.task, now)
             .map_err(|_| RuntimeTransportError::new(RuntimeTransportErrorKind::Authority))?;
@@ -579,8 +632,12 @@ where
     };
     let generation = prepared.generation();
     match lock_manager(manager)?.install_prepared_session(prepared) {
-        Ok(installed) => Ok(installed),
+        Ok(installed) => {
+            developer_event("session=installed");
+            Ok(installed)
+        }
         Err(rejected) => {
+            developer_event("session=install_rejected");
             drop(rejected);
             lock_manager(manager)?
                 .connection_task_lost(peer_id, generation, now_ns)
@@ -603,6 +660,7 @@ where
     S: SecurePeerStream + 'static,
     A: kvm_network::SessionAdmission + 'static,
 {
+    developer_event("session=runner_started");
     let peer_id = installed.runner.peer_id();
     let generation = installed.runner.generation();
     let (session_shutdown, session_receiver) = tokio::sync::watch::channel(false);
@@ -639,6 +697,7 @@ where
         }
     }
     let _ = lock_manager(&manager)?.connection_task_lost(peer_id, generation, now_ns(started));
+    developer_event("session=runner_stopped");
     Ok(())
 }
 
@@ -711,6 +770,12 @@ fn now_ns(started: Instant) -> u64 {
 
 fn duration_ns(duration: Duration) -> u64 {
     u64::try_from(duration.as_nanos()).unwrap_or(u64::MAX)
+}
+
+fn developer_event(message: &str) {
+    if std::env::var_os("SOFTWARE_KVM_DEV_LOG").is_some() {
+        eprintln!("[dev] {message}");
+    }
 }
 
 impl PreparedTwoHostAlpha {

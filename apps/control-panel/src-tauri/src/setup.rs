@@ -4,8 +4,8 @@
 
 use std::collections::HashSet;
 use std::fs;
-use std::io::{Read, Write};
-use std::net::{IpAddr, SocketAddr};
+use std::io::{Read, Seek, SeekFrom, Write};
+use std::net::{IpAddr, SocketAddr, UdpSocket};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::Mutex;
@@ -158,6 +158,26 @@ enum RuntimeFault {
     Unknown,
 }
 
+#[derive(Clone, Copy, Debug, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum LanBindingState {
+    Healthy,
+    Mismatch,
+    WaitingForPeer,
+    NotConfigured,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DeveloperDiagnosticsDto {
+    lan_binding: LanBindingState,
+    configured_listener: Option<String>,
+    routed_listener: Option<String>,
+    configured_peer: Option<String>,
+    observed_peer: Option<String>,
+    recent_events: Vec<String>,
+}
+
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct SetupSnapshot {
@@ -176,6 +196,7 @@ pub(crate) struct SetupSnapshot {
     discovery_available: bool,
     nearby_machines: Vec<NearbyMachineDto>,
     nearby_pairing: Option<NearbyPairingDto>,
+    developer_diagnostics: Option<DeveloperDiagnosticsDto>,
     setup_directory: Option<String>,
     profile_path: Option<String>,
 }
@@ -290,6 +311,8 @@ impl SetupService {
             .discovery
             .as_ref()
             .and_then(NearbyDiscovery::pairing_snapshot);
+        let developer_diagnostics = cfg!(debug_assertions)
+            .then(|| self.developer_diagnostics(&setup));
         let host_id = setup
             .local
             .as_ref()
@@ -322,6 +345,7 @@ impl SetupService {
             discovery_available: self.discovery.is_some(),
             nearby_machines,
             nearby_pairing,
+            developer_diagnostics,
             setup_directory: setup
                 .configured
                 .then(|| self.directory.to_string_lossy().into_owned()),
@@ -406,6 +430,47 @@ impl SetupService {
         setup.configured = false;
         setup.validated = false;
         self.save(&setup).map_err(|()| coarse_error())
+    }
+
+    fn developer_diagnostics(&self, setup: &StoredSetup) -> DeveloperDiagnosticsDto {
+        let configured_listener = setup.local.as_ref().map(|local| local.address.clone());
+        let configured_peer = setup.peer.as_ref().map(|peer| peer.address.clone());
+        let observed_peer = setup.peer.as_ref().and_then(|peer| {
+            self.discovery
+                .as_ref()?
+                .observed_runtime_address(&peer.peer_id)
+                .map(|address| address.to_string())
+        });
+        let route_target = observed_peer
+            .as_deref()
+            .or(configured_peer.as_deref())
+            .and_then(|address| address.parse::<SocketAddr>().ok());
+        let routed_listener = route_target
+            .and_then(routed_local_address)
+            .map(|address| address.to_string());
+        let lan_binding = match (
+            configured_listener.as_deref(),
+            configured_peer.as_deref(),
+            observed_peer.as_deref(),
+            routed_listener.as_deref(),
+        ) {
+            (None, _, _, _) | (_, None, _, _) => LanBindingState::NotConfigured,
+            (_, _, None, _) => LanBindingState::WaitingForPeer,
+            (Some(listener), Some(peer), Some(observed), Some(routed))
+                if listener == routed && peer == observed =>
+            {
+                LanBindingState::Healthy
+            }
+            _ => LanBindingState::Mismatch,
+        };
+        DeveloperDiagnosticsDto {
+            lan_binding,
+            configured_listener,
+            routed_listener,
+            configured_peer,
+            observed_peer,
+            recent_events: read_developer_events(&self.directory.join(RUNTIME_LOG_FILE)),
+        }
     }
 }
 
@@ -711,31 +776,24 @@ pub(crate) fn finalize_setup(
 ) -> Result<SetupSnapshot, String> {
     ensure_runtime_stopped(&service)?;
     let mut setup = service.inner.lock().map_err(|_| coarse_error())?;
-    let local = setup.local.clone().ok_or_else(coarse_error)?;
-    let peer = setup.peer.clone().ok_or_else(coarse_error)?;
-    let local_displays =
-        native_displays(parse_host_id(&local.host_id)?).map_err(|_| coarse_error())?;
-    if local_displays.is_empty() || peer.displays.is_empty() {
-        return Err(coarse_error());
-    }
-    let config = build_config(&peer, &local_displays, &placement)?;
-    let config_source = encode_config(&config).map_err(|_| coarse_error())?;
-    secure_write(
-        &service.directory.join(CONFIG_FILE),
-        config_source.as_bytes(),
-        true,
-    )
-    .map_err(|()| coarse_error())?;
-    let profile = build_profile(&service.directory, &local, &peer);
-    secure_write(
-        &service.directory.join(PROFILE_FILE),
-        profile.as_bytes(),
-        true,
-    )
-    .map_err(|()| coarse_error())?;
     setup.placement = placement;
-    setup.configured = true;
-    setup.validated = false;
+    write_setup_configuration(&service, &mut setup)?;
+    drop(setup);
+    service.snapshot().map_err(|()| coarse_error())
+}
+
+#[tauri::command]
+pub(crate) fn repair_lan_binding(
+    service: State<'_, SetupService>,
+) -> Result<SetupSnapshot, String> {
+    ensure_runtime_stopped(&service)?;
+    let mut setup = service.inner.lock().map_err(|_| coarse_error())?;
+    write_setup_configuration(&service, &mut setup)?;
+    drop(setup);
+    kvm_runtime::prepare(&service.directory.join(PROFILE_FILE))
+        .map_err(|error| format!("runtime validation failed safely: {error}"))?;
+    let mut setup = service.inner.lock().map_err(|_| coarse_error())?;
+    setup.validated = true;
     service.save(&setup).map_err(|()| coarse_error())?;
     drop(setup);
     service.snapshot().map_err(|()| coarse_error())
@@ -779,15 +837,18 @@ pub(crate) fn start_runtime(service: State<'_, SetupService>) -> Result<SetupSna
         .last_runtime_fault
         .lock()
         .map_err(|_| coarse_error())? = None;
-    let child = Command::new(binary)
+    let mut command = Command::new(binary);
+    command
         .arg("run-managed")
         .arg(service.directory.join(PROFILE_FILE))
         .arg(control)
         .stdin(Stdio::null())
         .stdout(Stdio::from(stdout_log))
-        .stderr(Stdio::from(stderr_log))
-        .spawn()
-        .map_err(|_| coarse_error())?;
+        .stderr(Stdio::from(stderr_log));
+    if cfg!(debug_assertions) {
+        command.env("SOFTWARE_KVM_DEV_LOG", "1");
+    }
+    let child = command.spawn().map_err(|_| coarse_error())?;
     *active = Some(child);
     drop(active);
     service.snapshot().map_err(|()| coarse_error())
@@ -882,6 +943,56 @@ fn validate_bundle(peer: &PairingBundle) -> Result<(), String> {
     {
         return Err(coarse_error());
     }
+    Ok(())
+}
+
+fn write_setup_configuration(
+    service: &SetupService,
+    setup: &mut StoredSetup,
+) -> Result<(), String> {
+    refresh_lan_addresses(service, setup)?;
+    let local = setup.local.clone().ok_or_else(coarse_error)?;
+    let peer = setup.peer.clone().ok_or_else(coarse_error)?;
+    let local_displays =
+        native_displays(parse_host_id(&local.host_id)?).map_err(|_| coarse_error())?;
+    if local_displays.is_empty() || peer.displays.is_empty() {
+        return Err(coarse_error());
+    }
+    let config = build_config(&peer, &local_displays, &setup.placement)?;
+    let config_source = encode_config(&config).map_err(|_| coarse_error())?;
+    secure_write(
+        &service.directory.join(CONFIG_FILE),
+        config_source.as_bytes(),
+        true,
+    )
+    .map_err(|()| coarse_error())?;
+    let profile = build_profile(&service.directory, &local, &peer);
+    secure_write(
+        &service.directory.join(PROFILE_FILE),
+        profile.as_bytes(),
+        true,
+    )
+    .map_err(|()| coarse_error())?;
+    setup.configured = true;
+    setup.validated = false;
+    service.save(setup).map_err(|()| coarse_error())
+}
+
+fn refresh_lan_addresses(service: &SetupService, setup: &mut StoredSetup) -> Result<(), String> {
+    let peer = setup.peer.as_mut().ok_or_else(coarse_error)?;
+    if let Some(observed) = service
+        .discovery
+        .as_ref()
+        .and_then(|discovery| discovery.observed_runtime_address(&peer.peer_id))
+    {
+        peer.address = observed.to_string();
+    }
+    let peer_address = peer
+        .address
+        .parse::<SocketAddr>()
+        .map_err(|_| coarse_error())?;
+    let local_address = routed_local_address(peer_address).ok_or_else(coarse_error)?;
+    setup.local.as_mut().ok_or_else(coarse_error)?.address = local_address.to_string();
     Ok(())
 }
 
@@ -1076,6 +1187,51 @@ fn private_addresses() -> Vec<String> {
     addresses.sort();
     addresses.dedup();
     addresses
+}
+
+fn routed_local_address(peer: SocketAddr) -> Option<SocketAddr> {
+    let bind_address: SocketAddr = match peer {
+        SocketAddr::V4(_) => "0.0.0.0:0".parse().ok()?,
+        SocketAddr::V6(_) => "[::]:0".parse().ok()?,
+    };
+    let socket = UdpSocket::bind(bind_address).ok()?;
+    socket.connect(peer).ok()?;
+    let address = socket.local_addr().ok()?;
+    is_private_ip(address.ip()).then(|| SocketAddr::new(address.ip(), KVM_PORT))
+}
+
+fn read_developer_events(path: &Path) -> Vec<String> {
+    let Ok(mut file) = fs::File::open(path) else {
+        return Vec::new();
+    };
+    let length = file.metadata().map_or(0, |metadata| metadata.len());
+    let offset = length.saturating_sub(MAX_RUNTIME_LOG_READ);
+    if file.seek(SeekFrom::Start(offset)).is_err() {
+        return Vec::new();
+    }
+    let mut contents = String::new();
+    if file
+        .take(MAX_RUNTIME_LOG_READ)
+        .read_to_string(&mut contents)
+        .is_err()
+    {
+        return Vec::new();
+    }
+    contents
+        .lines()
+        .rev()
+        .take(40)
+        .map(|line| {
+            line.chars()
+                .filter(|character| !character.is_control())
+                .take(240)
+                .collect::<String>()
+        })
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect()
 }
 
 fn private_broadcast_addresses() -> Vec<IpAddr> {
