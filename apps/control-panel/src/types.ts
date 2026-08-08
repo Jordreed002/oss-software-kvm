@@ -1,6 +1,7 @@
 export type Platform = "macos" | "windows";
 export type RuntimeState = "stopped" | "starting" | "running" | "stopping" | "faulted";
 export type RuntimeFault = "native_capture" | "authenticated_transport" | "runtime_task" | "unknown";
+export type NearbyPresence = "setting_up" | "runtime_active";
 export type Placement = "local_left" | "local_right";
 
 export interface DisplayInfo {
@@ -46,6 +47,16 @@ export interface SetupSnapshot {
   runtime: RuntimeState;
   runtimeFault: RuntimeFault | null;
   runtimeLogPath: string | null;
+  discoveryAvailable: boolean;
+  nearbyMachines: NearbyMachine[];
   setupDirectory: string | null;
   profilePath: string | null;
+}
+
+export interface NearbyMachine {
+  name: string;
+  platform: Platform;
+  presence: NearbyPresence;
+  address: string;
+  paired: boolean;
 }

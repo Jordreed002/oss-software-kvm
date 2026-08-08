@@ -3399,6 +3399,7 @@ dependencies = [
  "kvm-runtime",
  "kvm-types",
  "kvm-windows",
+ "mdns-sd",
  "rcgen",
  "serde",
  "serde_json",

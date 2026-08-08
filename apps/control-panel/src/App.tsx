@@ -130,6 +130,7 @@ function LocalStep({ snapshot, name, setName, address, setAddress, busy, onConti
 function PairStep({ snapshot, bundle, setBundle, copied, onCopy, busy, onImport }: { snapshot: SetupSnapshot; bundle: string; setBundle: (v: string) => void; copied: boolean; onCopy: () => void; busy: string | null; onImport: () => void }) {
   return <div className="step-content enter">
     <SectionHeading number="02" kicker="TRUST" title="Exchange public link cards." copy="Copy this computer’s card to the other machine, then paste the other machine’s card below. It contains no private key." />
+    <NearbyPanel snapshot={snapshot}/>
     <div className="bundle-card">
       <div><span className="card-label">This computer’s public card</span><strong>{snapshot.local?.displayName}</strong><small>Certificate + address + display inventory</small></div>
       <button className="copy-button" onClick={onCopy}>{copied ? <Check size={17} /> : <Copy size={17} />}{copied ? "Copied" : "Copy card"}</button>
@@ -169,6 +170,7 @@ function ReadyStep({ snapshot, busy, onValidate, onStart, onStop }: { snapshot: 
   const runtimeFault = snapshot.runtime === "faulted" ? runtimeFaultMessage(snapshot.runtimeFault) : null;
   return <div className="step-content enter">
     <SectionHeading number="04" kicker="ACTIVATE" title={running ? "Your desk is linked." : "One last safety check."} copy={running ? "Pointer and keyboard routing are active. Closing this console does not terminate the runtime." : "Validate identities, certificates, network addresses, topology, and file protections before capture can start."} />
+    <NearbyPanel snapshot={snapshot}/>
     <div className="checklist">
       <CheckRow label="Local identity" detail="Private credential is protected" good={!!snapshot.local}/>
       <CheckRow label="Selected peer" detail="Public certificate is pinned" good={!!snapshot.peer}/>
@@ -180,6 +182,22 @@ function ReadyStep({ snapshot, busy, onValidate, onStart, onStop }: { snapshot: 
     {runtimeFault && snapshot.runtimeLogPath && <div className="path-note"><span>Private diagnostic log</span><code>{snapshot.runtimeLogPath}</code></div>}
     {!snapshot.validated ? <PrimaryButton busy={busy === "validate"} onClick={onValidate}>Validate this setup</PrimaryButton> : running ? <button className="stop-button" disabled={!!busy} onClick={onStop}><Square size={16} fill="currentColor"/> Stop routing safely</button> : <PrimaryButton busy={busy === "start"} onClick={onStart}><Play size={17} fill="currentColor"/> Start Software KVM</PrimaryButton>}
   </div>;
+}
+
+function NearbyPanel({ snapshot }: { snapshot: SetupSnapshot }) {
+  return <section className="nearby-panel" aria-label="Nearby Software KVM computers">
+    <div className="nearby-heading">
+      <div><span className="radar-mark"><Radio size={15}/></span><div><strong>LAN radar</strong><small>Untrusted presence · pairing still required</small></div></div>
+      <span className={snapshot.discoveryAvailable ? "scanning" : "unavailable"}>{snapshot.discoveryAvailable ? "SCANNING" : "UNAVAILABLE"}</span>
+    </div>
+    {snapshot.nearbyMachines.length === 0 ? <div className="nearby-empty"><i/><span>No other Software KVM consoles detected yet.</span></div> : <div className="nearby-list">
+      {snapshot.nearbyMachines.map((machine) => <div className="nearby-machine" key={`${machine.address}-${machine.name}`}>
+        <span className={`presence-orbit ${machine.presence}`}><i/></span>
+        <div><strong>{machine.name}</strong><small>{machine.platform === "macos" ? "macOS" : "Windows"} · {machine.address}</small></div>
+        <div className="nearby-badges">{machine.paired && <span>PAIRED</span>}<em>{machine.presence === "runtime_active" ? "RUNTIME ACTIVE" : "SETTING UP"}</em></div>
+      </div>)}
+    </div>}
+  </section>;
 }
 
 function runtimeFaultMessage(fault: SetupSnapshot["runtimeFault"]) {

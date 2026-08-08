@@ -18,6 +18,8 @@ const mock: SetupSnapshot = {
   runtime: "stopped",
   runtimeFault: null,
   runtimeLogPath: null,
+  discoveryAvailable: true,
+  nearbyMachines: [],
   setupDirectory: null,
   profilePath: null,
 };

@@ -1,3 +1,4 @@
+mod nearby;
 mod setup;
 
 use setup::SetupService;

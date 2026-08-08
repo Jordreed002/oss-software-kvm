@@ -25,6 +25,8 @@ use sha2::{Digest, Sha256};
 use tauri::{AppHandle, Manager, State};
 use uuid::Uuid;
 
+use crate::nearby::{NearbyDiscovery, NearbyMachineDto, NearbyPresence};
+
 const KVM_PORT: u16 = 24_800;
 const PAIRING_VERSION: u16 = 2;
 const CREDENTIAL_VERSION: u16 = 2;
@@ -48,6 +50,7 @@ pub(crate) struct SetupService {
     inner: Mutex<StoredSetup>,
     runtime: Mutex<Option<Child>>,
     last_runtime_fault: Mutex<Option<RuntimeFault>>,
+    discovery: Option<NearbyDiscovery>,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -170,6 +173,8 @@ pub(crate) struct SetupSnapshot {
     runtime: RuntimeState,
     runtime_fault: Option<RuntimeFault>,
     runtime_log_path: Option<String>,
+    discovery_available: bool,
+    nearby_machines: Vec<NearbyMachineDto>,
     setup_directory: Option<String>,
     profile_path: Option<String>,
 }
@@ -202,18 +207,31 @@ impl SetupService {
         if stored.draft_peer_id.is_empty() {
             stored.draft_peer_id = Uuid::new_v4().to_string();
         }
-        if !runtime_lock_held(&directory)
-            && reset_legacy_credentials(&directory, &mut stored)?
-        {
+        if !runtime_lock_held(&directory) && reset_legacy_credentials(&directory, &mut stored)? {
             let bytes = serde_json::to_vec_pretty(&stored)?;
             secure_write(&state_path, &bytes, true)
                 .map_err(|()| std::io::Error::other("credential upgrade failed"))?;
+        }
+        let discovery_addresses = private_addresses()
+            .into_iter()
+            .filter_map(|address| address.parse().ok())
+            .take(8)
+            .collect();
+        let discovery =
+            NearbyDiscovery::start(&stored.draft_peer_id, discovery_addresses, KVM_PORT).ok();
+        if let Some(discovery) = &discovery {
+            let advertised_name = stored
+                .local
+                .as_ref()
+                .map_or_else(suggested_name, |local| local.display_name.clone());
+            discovery.refresh(&advertised_name, platform_name(), NearbyPresence::SettingUp);
         }
         Ok(Self {
             directory,
             inner: Mutex::new(stored),
             runtime: Mutex::new(None),
             last_runtime_fault: Mutex::new(None),
+            discovery,
         })
     }
 
@@ -255,6 +273,21 @@ impl SetupService {
             .map(|local| self.local_dto(local, &displays))
             .transpose()?;
         let peer = setup.peer.clone().map(peer_dto);
+        let presence = if matches!(runtime_state, RuntimeState::Running) {
+            NearbyPresence::RuntimeActive
+        } else {
+            NearbyPresence::SettingUp
+        };
+        if let Some(discovery) = &self.discovery {
+            let advertised_name = setup
+                .local
+                .as_ref()
+                .map_or_else(suggested_name, |local| local.display_name.clone());
+            discovery.refresh(&advertised_name, platform_name(), presence);
+        }
+        let nearby_machines = self.discovery.as_ref().map_or_else(Vec::new, |discovery| {
+            discovery.snapshot(setup.peer.as_ref().map(|peer| peer.peer_id.as_str()))
+        });
         Ok(SetupSnapshot {
             platform: current_platform(),
             suggested_name: suggested_name(),
@@ -273,6 +306,8 @@ impl SetupService {
                     .to_string_lossy()
                     .into_owned()
             }),
+            discovery_available: self.discovery.is_some(),
+            nearby_machines,
             setup_directory: setup
                 .configured
                 .then(|| self.directory.to_string_lossy().into_owned()),
@@ -858,6 +893,21 @@ fn current_platform() -> PlatformDto {
     #[cfg(not(any(target_os = "macos", windows)))]
     {
         PlatformDto::Macos
+    }
+}
+
+const fn platform_name() -> &'static str {
+    #[cfg(target_os = "macos")]
+    {
+        "macos"
+    }
+    #[cfg(windows)]
+    {
+        "windows"
+    }
+    #[cfg(not(any(target_os = "macos", windows)))]
+    {
+        "macos"
     }
 }
 
