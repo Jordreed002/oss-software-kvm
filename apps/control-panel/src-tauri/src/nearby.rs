@@ -76,7 +76,11 @@ pub(crate) struct NearbyDiscovery {
 }
 
 impl NearbyDiscovery {
-    pub(crate) fn start(peer_id: &str, addresses: &[IpAddr], runtime_port: u16) -> Result<Self, ()> {
+    pub(crate) fn start(
+        peer_id: &str,
+        addresses: &[IpAddr],
+        runtime_port: u16,
+    ) -> Result<Self, ()> {
         if !valid_peer_id(peer_id)
             || addresses.is_empty()
             || addresses.len() > 8

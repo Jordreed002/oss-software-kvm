@@ -212,7 +212,7 @@ impl SetupService {
             secure_write(&state_path, &bytes, true)
                 .map_err(|()| std::io::Error::other("credential upgrade failed"))?;
         }
-        let discovery_addresses = private_addresses()
+        let discovery_addresses: Vec<IpAddr> = private_addresses()
             .into_iter()
             .filter_map(|address| address.parse().ok())
             .take(8)
