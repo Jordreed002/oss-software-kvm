@@ -55,6 +55,14 @@ pub struct CaptureStatistics {
     pub dropped_events: u64,
     /// Native packets that could not be represented safely in the shared model.
     pub untranslated_packets: u64,
+    /// Raw Input keyboard packets presented to the translator.
+    pub keyboard_packets: u64,
+    /// Raw Input mouse packets presented to the translator.
+    pub mouse_packets: u64,
+    /// Keyboard packets rejected by conservative translation.
+    pub untranslated_keyboard_packets: u64,
+    /// Mouse packets that contained no representable motion, button, or wheel event.
+    pub untranslated_mouse_packets: u64,
     /// Panics caught at the callback boundary.
     pub callback_panics: u64,
     /// Suppression requests ignored by the observation-only Raw Input layer.

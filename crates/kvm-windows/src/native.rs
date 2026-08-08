@@ -4,7 +4,7 @@
 
 use std::collections::HashMap;
 use std::ffi::c_void;
-use std::mem::{size_of, MaybeUninit};
+use std::mem::size_of;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender, TrySendError};
@@ -20,12 +20,21 @@ use kvm_input::{InputEvent, InputPayload};
 use kvm_types::{
     DeviceCapabilities, DeviceKind, Display, DisplayId, HostId, InputDevice, Rect, Size,
 };
-use windows::core::{w, BOOL};
+use windows::core::{w, BOOL, GUID, PCWSTR};
+use windows::Win32::Devices::DeviceAndDriverInstallation::{
+    CM_Get_Device_Interface_PropertyW, CR_SUCCESS,
+};
+use windows::Win32::Devices::Properties::{
+    DEVPKEY_Device_ContainerId, DEVPROPTYPE, DEVPROP_TYPE_GUID,
+};
 use windows::Win32::Foundation::{HANDLE, HWND, LPARAM, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{
     EnumDisplayMonitors, GetMonitorInfoW, HDC, HMONITOR, MONITORINFO, MONITORINFOEXW,
 };
-use windows::Win32::UI::HiDpi::{GetDpiForMonitor, MDT_EFFECTIVE_DPI};
+use windows::Win32::UI::HiDpi::{
+    GetDpiForMonitor, SetThreadDpiAwarenessContext, DPI_AWARENESS_CONTEXT,
+    DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, MDT_EFFECTIVE_DPI,
+};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, INPUT_MOUSE, KEYBDINPUT, KEYEVENTF_EXTENDEDKEY,
     KEYEVENTF_KEYUP, KEYEVENTF_SCANCODE, MOUSEEVENTF_HWHEEL, MOUSEEVENTF_LEFTDOWN,
@@ -36,9 +45,9 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
 use windows::Win32::UI::Input::{
     GetCurrentInputMessageSource, GetRawInputData, GetRawInputDeviceInfoW, GetRawInputDeviceList,
     RegisterRawInputDevices, HRAWINPUT, IMO_HARDWARE, IMO_INJECTED, IMO_SYSTEM,
-    INPUT_MESSAGE_SOURCE, RAWINPUT, RAWINPUTDEVICE, RAWINPUTDEVICELIST, RIDEV_DEVNOTIFY,
-    RIDEV_INPUTSINK, RIDEV_REMOVE, RIDI_DEVICEINFO, RIDI_DEVICENAME, RID_DEVICE_INFO, RID_INPUT,
-    RIM_TYPEKEYBOARD, RIM_TYPEMOUSE,
+    INPUT_MESSAGE_SOURCE, RAWINPUT, RAWINPUTDEVICE, RAWINPUTDEVICELIST, RAWKEYBOARD, RAWMOUSE,
+    RIDEV_DEVNOTIFY, RIDEV_INPUTSINK, RIDEV_REMOVE, RIDI_DEVICEINFO, RIDI_DEVICENAME,
+    RID_DEVICE_INFO, RID_INPUT, RIM_TYPEKEYBOARD, RIM_TYPEMOUSE,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetMessageW,
@@ -51,7 +60,7 @@ use crate::capture::{
     classify_raw_input, is_state_transition, translate_keyboard, translate_mouse, MessageOrigin,
     RawKeyboardPacket, RawMousePacket,
 };
-use crate::identity::usb_ids_from_device_path;
+use crate::identity::{container_scoped_raw_input_identity, usb_ids_from_device_path};
 use crate::mapping::{key_is_released, mouse_action, scan_code, MouseAction, WHEEL_DELTA};
 use crate::ownership::{ClaimError, RegistrationState};
 use crate::{
@@ -70,6 +79,10 @@ struct CaptureCounters {
     captured_events: AtomicU64,
     dropped_events: AtomicU64,
     untranslated_packets: AtomicU64,
+    keyboard_packets: AtomicU64,
+    mouse_packets: AtomicU64,
+    untranslated_keyboard_packets: AtomicU64,
+    untranslated_mouse_packets: AtomicU64,
     callback_panics: AtomicU64,
     suppression_requests_ignored: AtomicU64,
     capture_discontinuities: AtomicU64,
@@ -81,6 +94,12 @@ impl CaptureCounters {
             captured_events: self.captured_events.load(Ordering::Relaxed),
             dropped_events: self.dropped_events.load(Ordering::Relaxed),
             untranslated_packets: self.untranslated_packets.load(Ordering::Relaxed),
+            keyboard_packets: self.keyboard_packets.load(Ordering::Relaxed),
+            mouse_packets: self.mouse_packets.load(Ordering::Relaxed),
+            untranslated_keyboard_packets: self
+                .untranslated_keyboard_packets
+                .load(Ordering::Relaxed),
+            untranslated_mouse_packets: self.untranslated_mouse_packets.load(Ordering::Relaxed),
             callback_panics: self.callback_panics.load(Ordering::Relaxed),
             suppression_requests_ignored: self.suppression_requests_ignored.load(Ordering::Relaxed),
             capture_discontinuities: self.capture_discontinuities.load(Ordering::Relaxed),
@@ -287,20 +306,14 @@ impl WindowsInputBackend {
             )
         };
 
-        let durable_identity = if raw_path.is_empty() {
-            format!("session-handle:{}:{:p}", fallback_label, entry.hDevice.0)
-        } else {
-            raw_path.clone()
-        };
+        let durable_identity =
+            durable_raw_input_identity(&raw_path, entry.dwType.0, entry.hDevice.0);
+        let public_name = fallback_label.to_owned();
         let (vendor_id, product_id) = usb_ids_from_device_path(&raw_path);
         let mut device = InputDevice::new(
             derive_device_id(&durable_identity),
             self.host_id,
-            if raw_path.is_empty() {
-                fallback_label.to_owned()
-            } else {
-                raw_path
-            },
+            public_name,
             kind,
             capabilities,
         );
@@ -478,6 +491,65 @@ impl WindowsInputBackend {
         self.capture = None;
         thread_error.map_or(Ok(()), Err)
     }
+}
+
+fn durable_raw_input_identity(
+    raw_path: &str,
+    device_type: u32,
+    native_handle: *mut c_void,
+) -> String {
+    if raw_path.is_empty() {
+        return format!(
+            "session-handle:{}:{native_handle:p}",
+            raw_input_type_label(device_type)
+        );
+    }
+    if let Some(identity) = device_container_id(raw_path)
+        .and_then(|container| container_scoped_raw_input_identity(container, raw_path))
+    {
+        return identity;
+    }
+    raw_path.to_owned()
+}
+
+fn raw_input_type_label(device_type: u32) -> &'static str {
+    if device_type == RIM_TYPEKEYBOARD.0 {
+        "keyboard"
+    } else if device_type == RIM_TYPEMOUSE.0 {
+        "mouse"
+    } else {
+        "other"
+    }
+}
+
+fn device_container_id(raw_path: &str) -> Option<u128> {
+    let wide_path = raw_path
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect::<Vec<_>>();
+    let mut property_type = DEVPROPTYPE::default();
+    let mut container = GUID::zeroed();
+    let property_key = DEVPKEY_Device_ContainerId;
+    let mut byte_count =
+        u32::try_from(size_of::<GUID>()).expect("a Windows GUID always fits in u32");
+    // SAFETY: the path is null-terminated UTF-16, every output pointer refers
+    // to initialized writable storage of the advertised size, and no buffer is
+    // retained by Configuration Manager.
+    let result = unsafe {
+        CM_Get_Device_Interface_PropertyW(
+            PCWSTR(wide_path.as_ptr()),
+            &raw const property_key,
+            &raw mut property_type,
+            Some((&raw mut container).cast::<u8>()),
+            &raw mut byte_count,
+            0,
+        )
+    };
+    (result == CR_SUCCESS
+        && property_type == DEVPROP_TYPE_GUID
+        && byte_count as usize == size_of::<GUID>()
+        && container != GUID::zeroed())
+    .then(|| container.to_u128())
 }
 
 impl Drop for WindowsInputBackend {
@@ -951,11 +1023,12 @@ fn dispatch_raw_input(
     sender: &SyncSender<CapturedInput>,
     counters: &CaptureCounters,
 ) -> Result<(), WindowsBackendError> {
-    let source_device = capture_device_id(raw.header.hDevice, devices);
+    let source_device = capture_device_id(raw.header.hDevice, raw.header.dwType, devices);
     let has_device_handle = !raw.header.hDevice.0.is_null();
     let timestamp_ns = u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX);
 
     if raw.header.dwType == RIM_TYPEKEYBOARD.0 {
+        counters.keyboard_packets.fetch_add(1, Ordering::Relaxed);
         // SAFETY: `dwType` selects the keyboard arm of the RAWINPUT union.
         let keyboard = unsafe { raw.data.keyboard };
         let classification =
@@ -967,6 +1040,9 @@ fn dispatch_raw_input(
         }) else {
             counters
                 .untranslated_packets
+                .fetch_add(1, Ordering::Relaxed);
+            counters
+                .untranslated_keyboard_packets
                 .fetch_add(1, Ordering::Relaxed);
             return Ok(());
         };
@@ -981,6 +1057,7 @@ fn dispatch_raw_input(
             counters,
         )?;
     } else if raw.header.dwType == RIM_TYPEMOUSE.0 {
+        counters.mouse_packets.fetch_add(1, Ordering::Relaxed);
         // SAFETY: `dwType` selects the mouse arm of the RAWINPUT union.
         let mouse = unsafe { raw.data.mouse };
         // SAFETY: Raw Input documents the button flag/data pair as the active
@@ -998,6 +1075,9 @@ fn dispatch_raw_input(
         if payloads.is_empty() {
             counters
                 .untranslated_packets
+                .fetch_add(1, Ordering::Relaxed);
+            counters
+                .untranslated_mouse_packets
                 .fetch_add(1, Ordering::Relaxed);
         }
         for payload in payloads {
@@ -1072,8 +1152,8 @@ fn current_message_origin() -> MessageOrigin {
 }
 
 fn read_raw_input(handle: HRAWINPUT) -> Result<RAWINPUT, WindowsBackendError> {
-    let header_size = u32::try_from(size_of::<windows::Win32::UI::Input::RAWINPUTHEADER>())
-        .expect("RAWINPUTHEADER always fits in u32");
+    let native_header_size = size_of::<windows::Win32::UI::Input::RAWINPUTHEADER>();
+    let header_size = u32::try_from(native_header_size).expect("RAWINPUTHEADER always fits in u32");
     let mut byte_count = 0_u32;
     // SAFETY: this is the documented null-buffer size query; `byte_count` is
     // writable and the HRAWINPUT came directly from WM_INPUT.
@@ -1082,17 +1162,20 @@ fn read_raw_input(handle: HRAWINPUT) -> Result<RAWINPUT, WindowsBackendError> {
     if first == UINT_ERROR {
         return Err(last_api_error("GetRawInputData(size query)"));
     }
-    if byte_count < u32::try_from(size_of::<RAWINPUT>()).expect("RAWINPUT always fits in u32") {
+    if byte_count < header_size {
         return Err(WindowsBackendError::CaptureRuntime(
-            "Raw Input packet was smaller than RAWINPUT".into(),
+            "Raw Input packet was smaller than RAWINPUTHEADER".into(),
         ));
     }
 
     let unit_size = size_of::<RAWINPUT>();
     let units = (byte_count as usize).div_ceil(unit_size);
-    let mut storage = vec![MaybeUninit::<RAWINPUT>::uninit(); units];
+    // Keyboard packets can be smaller than the largest RAWINPUT union member.
+    // Zero-initialize the aligned tail so returning the fixed Rust binding is
+    // sound after Windows writes only the active packet variant.
+    let mut storage = (0..units).map(|_| RAWINPUT::default()).collect::<Vec<_>>();
     // SAFETY: `storage` is correctly aligned and spans at least `byte_count`
-    // writable bytes. It is not read until the API reports a complete packet.
+    // writable bytes.
     let returned = unsafe {
         GetRawInputData(
             handle,
@@ -1105,14 +1188,33 @@ fn read_raw_input(handle: HRAWINPUT) -> Result<RAWINPUT, WindowsBackendError> {
     if returned == UINT_ERROR {
         return Err(last_api_error("GetRawInputData"));
     }
-    if returned < u32::try_from(size_of::<RAWINPUT>()).expect("RAWINPUT always fits in u32") {
+    if returned < header_size {
         return Err(WindowsBackendError::CaptureRuntime(
-            "GetRawInputData returned a truncated packet".into(),
+            "GetRawInputData returned a truncated Raw Input header".into(),
         ));
     }
-    // SAFETY: the API wrote at least one complete RAWINPUT record, verified by
-    // `returned`, into storage aligned for RAWINPUT.
-    Ok(unsafe { storage[0].assume_init_read() })
+    let raw = storage
+        .into_iter()
+        .next()
+        .expect("a non-empty Raw Input packet allocates at least one unit");
+    let required = minimum_raw_input_size(raw.header.dwType);
+    if (returned as usize) < required || (raw.header.dwSize as usize) < required {
+        return Err(WindowsBackendError::CaptureRuntime(
+            "GetRawInputData returned a truncated typed packet".into(),
+        ));
+    }
+    Ok(raw)
+}
+
+fn minimum_raw_input_size(device_type: u32) -> usize {
+    let header = size_of::<windows::Win32::UI::Input::RAWINPUTHEADER>();
+    if device_type == RIM_TYPEKEYBOARD.0 {
+        header + size_of::<RAWKEYBOARD>()
+    } else if device_type == RIM_TYPEMOUSE.0 {
+        header + size_of::<RAWMOUSE>()
+    } else {
+        header
+    }
 }
 
 fn build_capture_device_cache() -> HashMap<usize, kvm_types::DeviceId> {
@@ -1124,7 +1226,7 @@ fn build_capture_device_cache() -> HashMap<usize, kvm_types::DeviceId> {
         .filter(|entry| entry.dwType == RIM_TYPEKEYBOARD || entry.dwType == RIM_TYPEMOUSE)
         .map(|entry| {
             let key = entry.hDevice.0 as usize;
-            let id = capture_device_id(entry.hDevice, &mut HashMap::new());
+            let id = capture_device_id(entry.hDevice, entry.dwType.0, &mut HashMap::new());
             (key, id)
         })
         .collect()
@@ -1132,6 +1234,7 @@ fn build_capture_device_cache() -> HashMap<usize, kvm_types::DeviceId> {
 
 fn capture_device_id(
     handle: HANDLE,
+    device_type: u32,
     devices: &mut HashMap<usize, kvm_types::DeviceId>,
 ) -> kvm_types::DeviceId {
     if handle.0.is_null() {
@@ -1142,11 +1245,7 @@ fn capture_device_id(
         return *id;
     }
     let path = raw_device_name(handle).unwrap_or_default();
-    let identity = if path.is_empty() {
-        format!("session-handle:raw-input:{:p}", handle.0)
-    } else {
-        path
-    };
+    let identity = durable_raw_input_identity(&path, device_type, handle.0);
     let id = derive_device_id(&identity);
     devices.insert(key, id);
     id
@@ -1289,7 +1388,34 @@ struct MonitorCollector {
     error: Option<WindowsBackendError>,
 }
 
+struct ThreadDpiAwarenessGuard {
+    previous: DPI_AWARENESS_CONTEXT,
+}
+
+impl ThreadDpiAwarenessGuard {
+    fn enter_per_monitor_v2() -> Result<Self, WindowsBackendError> {
+        // SAFETY: this changes only the calling thread's DPI context and the
+        // returned prior context is restored by Drop on every exit path.
+        let previous =
+            unsafe { SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2) };
+        if previous.0.is_null() {
+            Err(last_api_error("SetThreadDpiAwarenessContext(enumeration)"))
+        } else {
+            Ok(Self { previous })
+        }
+    }
+}
+
+impl Drop for ThreadDpiAwarenessGuard {
+    fn drop(&mut self) {
+        // SAFETY: `previous` was returned by the successful context change in
+        // `enter_per_monitor_v2` and belongs to this same thread.
+        let _ = unsafe { SetThreadDpiAwarenessContext(self.previous) };
+    }
+}
+
 fn enumerate_monitors(host_id: HostId) -> Result<Vec<Display>, WindowsBackendError> {
+    let _dpi_awareness = ThreadDpiAwarenessGuard::enter_per_monitor_v2()?;
     let mut collector = MonitorCollector {
         host_id,
         displays: Vec::new(),
@@ -1357,29 +1483,41 @@ fn display_from_monitor(
         ));
     }
 
-    let mut dpi_x = 96_u32;
-    let mut dpi_y = 96_u32;
-    // SAFETY: both DPI pointers are writable and `monitor` is valid during
-    // enumeration. Failure is non-fatal because 96 DPI is Windows' base scale.
-    let _ = unsafe { GetDpiForMonitor(monitor, MDT_EFFECTIVE_DPI, &raw mut dpi_x, &raw mut dpi_y) };
+    let mut dpi_x = 0_u32;
+    let mut dpi_y = 0_u32;
+    // SAFETY: both DPI pointers are writable, `monitor` is valid during
+    // enumeration, and the caller established a per-monitor-aware context.
+    unsafe { GetDpiForMonitor(monitor, MDT_EFFECTIVE_DPI, &raw mut dpi_x, &raw mut dpi_y) }
+        .map_err(|error| binding_error("GetDpiForMonitor", &error))?;
+    if dpi_x == 0 || dpi_y == 0 {
+        return Err(WindowsBackendError::InvalidInput(
+            "Windows returned zero effective display DPI",
+        ));
+    }
     let scale_factor = (f64::from(dpi_x) + f64::from(dpi_y)) / (2.0 * 96.0);
+    let physical_width = f64::from(width);
+    let physical_height = f64::from(height);
     let identity = format!("display:{name}");
 
     Ok(Display {
         id: DisplayId::from_bytes(derive_device_id(&identity).into_bytes()),
         host_id,
         name,
-        logical_size: Size::new(f64::from(width), f64::from(height)),
-        // GDI monitor bounds are affected by the process DPI-awareness mode;
-        // do not claim independent physical dimensions without DisplayConfig.
-        physical_size: None,
+        logical_size: Size::new(
+            physical_width / scale_factor,
+            physical_height / scale_factor,
+        ),
+        physical_size: Some(Size::new(physical_width, physical_height)),
         scale_factor,
         refresh_rate: None,
+        // Per-monitor-v2 Win32 virtual-screen coordinates are physical pixels.
+        // They preserve the real adjacency of mixed-DPI displays; logical size
+        // remains available separately for normalized workspace mapping.
         native_bounds: Rect::new(
             f64::from(bounds.left),
             f64::from(bounds.top),
-            f64::from(width),
-            f64::from(height),
+            physical_width,
+            physical_height,
         ),
         primary: info.monitorInfo.dwFlags & MONITORINFOF_PRIMARY != 0,
     })
@@ -1415,5 +1553,35 @@ mod tests {
     fn out_of_range_delta_is_rejected() {
         let mut remainder = 0.0;
         assert!(take_integral_delta(f64::MAX, &mut remainder).is_err());
+    }
+
+    #[test]
+    fn missing_raw_input_path_uses_type_specific_session_identity() {
+        let handle = 42_usize as *mut c_void;
+        let keyboard = durable_raw_input_identity("", RIM_TYPEKEYBOARD.0, handle);
+        let mouse = durable_raw_input_identity("", RIM_TYPEMOUSE.0, handle);
+
+        assert!(keyboard.starts_with("session-handle:keyboard:"));
+        assert!(mouse.starts_with("session-handle:mouse:"));
+        assert_ne!(keyboard, mouse);
+    }
+
+    #[test]
+    fn keyboard_packet_size_is_validated_against_its_active_variant() {
+        let keyboard_size = minimum_raw_input_size(RIM_TYPEKEYBOARD.0);
+
+        assert!(keyboard_size < size_of::<RAWINPUT>());
+        assert_eq!(
+            keyboard_size,
+            size_of::<windows::Win32::UI::Input::RAWINPUTHEADER>() + size_of::<RAWKEYBOARD>()
+        );
+    }
+
+    #[test]
+    fn physical_pixels_convert_to_logical_size_at_recommended_scale() {
+        let scale = 144.0 / 96.0;
+
+        assert!((3840.0 / scale - 2560.0_f64).abs() < f64::EPSILON);
+        assert!((2160.0 / scale - 1440.0_f64).abs() < f64::EPSILON);
     }
 }
