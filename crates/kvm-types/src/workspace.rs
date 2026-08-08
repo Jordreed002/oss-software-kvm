@@ -1,13 +1,21 @@
+use core::fmt;
+
 use serde::{Deserialize, Serialize};
 
 use crate::{DisplayId, HostId, Point};
 
 /// The single logical pointer shared by all follow-active-host devices.
-#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct LogicalPointer {
     pub display_id: DisplayId,
     pub x: f64,
     pub y: f64,
+}
+
+impl fmt::Debug for LogicalPointer {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("LogicalPointer([REDACTED])")
+    }
 }
 
 impl LogicalPointer {
@@ -28,12 +36,18 @@ impl LogicalPointer {
 }
 
 /// Router-visible state for a host's view of the shared workspace.
-#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct WorkspaceState {
     pub local_host: HostId,
     pub active_host: HostId,
     pub active_display: DisplayId,
     pub pointer: LogicalPointer,
+}
+
+impl fmt::Debug for WorkspaceState {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("WorkspaceState([REDACTED])")
+    }
 }
 
 impl WorkspaceState {
@@ -72,5 +86,17 @@ mod tests {
         assert_eq!(state.active_host, remote);
         assert_eq!(state.active_display, second);
         assert_eq!(state.pointer.display_id, second);
+    }
+
+    #[test]
+    fn workspace_debug_omits_stable_identity_and_coordinates() {
+        let marker = [0x71; 16];
+        let host = HostId::from_bytes(marker);
+        let display = DisplayId::from_bytes(marker);
+        let pointer = LogicalPointer::new(display, 7171.25, 8383.5);
+        let state = WorkspaceState::new(host, host, pointer);
+
+        assert_eq!(format!("{pointer:?}"), "LogicalPointer([REDACTED])");
+        assert_eq!(format!("{state:?}"), "WorkspaceState([REDACTED])");
     }
 }

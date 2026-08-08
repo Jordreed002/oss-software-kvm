@@ -6,13 +6,32 @@ use std::fmt;
 
 use kvm_types::{Display, DisplayId, Edge, Point, Rect};
 
+mod configured;
+
+pub use configured::{
+    ConfiguredWorkspace, ConfiguredWorkspaceCompiler, WorkspaceCompileError, WorkspaceEpoch,
+    WorkspaceLink, WorkspacePlacement, WorkspaceTransition, WorkspaceTransitionError,
+    MAX_LOGICAL_DISPLAY_EXTENT, MAX_WORKSPACE_COORDINATE, MAX_WORKSPACE_DISPLAYS,
+    MAX_WORKSPACE_EXTENT, MAX_WORKSPACE_HOSTS, MAX_WORKSPACE_LINKS,
+};
+
 const GEOMETRY_EPSILON: f64 = 1.0e-9;
 
 /// A platform display placed in the shared logical workspace.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, PartialEq)]
 pub struct WorkspaceDisplay {
     pub display: Display,
     pub workspace_bounds: Rect,
+}
+
+impl fmt::Debug for WorkspaceDisplay {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("WorkspaceDisplay")
+            .field("display", &"[REDACTED]")
+            .field("workspace_geometry", &"[REDACTED]")
+            .finish_non_exhaustive()
+    }
 }
 
 impl WorkspaceDisplay {
@@ -37,18 +56,27 @@ impl WorkspaceDisplay {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Eq, PartialEq)]
 pub enum TopologyError {
     InvalidDisplay(DisplayId),
     InvalidWorkspaceBounds(DisplayId),
 }
 
+impl fmt::Debug for TopologyError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::InvalidDisplay(_) => "TopologyError::InvalidDisplay",
+            Self::InvalidWorkspaceBounds(_) => "TopologyError::InvalidWorkspaceBounds",
+        })
+    }
+}
+
 impl fmt::Display for TopologyError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::InvalidDisplay(id) => write!(formatter, "display {id} has invalid metadata"),
-            Self::InvalidWorkspaceBounds(id) => {
-                write!(formatter, "display {id} has invalid workspace bounds")
+            Self::InvalidDisplay(_) => formatter.write_str("display has invalid metadata"),
+            Self::InvalidWorkspaceBounds(_) => {
+                formatter.write_str("display has invalid workspace bounds")
             }
         }
     }
@@ -57,7 +85,7 @@ impl fmt::Display for TopologyError {
 impl Error for TopologyError {}
 
 /// Result of crossing one display edge into another.
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, PartialEq)]
 pub struct PointerTransition {
     pub display_id: DisplayId,
     pub entry_edge: Edge,
@@ -68,10 +96,25 @@ pub struct PointerTransition {
     pub normalized_position: f64,
 }
 
+impl fmt::Debug for PointerTransition {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("PointerTransition([REDACTED])")
+    }
+}
+
 /// All displays arranged in a single logical coordinate system.
-#[derive(Clone, Debug, Default, PartialEq)]
+#[derive(Clone, Default, PartialEq)]
 pub struct WorkspaceTopology {
     pub displays: HashMap<DisplayId, WorkspaceDisplay>,
+}
+
+impl fmt::Debug for WorkspaceTopology {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("WorkspaceTopology")
+            .field("display_count", &self.displays.len())
+            .finish_non_exhaustive()
+    }
 }
 
 impl WorkspaceTopology {
@@ -323,3 +366,6 @@ fn point_at(bounds: Rect, edge: Edge, position: f64) -> Point {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod configured_tests;

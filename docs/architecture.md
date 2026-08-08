@@ -18,9 +18,12 @@ advanced gestures, Linux, display streaming, and WAN control are deliberately de
 - `kvm-protocol`: independently versioned wire data and framing.
 - `kvm-router`: device-route decisions against an immutable workspace snapshot.
 - `kvm-topology`: logical display geometry and cross-display transitions.
-- `kvm-network`: authenticated-stream framing, admitted persistent peer sessions, channel
-  scheduling, peer health, reconnect policy, and a sealed outbound TCP/rustls adapter. Production
-  inbound listening and discovery remain integration work.
+- `kvm-network`: authenticated-stream framing, direction-neutral admitted sessions, channel
+  scheduling, peer health, reconnect policy, sealed inbound/outbound TCP/rustls adapters, and
+  deterministic connection-role/generation state. It also owns the bounded explicit-LAN listener
+  and the validated production LAN-address connector boundary.
+- `kvm-discovery`: bounded, expiring, untrusted DNS-SD/mDNS advertisement and reachability
+  snapshots. Discovery never establishes peer identity or authorization.
 - `kvm-security`: host identity, pairing, authorization, and credential interfaces. Native
   credential stores remain integration work; paired session admission now consumes the
   network-owned, direction-bound TLS exporter proof.
@@ -29,8 +32,11 @@ advanced gestures, Linux, display streaming, and WAN control are deliberately de
 - `kvm-windows` and `kvm-macos`: native device/display enumeration, observation-only capture,
   injection, identity, and capability/permission surfaces. Selective suppression remains behind
   the native feasibility gate described in `platform-notes.md`.
-- `kvm-daemon`: safety-state, deliberate wire/domain conversion, and simulated admitted-peer
-  coordination. Full native composition, local IPC, and service lifecycle remain integration work.
+- `kvm-daemon`: safety-state, deliberate wire/domain conversion, simulated admitted-peer
+  coordination, generation-aware peer supervision, deterministic paired-peer scheduling over
+  untrusted discovery candidates, one selected logical-workspace control plane, and synchronous
+  Follow Active Host routing into the exact admitted FIFO. Full native composition, local IPC, and
+  service lifecycle remain integration work.
 - `kvm-diagnostics`: read-only physical-host evidence collection. It never suppresses or routes
   input and redacts captured payload values by default.
 
@@ -40,10 +46,17 @@ APIs. Wire structs remain separate from domain structs so either side can evolve
 ## Input path
 
 Native callbacks classify an event as physical, KVM-injected, or unknown and convert physical
-events into the shared representation immediately. A routing decision uses a read-only workspace
-snapshot. Local events are released to the OS; remote events are suppressed locally and offered
-to a bounded, high-priority input channel. Injection updates pressed state before acknowledging
-the event.
+events into the shared representation immediately. The platform-neutral authoritative decision is
+a synchronous mutable operation on the selected peer manager: it validates the exact admitted
+generation and current workspace, enqueues remote input on that session's bounded FIFO, commits
+held state, and only then reports local suppression. Immutable routing snapshots are observational
+and cannot independently authorize suppression. The native callback-to-manager reservation and
+drain bridge remains a later hardware milestone.
+
+State-bearing keys and buttons are latched to one destination until physical release. Route or
+authority changes first gate affected input and queue deterministic releases; unsent cleanup stays
+owned for retry until it enters the FIFO or transport termination is confirmed. Key repeat follows
+the existing latch without allocating or changing held state.
 
 Clipboard, discovery, diagnostics, configuration, logging, and the UI use separate bounded work
 queues. They cannot apply backpressure to keyboard or pointer processing. Mouse movement may be
@@ -53,10 +66,12 @@ the peer is healthy.
 ## Workspace authority
 
 The daemon hosting the active display is authoritative for the logical pointer. A cross-host
-transition carries a monotonically increasing workspace epoch and transition identifier. The new
-host acknowledges the transition before it becomes authoritative. Stale epochs are rejected.
-During ambiguity or connection failure both peers converge to safe local control rather than
-continuing remote suppression.
+transition carries a monotonically increasing workspace epoch and transition identifier. The
+destination gates affected Follow Active Host input and queues its releases before sending an
+accepted acknowledgement. The source then queues an ordered Commit before publishing remote
+authority; the destination becomes authoritative only after consuming that exact Commit. Stale
+epochs and generations are rejected. During ambiguity or connection failure routing is gated and
+both peers reconcile to safe local control rather than continuing remote suppression.
 
 ## Native execution model
 

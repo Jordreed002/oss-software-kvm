@@ -1,5 +1,6 @@
 use kvm_protocol::{
-    decode_frame, encode_frame, FrameHeader, ProtocolError, WireMessage, FRAME_HEADER_LEN,
+    decode_frame_for_version, encode_frame, FrameHeader, ProtocolError, WireMessage,
+    FRAME_HEADER_LEN, PROTOCOL_VERSION_V1,
 };
 use thiserror::Error;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -23,6 +24,7 @@ pub enum NetworkError {
 #[derive(Debug)]
 pub struct FrameReader<R> {
     stream: R,
+    required_version: u16,
 }
 
 /// Incremental receive state retained by a peer session across competing
@@ -70,7 +72,18 @@ where
     /// Marks a stream half that the caller has already encrypted and
     /// authenticated as ready for protocol reads.
     pub const fn new_authenticated(stream: R) -> Self {
-        Self { stream }
+        Self {
+            stream,
+            required_version: PROTOCOL_VERSION_V1,
+        }
+    }
+
+    /// Creates an internal reader bound to one already negotiated version.
+    pub(crate) const fn new_authenticated_for_version(stream: R, required_version: u16) -> Self {
+        Self {
+            stream,
+            required_version,
+        }
     }
 
     /// Reads exactly one frame, tolerating arbitrary fragmentation by the
@@ -83,7 +96,7 @@ where
     pub async fn read_message(&mut self) -> Result<WireMessage, NetworkError> {
         let mut header_bytes = [0_u8; FRAME_HEADER_LEN];
         self.stream.read_exact(&mut header_bytes).await?;
-        let header = FrameHeader::decode(&header_bytes)?;
+        let header = FrameHeader::decode_for_version(&header_bytes, self.required_version)?;
 
         let payload_length = header.payload_length as usize;
         let mut frame = Vec::with_capacity(FRAME_HEADER_LEN + payload_length);
@@ -92,7 +105,7 @@ where
         self.stream
             .read_exact(&mut frame[FRAME_HEADER_LEN..])
             .await?;
-        Ok(decode_frame(&frame)?)
+        Ok(decode_frame_for_version(&frame, self.required_version)?)
     }
 
     /// Advances one frame by at most one cancellation-safe `read` operation.
@@ -119,11 +132,11 @@ where
             if progress.header_read < FRAME_HEADER_LEN {
                 return Ok(None);
             }
-            let header = FrameHeader::decode(&progress.header)?;
+            let header = FrameHeader::decode_for_version(&progress.header, self.required_version)?;
             progress.payload.resize(header.payload_length as usize, 0);
             progress.decoded_header = Some(header);
             if progress.payload.is_empty() {
-                return finish_progress(progress).map(Some);
+                return finish_progress(progress, self.required_version).map(Some);
             }
             return Ok(None);
         }
@@ -142,7 +155,7 @@ where
         if progress.payload_read < progress.payload.len() {
             return Ok(None);
         }
-        finish_progress(progress).map(Some)
+        finish_progress(progress, self.required_version).map(Some)
     }
 
     pub fn into_inner(self) -> R {
@@ -150,12 +163,15 @@ where
     }
 }
 
-fn finish_progress(progress: &mut FrameReadProgress) -> Result<WireMessage, NetworkError> {
+fn finish_progress(
+    progress: &mut FrameReadProgress,
+    required_version: u16,
+) -> Result<WireMessage, NetworkError> {
     debug_assert!(progress.decoded_header.is_some());
     let mut frame = Vec::with_capacity(FRAME_HEADER_LEN + progress.payload.len());
     frame.extend_from_slice(&progress.header);
     frame.extend_from_slice(&progress.payload);
-    let message = decode_frame(&frame)?;
+    let message = decode_frame_for_version(&frame, required_version)?;
     progress.reset();
     Ok(message)
 }
@@ -223,7 +239,10 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use kvm_protocol::{ClipboardV1, PingV1, WireClipboardId, WireHostId};
+    use kvm_protocol::{
+        encode_frame_for_version, ClipboardV1, PingV1, WireClipboardId, WireHostId,
+        PROTOCOL_VERSION_V2,
+    };
     use tokio::io::{duplex, AsyncWriteExt};
 
     #[tokio::test]
@@ -298,5 +317,65 @@ mod tests {
             error,
             NetworkError::Protocol(ProtocolError::PayloadTooLarge { .. })
         ));
+    }
+
+    #[tokio::test]
+    async fn negotiated_v2_incremental_progress_survives_fragmentation() {
+        let (mut sender, receiver) = duplex(64);
+        let mut reader = FrameReader::new_authenticated_for_version(receiver, PROTOCOL_VERSION_V2);
+        let mut progress = FrameReadProgress::default();
+        let expected = WireMessage::Ping(PingV1 {
+            nonce: 31,
+            sent_at_ns: 32,
+        });
+        let encoded = encode_frame_for_version(&expected, PROTOCOL_VERSION_V2).unwrap();
+        let write_task = tokio::spawn(async move {
+            for byte in encoded {
+                sender.write_all(&[byte]).await.unwrap();
+                tokio::task::yield_now().await;
+            }
+        });
+
+        let decoded_message = loop {
+            if let Some(message) = reader.read_some(&mut progress).await.unwrap() {
+                break message;
+            }
+            tokio::task::yield_now().await;
+        };
+
+        assert_eq!(decoded_message, expected);
+        assert_eq!(progress.buffered_bytes(), 0);
+        write_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn negotiated_v2_rejects_v1_header_without_buffering_payload() {
+        let (mut sender, receiver) = duplex(64);
+        let mut reader = FrameReader::new_authenticated_for_version(receiver, PROTOCOL_VERSION_V2);
+        let mut progress = FrameReadProgress::default();
+        let header = FrameHeader {
+            protocol_version: PROTOCOL_VERSION_V1,
+            message_type: kvm_protocol::MessageType::Ping,
+            payload_length: u32::try_from(kvm_protocol::MAX_FRAME_PAYLOAD).unwrap(),
+        }
+        .encode();
+        sender.write_all(&header).await.unwrap();
+
+        let error = loop {
+            match reader.read_some(&mut progress).await {
+                Ok(None) => {}
+                Ok(Some(message)) => panic!("unexpected message: {message:?}"),
+                Err(error) => break error,
+            }
+        };
+
+        assert!(matches!(
+            error,
+            NetworkError::Protocol(ProtocolError::UnsupportedVersion {
+                received: PROTOCOL_VERSION_V1,
+                supported: PROTOCOL_VERSION_V2,
+            })
+        ));
+        assert_eq!(progress.payload.capacity(), 0);
     }
 }

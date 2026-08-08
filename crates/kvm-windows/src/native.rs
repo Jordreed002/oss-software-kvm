@@ -6,19 +6,20 @@ use std::collections::HashMap;
 use std::ffi::c_void;
 use std::mem::size_of;
 use std::panic::{catch_unwind, AssertUnwindSafe};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64, AtomicU8, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender, TrySendError};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use kvm_daemon::{
-    CaptureCallback, CaptureDisposition, CapturedInput, DisplayBackend, EventClassification,
-    InputCaptureBackend, OutputInjectionBackend, PlatformError,
+    CaptureCallback, CaptureDisposition, CaptureLifecycleState, CapturedInput, DisplayBackend,
+    EventClassification, InputCaptureBackend, OutputInjectionBackend, PlatformError,
 };
-use kvm_input::{InputEvent, InputPayload};
+use kvm_input::{ButtonState, InputEvent, InputPayload, KeyState, PointerButton};
 use kvm_types::{
-    DeviceCapabilities, DeviceKind, Display, DisplayId, HostId, InputDevice, Rect, Size,
+    DeviceCapabilities, DeviceId, DeviceKind, Display, DisplayId, HostId, InputDevice, Point, Rect,
+    Size,
 };
 use windows::core::{w, BOOL, GUID, PCWSTR};
 use windows::Win32::Devices::DeviceAndDriverInstallation::{
@@ -27,10 +28,11 @@ use windows::Win32::Devices::DeviceAndDriverInstallation::{
 use windows::Win32::Devices::Properties::{
     DEVPKEY_Device_ContainerId, DEVPROPTYPE, DEVPROP_TYPE_GUID,
 };
-use windows::Win32::Foundation::{HANDLE, HWND, LPARAM, RECT, WPARAM};
+use windows::Win32::Foundation::{HANDLE, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{
     EnumDisplayMonitors, GetMonitorInfoW, HDC, HMONITOR, MONITORINFO, MONITORINFOEXW,
 };
+use windows::Win32::System::Threading::GetCurrentThreadId;
 use windows::Win32::UI::HiDpi::{
     GetDpiForMonitor, SetThreadDpiAwarenessContext, DPI_AWARENESS_CONTEXT,
     DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, MDT_EFFECTIVE_DPI,
@@ -50,29 +52,46 @@ use windows::Win32::UI::Input::{
     RID_DEVICE_INFO, RID_INPUT, RIM_TYPEKEYBOARD, RIM_TYPEMOUSE,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetMessageW,
-    GetWindowThreadProcessId, PostMessageW, PostThreadMessageW, TranslateMessage, HWND_MESSAGE,
-    MONITORINFOF_PRIMARY, MSG, WINDOW_EX_STYLE, WINDOW_STYLE, WM_APP, WM_INPUT,
-    WM_INPUT_DEVICE_CHANGE, WM_QUIT,
+    CallNextHookEx, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetCursorPos,
+    GetMessageW, GetWindowThreadProcessId, PeekMessageW, PostMessageW, PostThreadMessageW,
+    SetWindowsHookExW, TranslateMessage, UnhookWindowsHookEx, HHOOK, HWND_MESSAGE, KBDLLHOOKSTRUCT,
+    LLKHF_EXTENDED, LLKHF_INJECTED, LLKHF_UP, MONITORINFOF_PRIMARY, MSG, MSLLHOOKSTRUCT,
+    PM_NOREMOVE, WH_KEYBOARD_LL, WH_MOUSE_LL, WINDOW_EX_STYLE, WINDOW_STYLE, WM_APP, WM_INPUT,
+    WM_INPUT_DEVICE_CHANGE, WM_KEYDOWN, WM_KEYUP, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP,
+    WM_MBUTTONDBLCLK, WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEHWHEEL, WM_MOUSEMOVE, WM_MOUSEWHEEL,
+    WM_QUIT, WM_RBUTTONDBLCLK, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SYSKEYDOWN, WM_SYSKEYUP,
+    WM_XBUTTONDBLCLK, WM_XBUTTONDOWN, WM_XBUTTONUP,
 };
 
 use crate::capture::{
-    classify_raw_input, is_state_transition, translate_keyboard, translate_mouse, MessageOrigin,
-    RawKeyboardPacket, RawMousePacket,
+    classify_low_level, classify_raw_input, hooks_can_release_callback_state, is_state_transition,
+    translate_keyboard, translate_low_level_keyboard, translate_mouse,
+    whole_host_keyboard_device_id, whole_host_pointer_device_id, whole_host_should_suppress,
+    MessageOrigin, RawKeyboardPacket, RawMousePacket, LOW_LEVEL_KEY_EXTENDED,
+    LOW_LEVEL_KEY_INJECTED, LOW_LEVEL_KEY_UP, LOW_LEVEL_MOUSE_INJECTED,
 };
 use crate::identity::{container_scoped_raw_input_identity, usb_ids_from_device_path};
 use crate::mapping::{key_is_released, mouse_action, scan_code, MouseAction, WHEEL_DELTA};
 use crate::ownership::{ClaimError, RegistrationState};
 use crate::{
-    derive_device_id, CapabilityState, CaptureStatistics, WindowsBackendError, WindowsCapabilities,
-    CAPTURE_QUEUE_CAPACITY, KVM_INJECTION_TAG,
+    derive_device_id, CapabilityState, CaptureStatistics, SuppressionScope, WindowsBackendError,
+    WindowsCapabilities, WindowsCaptureMode, CAPTURE_QUEUE_CAPACITY, KVM_INJECTION_TAG,
 };
 
 const UINT_ERROR: u32 = u32::MAX;
 const CAPTURE_STOP_MESSAGE: u32 = WM_APP + 0x4b;
+const WHOLE_HOST_STOP_MESSAGE: u32 = WM_APP + 0x4c;
 const CAPTURE_START_TIMEOUT: Duration = Duration::from_secs(5);
 const CAPTURE_STOP_TIMEOUT: Duration = Duration::from_secs(2);
+const WHOLE_HOST_CALLBACK_DEADLINE: Duration = Duration::from_millis(100);
 static RAW_INPUT_OWNERSHIP: Mutex<RegistrationState> = Mutex::new(RegistrationState::new());
+static WHOLE_HOST_HOOK_STATE: RwLock<Option<Arc<WholeHostCallbackState>>> = RwLock::new(None);
+static NEXT_WHOLE_HOST_GENERATION: AtomicU32 = AtomicU32::new(1);
+
+const WHOLE_HOST_IDLE: u8 = 0;
+const WHOLE_HOST_RUNNING: u8 = 1;
+const WHOLE_HOST_STOPPED: u8 = 2;
+const WHOLE_HOST_FAULTED: u8 = 3;
 
 #[derive(Debug, Default)]
 struct CaptureCounters {
@@ -85,6 +104,7 @@ struct CaptureCounters {
     untranslated_mouse_packets: AtomicU64,
     callback_panics: AtomicU64,
     suppression_requests_ignored: AtomicU64,
+    suppressed_events: AtomicU64,
     capture_discontinuities: AtomicU64,
 }
 
@@ -102,6 +122,7 @@ impl CaptureCounters {
             untranslated_mouse_packets: self.untranslated_mouse_packets.load(Ordering::Relaxed),
             callback_panics: self.callback_panics.load(Ordering::Relaxed),
             suppression_requests_ignored: self.suppression_requests_ignored.load(Ordering::Relaxed),
+            suppressed_events: self.suppressed_events.load(Ordering::Relaxed),
             capture_discontinuities: self.capture_discontinuities.load(Ordering::Relaxed),
         }
     }
@@ -153,6 +174,222 @@ struct CaptureSession {
     callback_thread: Option<JoinHandle<()>>,
     message_done: Receiver<()>,
     callback_done: Receiver<()>,
+}
+
+struct WholeHostCaptureSession {
+    thread_id: u32,
+    generation: u32,
+    state: Arc<WholeHostCallbackState>,
+    hook_thread: Option<JoinHandle<Result<(), WindowsBackendError>>>,
+    thread_done: Receiver<()>,
+}
+
+impl std::fmt::Debug for WholeHostCaptureSession {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("WholeHostCaptureSession")
+            .field("generation", &"[REDACTED]")
+            .field("lifecycle", &self.state.lifecycle())
+            .field(
+                "thread_finished",
+                &self
+                    .hook_thread
+                    .as_ref()
+                    .is_none_or(JoinHandle::is_finished),
+            )
+            .finish_non_exhaustive()
+    }
+}
+
+struct WholeHostCallbackState {
+    active: AtomicBool,
+    lifecycle: AtomicU8,
+    callback: CaptureCallback,
+    counters: Arc<CaptureCounters>,
+    host_id: HostId,
+    keyboard_device: DeviceId,
+    pointer_device: DeviceId,
+    started: Instant,
+    sequence: AtomicU64,
+    key_bits: [AtomicU64; 8],
+    button_bits: AtomicU8,
+    pointer_initialized: AtomicBool,
+    pointer_x: AtomicI32,
+    pointer_y: AtomicI32,
+}
+
+impl WholeHostCallbackState {
+    fn new(host_id: HostId, callback: CaptureCallback, counters: Arc<CaptureCounters>) -> Self {
+        Self {
+            active: AtomicBool::new(false),
+            lifecycle: AtomicU8::new(WHOLE_HOST_IDLE),
+            callback,
+            counters,
+            host_id,
+            keyboard_device: whole_host_keyboard_device_id(host_id),
+            pointer_device: whole_host_pointer_device_id(host_id),
+            started: Instant::now(),
+            sequence: AtomicU64::new(1),
+            key_bits: std::array::from_fn(|_| AtomicU64::new(0)),
+            button_bits: AtomicU8::new(0),
+            pointer_initialized: AtomicBool::new(false),
+            pointer_x: AtomicI32::new(0),
+            pointer_y: AtomicI32::new(0),
+        }
+    }
+
+    fn activate(&self) {
+        self.lifecycle.store(WHOLE_HOST_RUNNING, Ordering::Release);
+        self.active.store(true, Ordering::Release);
+    }
+
+    fn stop(&self) {
+        self.active.store(false, Ordering::Release);
+        let _ = self
+            .lifecycle
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+                (current != WHOLE_HOST_FAULTED).then_some(WHOLE_HOST_STOPPED)
+            });
+    }
+
+    fn fault(&self) {
+        self.active.store(false, Ordering::Release);
+        if self.lifecycle.swap(WHOLE_HOST_FAULTED, Ordering::AcqRel) != WHOLE_HOST_FAULTED {
+            self.counters
+                .capture_discontinuities
+                .fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    fn lifecycle(&self) -> CaptureLifecycleState {
+        match self.lifecycle.load(Ordering::Acquire) {
+            WHOLE_HOST_RUNNING => CaptureLifecycleState::Running,
+            WHOLE_HOST_STOPPED => CaptureLifecycleState::Stopped,
+            WHOLE_HOST_FAULTED => CaptureLifecycleState::Faulted,
+            _ => CaptureLifecycleState::Idle,
+        }
+    }
+
+    fn key_was_held(&self, scan_code: u32, extended: bool, released: bool) -> bool {
+        let slot = usize::try_from(scan_code & 0xff).expect("masked scan code fits usize")
+            | (usize::from(extended) << 8);
+        let word = slot / u64::BITS as usize;
+        let mask = 1_u64 << (slot % u64::BITS as usize);
+        let previous = if released {
+            self.key_bits[word].fetch_and(!mask, Ordering::Relaxed)
+        } else {
+            self.key_bits[word].fetch_or(mask, Ordering::Relaxed)
+        };
+        previous & mask != 0
+    }
+
+    fn track_button(&self, button: PointerButton, state: ButtonState) {
+        let bit = match button {
+            PointerButton::Left => 1 << 0,
+            PointerButton::Right => 1 << 1,
+            PointerButton::Middle => 1 << 2,
+            PointerButton::Back => 1 << 3,
+            PointerButton::Forward => 1 << 4,
+            PointerButton::Other(_) => return,
+        };
+        match state {
+            ButtonState::Pressed => {
+                self.button_bits.fetch_or(bit, Ordering::Relaxed);
+            }
+            ButtonState::Released => {
+                self.button_bits.fetch_and(!bit, Ordering::Relaxed);
+            }
+        }
+    }
+
+    fn pointer_delta(&self, x: i32, y: i32) -> Option<InputPayload> {
+        let old_x = self.pointer_x.swap(x, Ordering::Relaxed);
+        let old_y = self.pointer_y.swap(y, Ordering::Relaxed);
+        if !self.pointer_initialized.swap(true, Ordering::Relaxed) {
+            return None;
+        }
+        let dx = x.saturating_sub(old_x);
+        let dy = y.saturating_sub(old_y);
+        if dx == 0 && dy == 0 {
+            None
+        } else {
+            Some(InputPayload::PointerMove {
+                dx: f64::from(dx),
+                dy: f64::from(dy),
+            })
+        }
+    }
+
+    fn seed_pointer(&self, x: i32, y: i32) {
+        self.pointer_x.store(x, Ordering::Relaxed);
+        self.pointer_y.store(y, Ordering::Relaxed);
+        self.pointer_initialized.store(true, Ordering::Release);
+    }
+
+    fn dispatch(
+        &self,
+        payload: InputPayload,
+        classification: EventClassification,
+        source_device: DeviceId,
+        native_pointer_position: Option<Point>,
+    ) -> bool {
+        let Ok(sequence) =
+            self.sequence
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                    current.checked_add(1)
+                })
+        else {
+            self.fault();
+            return false;
+        };
+        let timestamp_ns = u64::try_from(self.started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+        let pointer_motion = matches!(payload, InputPayload::PointerMove { .. });
+        let event = InputEvent::new(sequence, timestamp_ns, self.host_id, source_device, payload);
+        self.counters
+            .captured_events
+            .fetch_add(1, Ordering::Relaxed);
+        let callback_started = Instant::now();
+        let result = catch_unwind(AssertUnwindSafe(|| {
+            let mut captured = CapturedInput::new(event, classification);
+            if pointer_motion {
+                if let Some(position) = native_pointer_position {
+                    captured = captured.with_native_pointer_position(position);
+                }
+            }
+            (self.callback)(captured)
+        }));
+        let deadline_exceeded = callback_started.elapsed() > WHOLE_HOST_CALLBACK_DEADLINE;
+        match result {
+            Ok(disposition)
+                if self.active.load(Ordering::Acquire)
+                    && whole_host_should_suppress(classification, disposition) =>
+            {
+                self.counters
+                    .suppressed_events
+                    .fetch_add(1, Ordering::Relaxed);
+                if deadline_exceeded {
+                    // The exact remote frame is already queued, so this event
+                    // remains suppressed to avoid duplicate delivery. Future
+                    // input fails open while runtime health drives cleanup.
+                    self.fault();
+                }
+                true
+            }
+            Ok(_) => {
+                if deadline_exceeded {
+                    self.fault();
+                }
+                false
+            }
+            Err(_) => {
+                self.counters
+                    .callback_panics
+                    .fetch_add(1, Ordering::Relaxed);
+                self.fault();
+                false
+            }
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -231,7 +468,10 @@ fn claim_raw_input_registration() -> Result<RegistrationClaim, WindowsBackendErr
 #[derive(Debug)]
 pub struct WindowsInputBackend {
     host_id: HostId,
-    capture: Option<CaptureSession>,
+    capture_mode: WindowsCaptureMode,
+    raw_capture: Option<CaptureSession>,
+    whole_host_capture: Option<WholeHostCaptureSession>,
+    last_lifecycle: CaptureLifecycleState,
     counters: Arc<CaptureCounters>,
 }
 
@@ -240,9 +480,33 @@ impl WindowsInputBackend {
     pub fn new(host_id: HostId) -> Self {
         Self {
             host_id,
-            capture: None,
+            capture_mode: WindowsCaptureMode::RawInputObservation,
+            raw_capture: None,
+            whole_host_capture: None,
+            last_lifecycle: CaptureLifecycleState::Idle,
             counters: Arc::new(CaptureCounters::default()),
         }
+    }
+
+    /// Creates an explicitly opted-in aggregate low-level-hook backend.
+    ///
+    /// This mode can suppress all translated physical keyboard and pointer
+    /// input. It cannot attribute hook events to individual Raw Input devices.
+    #[must_use]
+    pub fn new_whole_host_alpha(host_id: HostId) -> Self {
+        Self {
+            host_id,
+            capture_mode: WindowsCaptureMode::WholeHostAlpha,
+            raw_capture: None,
+            whole_host_capture: None,
+            last_lifecycle: CaptureLifecycleState::Idle,
+            counters: Arc::new(CaptureCounters::default()),
+        }
+    }
+
+    #[must_use]
+    pub const fn capture_mode(&self) -> WindowsCaptureMode {
+        self.capture_mode
     }
 
     #[must_use]
@@ -271,6 +535,33 @@ impl WindowsInputBackend {
             .into_iter()
             .filter_map(|entry| self.input_device(entry).transpose())
             .collect()
+    }
+
+    /// Returns the two aggregate devices emitted by whole-host alpha hooks.
+    #[must_use]
+    pub fn enumerate_whole_host_alpha_devices(&self) -> Vec<InputDevice> {
+        vec![
+            InputDevice::new(
+                whole_host_keyboard_device_id(self.host_id),
+                self.host_id,
+                "Whole-host keyboard (alpha)",
+                DeviceKind::Keyboard,
+                DeviceCapabilities::KEYBOARD,
+            ),
+            InputDevice::new(
+                whole_host_pointer_device_id(self.host_id),
+                self.host_id,
+                "Whole-host pointer (alpha)",
+                DeviceKind::Mouse,
+                DeviceCapabilities {
+                    pointer: true,
+                    keyboard: false,
+                    vertical_scroll: true,
+                    horizontal_scroll: true,
+                    extra_buttons: true,
+                },
+            ),
+        ]
     }
 
     fn input_device(
@@ -339,7 +630,7 @@ impl WindowsInputBackend {
         &mut self,
         callback: CaptureCallback,
     ) -> Result<(), WindowsBackendError> {
-        if self.capture.is_some() {
+        if self.raw_capture.is_some() || self.whole_host_capture.is_some() {
             return Err(WindowsBackendError::CaptureAlreadyRunning);
         }
         let registration_claim = claim_raw_input_registration()?;
@@ -394,7 +685,8 @@ impl WindowsInputBackend {
                         "Raw Input thread ended before startup acknowledgement".into(),
                     )
                 })?;
-                self.capture = Some(CaptureSession {
+                self.last_lifecycle = CaptureLifecycleState::Running;
+                self.raw_capture = Some(CaptureSession {
                     window: ready.window,
                     thread_id: ready.thread_id,
                     message_thread: Some(message_thread),
@@ -436,7 +728,7 @@ impl WindowsInputBackend {
     /// exit before the timeout, a worker panics, capture became discontinuous,
     /// or the Raw Input thread reports a native failure during shutdown.
     pub fn stop_observing(&mut self) -> Result<(), WindowsBackendError> {
-        let Some(session) = self.capture.as_mut() else {
+        let Some(session) = self.raw_capture.as_mut() else {
             return Ok(());
         };
         let mut thread_error = None;
@@ -488,8 +780,214 @@ impl WindowsInputBackend {
             }
         }
 
-        self.capture = None;
+        self.raw_capture = None;
+        self.last_lifecycle = if thread_error.is_some() {
+            CaptureLifecycleState::Faulted
+        } else {
+            CaptureLifecycleState::Stopped
+        };
         thread_error.map_or(Ok(()), Err)
+    }
+
+    /// Starts the explicitly opted-in aggregate whole-host alpha hooks.
+    ///
+    /// The callback executes synchronously on the hook thread. Only translated
+    /// physical events may honor `SuppressLocal`; injected, untrusted, unknown,
+    /// panicking, and untranslatable paths always remain local.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when another capture is running, another whole-host
+    /// owner exists, the hook thread cannot start, or either hook cannot be
+    /// installed.
+    #[allow(clippy::too_many_lines)] // Startup keeps its affine cancellation branches together.
+    pub fn start_whole_host_alpha(
+        &mut self,
+        callback: CaptureCallback,
+    ) -> Result<(), WindowsBackendError> {
+        if self.raw_capture.is_some() || self.whole_host_capture.is_some() {
+            return Err(WindowsBackendError::CaptureAlreadyRunning);
+        }
+        let generation = NEXT_WHOLE_HOST_GENERATION
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+                current.checked_add(1)
+            })
+            .map_err(|_| {
+                WindowsBackendError::CaptureRuntime(
+                    "whole-host capture generation space is exhausted".into(),
+                )
+            })?;
+        let state = Arc::new(WholeHostCallbackState::new(
+            self.host_id,
+            callback,
+            Arc::clone(&self.counters),
+        ));
+
+        let (thread_id_sender, thread_id_receiver) = mpsc::sync_channel(1);
+        let (ready_sender, ready_receiver) = mpsc::sync_channel(1);
+        let (ready_ack_sender, ready_ack_receiver) = mpsc::sync_channel(1);
+        let (thread_done_sender, thread_done) = mpsc::sync_channel(1);
+        let thread_state = Arc::clone(&state);
+        let hook_thread = thread::Builder::new()
+            .name("kvm-windows-whole-host-alpha".into())
+            .spawn(move || {
+                let result = whole_host_hook_thread(
+                    generation,
+                    &thread_state,
+                    &thread_id_sender,
+                    &ready_sender,
+                    &ready_ack_receiver,
+                );
+                let _ = thread_done_sender.send(());
+                result
+            })
+            .map_err(|error| {
+                WindowsBackendError::CaptureRuntime(format!(
+                    "could not spawn whole-host hook thread: {error}"
+                ))
+            })?;
+
+        let thread_id = match thread_id_receiver.recv_timeout(CAPTURE_START_TIMEOUT) {
+            Ok(thread_id) => thread_id,
+            Err(RecvTimeoutError::Timeout) => {
+                // The hook thread publishes its ID before allocating state or
+                // installing either hook. A dropped receiver makes it return.
+                drop(hook_thread);
+                return Err(WindowsBackendError::CaptureRuntime(format!(
+                    "whole-host hook thread startup exceeded {} seconds",
+                    CAPTURE_START_TIMEOUT.as_secs()
+                )));
+            }
+            Err(RecvTimeoutError::Disconnected) => {
+                let _ = hook_thread.join();
+                return Err(WindowsBackendError::CaptureRuntime(
+                    "whole-host hook thread ended before publishing its thread ID".into(),
+                ));
+            }
+        };
+
+        match ready_receiver.recv_timeout(CAPTURE_START_TIMEOUT) {
+            Ok(Ok(())) => {
+                // Publish Running before the native thread is allowed to leave
+                // its startup barrier. It can therefore never exit and clear
+                // the hooks while the owner subsequently reports Running.
+                state.activate();
+                if ready_ack_sender.send(()).is_err() {
+                    state.fault();
+                    let _ = hook_thread.join();
+                    return Err(WindowsBackendError::CaptureRuntime(
+                        "whole-host hook thread ended before startup acknowledgement".into(),
+                    ));
+                }
+                self.last_lifecycle = CaptureLifecycleState::Running;
+                self.whole_host_capture = Some(WholeHostCaptureSession {
+                    thread_id,
+                    generation,
+                    state,
+                    hook_thread: Some(hook_thread),
+                    thread_done,
+                });
+                Ok(())
+            }
+            Ok(Err(error)) => {
+                let _ = hook_thread.join();
+                Err(error)
+            }
+            Err(RecvTimeoutError::Timeout) => {
+                self.whole_host_capture = Some(WholeHostCaptureSession {
+                    thread_id,
+                    generation,
+                    state,
+                    hook_thread: Some(hook_thread),
+                    thread_done,
+                });
+                // Disconnecting the acknowledgement forces any late native
+                // install to tear itself down before entering its message loop.
+                drop(ready_ack_sender);
+                drop(ready_receiver);
+                let cleanup = self.stop_whole_host_alpha();
+                Err(WindowsBackendError::CaptureRuntime(match cleanup {
+                    Ok(()) => format!(
+                        "whole-host hook installation exceeded {} seconds and was cancelled",
+                        CAPTURE_START_TIMEOUT.as_secs()
+                    ),
+                    Err(error) => format!(
+                        "whole-host hook installation exceeded {} seconds; cancellation: {error}",
+                        CAPTURE_START_TIMEOUT.as_secs()
+                    ),
+                }))
+            }
+            Err(RecvTimeoutError::Disconnected) => {
+                let _ = hook_thread.join();
+                Err(WindowsBackendError::CaptureRuntime(
+                    "whole-host hook thread ended before startup completed".into(),
+                ))
+            }
+        }
+    }
+
+    /// Stops and removes the aggregate whole-host hooks.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the hook queue cannot be woken, teardown exceeds
+    /// the bounded wait, the thread panics, or native unhook fails.
+    pub fn stop_whole_host_alpha(&mut self) -> Result<(), WindowsBackendError> {
+        let Some(session) = self.whole_host_capture.as_mut() else {
+            return Ok(());
+        };
+        session.state.stop();
+        // A private generation-checked message cannot terminate a replacement
+        // or unrelated thread if Windows has already reused the numeric ID.
+        let signal_result = unsafe {
+            PostThreadMessageW(
+                session.thread_id,
+                WHOLE_HOST_STOP_MESSAGE,
+                WPARAM(session.generation as usize),
+                LPARAM(0),
+            )
+        }
+        .map_err(|error| binding_error("PostThreadMessageW(whole-host stop)", &error));
+
+        match session.thread_done.recv_timeout(CAPTURE_STOP_TIMEOUT) {
+            Ok(()) | Err(RecvTimeoutError::Disconnected) => {
+                let join_result = session.hook_thread.take().map(JoinHandle::join);
+                let result = match join_result {
+                    Some(Ok(result)) => result,
+                    Some(Err(_)) => {
+                        session.state.fault();
+                        Err(WindowsBackendError::CaptureRuntime(
+                            "whole-host hook thread panicked".into(),
+                        ))
+                    }
+                    None => Ok(()),
+                };
+                if result.is_err() {
+                    session.state.fault();
+                }
+                self.last_lifecycle = session.state.lifecycle();
+                self.whole_host_capture = None;
+                result
+            }
+            Err(RecvTimeoutError::Timeout) => {
+                session.state.fault();
+                self.last_lifecycle = CaptureLifecycleState::Faulted;
+                Err(signal_result.err().unwrap_or_else(|| {
+                    WindowsBackendError::CaptureRuntime(format!(
+                        "whole-host hook shutdown exceeded {} seconds",
+                        CAPTURE_STOP_TIMEOUT.as_secs()
+                    ))
+                }))
+            }
+        }
+    }
+
+    fn stop_active_capture(&mut self) -> Result<(), WindowsBackendError> {
+        if self.whole_host_capture.is_some() {
+            self.stop_whole_host_alpha()
+        } else {
+            self.stop_observing()
+        }
     }
 }
 
@@ -554,7 +1052,7 @@ fn device_container_id(raw_path: &str) -> Option<u128> {
 
 impl Drop for WindowsInputBackend {
     fn drop(&mut self) {
-        let _ = self.stop_observing();
+        let _ = self.stop_active_capture();
     }
 }
 
@@ -732,24 +1230,71 @@ pub fn probe_capabilities() -> WindowsCapabilities {
             CapabilityState::Unavailable
         },
         per_device_suppression: CapabilityState::NotImplemented,
+        suppression_scope: SuppressionScope::WholeHostAlpha,
         diagnostics,
     }
 }
 
 impl InputCaptureBackend for WindowsInputBackend {
     fn enumerate_devices(&self) -> Result<Vec<InputDevice>, PlatformError> {
-        self.enumerate_raw_input_devices()
-            .map_err(|error| Box::new(error) as PlatformError)
+        match self.capture_mode {
+            WindowsCaptureMode::RawInputObservation => self
+                .enumerate_raw_input_devices()
+                .map_err(|error| Box::new(error) as PlatformError),
+            WindowsCaptureMode::WholeHostAlpha => Ok(self.enumerate_whole_host_alpha_devices()),
+        }
     }
 
     fn start_capture(&mut self, callback: CaptureCallback) -> Result<(), PlatformError> {
-        self.start_observing(callback)
-            .map_err(|error| Box::new(error) as PlatformError)
+        match self.capture_mode {
+            WindowsCaptureMode::RawInputObservation => self.start_observing(callback),
+            WindowsCaptureMode::WholeHostAlpha => self.start_whole_host_alpha(callback),
+        }
+        .map_err(|error| Box::new(error) as PlatformError)
     }
 
     fn stop_capture(&mut self) -> Result<(), PlatformError> {
-        self.stop_observing()
+        self.stop_active_capture()
             .map_err(|error| Box::new(error) as PlatformError)
+    }
+
+    fn capture_lifecycle(&self) -> CaptureLifecycleState {
+        match self.capture_mode {
+            WindowsCaptureMode::RawInputObservation => {
+                if let Some(session) = self.raw_capture.as_ref() {
+                    let message_ended = session
+                        .message_thread
+                        .as_ref()
+                        .is_none_or(JoinHandle::is_finished);
+                    let callback_ended = session
+                        .callback_thread
+                        .as_ref()
+                        .is_none_or(JoinHandle::is_finished);
+                    if message_ended || callback_ended {
+                        CaptureLifecycleState::Faulted
+                    } else {
+                        CaptureLifecycleState::Running
+                    }
+                } else {
+                    self.last_lifecycle
+                }
+            }
+            WindowsCaptureMode::WholeHostAlpha => {
+                if let Some(session) = self.whole_host_capture.as_ref() {
+                    if session
+                        .hook_thread
+                        .as_ref()
+                        .is_none_or(JoinHandle::is_finished)
+                        && session.state.lifecycle() == CaptureLifecycleState::Running
+                    {
+                        session.state.fault();
+                    }
+                    session.state.lifecycle()
+                } else {
+                    self.last_lifecycle
+                }
+            }
+        }
     }
 }
 
@@ -785,6 +1330,373 @@ fn callback_dispatch_loop(
                 counters.callback_panics.fetch_add(1, Ordering::Relaxed);
             }
         }
+    }
+}
+
+fn whole_host_state_snapshot() -> Option<Arc<WholeHostCallbackState>> {
+    WHOLE_HOST_HOOK_STATE
+        .try_read()
+        .ok()
+        .and_then(|slot| slot.as_ref().map(Arc::clone))
+}
+
+fn claim_whole_host_state(state: &Arc<WholeHostCallbackState>) -> Result<(), WindowsBackendError> {
+    let mut slot = WHOLE_HOST_HOOK_STATE
+        .try_write()
+        .map_err(|_| WindowsBackendError::WholeHostCaptureOwned)?;
+    if slot.is_some() {
+        return Err(WindowsBackendError::WholeHostCaptureOwned);
+    }
+    *slot = Some(Arc::clone(state));
+    Ok(())
+}
+
+fn release_whole_host_state(state: &Arc<WholeHostCallbackState>) {
+    let mut slot = WHOLE_HOST_HOOK_STATE
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if slot
+        .as_ref()
+        .is_some_and(|current| Arc::ptr_eq(current, state))
+    {
+        *slot = None;
+    }
+}
+
+unsafe extern "system" fn low_level_keyboard_hook(
+    code: i32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> LRESULT {
+    if code != 0 {
+        // SAFETY: forwarding the unmodified hook arguments is required for all
+        // non-action hook notifications.
+        return unsafe { CallNextHookEx(None, code, wparam, lparam) };
+    }
+    let Some(state) = whole_host_state_snapshot() else {
+        // SAFETY: there is no active owner; forwarding is the fail-open path.
+        return unsafe { CallNextHookEx(None, code, wparam, lparam) };
+    };
+    if !state.active.load(Ordering::Acquire) {
+        // SAFETY: inactive teardown state must never suppress local input.
+        return unsafe { CallNextHookEx(None, code, wparam, lparam) };
+    }
+    // SAFETY: Windows supplies a live KBDLLHOOKSTRUCT for HC_ACTION callbacks.
+    let record = unsafe { &*(lparam.0 as *const KBDLLHOOKSTRUCT) };
+    let native_flags = record.flags.0;
+    let flags = (u32::from(record.flags.contains(LLKHF_EXTENDED)) * LOW_LEVEL_KEY_EXTENDED)
+        | (u32::from(record.flags.contains(LLKHF_INJECTED)) * LOW_LEVEL_KEY_INJECTED)
+        | (u32::from(record.flags.contains(LLKHF_UP)) * LOW_LEVEL_KEY_UP);
+    let classification =
+        classify_low_level(record.dwExtraInfo, native_flags, LOW_LEVEL_KEY_INJECTED);
+    let released = matches!(u32::try_from(wparam.0), Ok(WM_KEYUP | WM_SYSKEYUP))
+        || flags & LOW_LEVEL_KEY_UP != 0;
+    let pressed = matches!(u32::try_from(wparam.0), Ok(WM_KEYDOWN | WM_SYSKEYDOWN));
+    if !released && !pressed {
+        // SAFETY: unknown keyboard messages are explicitly fail-open.
+        return unsafe { CallNextHookEx(None, code, wparam, lparam) };
+    }
+
+    let initial = translate_low_level_keyboard(record.scanCode, record.vkCode, flags, false);
+    let Some(mut payload) = initial else {
+        state
+            .counters
+            .untranslated_packets
+            .fetch_add(1, Ordering::Relaxed);
+        state
+            .counters
+            .untranslated_keyboard_packets
+            .fetch_add(1, Ordering::Relaxed);
+        // SAFETY: untranslatable input remains local.
+        return unsafe { CallNextHookEx(None, code, wparam, lparam) };
+    };
+    state
+        .counters
+        .keyboard_packets
+        .fetch_add(1, Ordering::Relaxed);
+    if classification == EventClassification::Physical {
+        let was_held = state.key_was_held(
+            record.scanCode,
+            flags & LOW_LEVEL_KEY_EXTENDED != 0,
+            released,
+        );
+        if !released && was_held {
+            if let InputPayload::Key { code, .. } = payload {
+                payload = InputPayload::Key {
+                    code,
+                    state: KeyState::Repeated,
+                };
+            }
+        }
+    }
+    if state.dispatch(payload, classification, state.keyboard_device, None) {
+        LRESULT(1)
+    } else {
+        // SAFETY: forwarding is required whenever the callback did not
+        // synchronously suppress a proven physical event.
+        unsafe { CallNextHookEx(None, code, wparam, lparam) }
+    }
+}
+
+unsafe extern "system" fn low_level_mouse_hook(
+    code: i32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> LRESULT {
+    if code != 0 {
+        // SAFETY: forwarding the unmodified non-action notification.
+        return unsafe { CallNextHookEx(None, code, wparam, lparam) };
+    }
+    let Some(state) = whole_host_state_snapshot() else {
+        // SAFETY: no owner means fail open.
+        return unsafe { CallNextHookEx(None, code, wparam, lparam) };
+    };
+    if !state.active.load(Ordering::Acquire) {
+        // SAFETY: teardown is always fail open.
+        return unsafe { CallNextHookEx(None, code, wparam, lparam) };
+    }
+    // SAFETY: Windows supplies a live MSLLHOOKSTRUCT for HC_ACTION callbacks.
+    let record = unsafe { &*(lparam.0 as *const MSLLHOOKSTRUCT) };
+    let classification =
+        classify_low_level(record.dwExtraInfo, record.flags, LOW_LEVEL_MOUSE_INJECTED);
+    let Ok(message) = u32::try_from(wparam.0) else {
+        // SAFETY: an out-of-range message value is unknown and fail-open.
+        return unsafe { CallNextHookEx(None, code, wparam, lparam) };
+    };
+    let payload = match message {
+        WM_MOUSEMOVE => state.pointer_delta(record.pt.x, record.pt.y),
+        WM_LBUTTONDOWN | WM_LBUTTONDBLCLK => Some(InputPayload::PointerButton {
+            button: PointerButton::Left,
+            state: ButtonState::Pressed,
+        }),
+        WM_LBUTTONUP => Some(InputPayload::PointerButton {
+            button: PointerButton::Left,
+            state: ButtonState::Released,
+        }),
+        WM_RBUTTONDOWN | WM_RBUTTONDBLCLK => Some(InputPayload::PointerButton {
+            button: PointerButton::Right,
+            state: ButtonState::Pressed,
+        }),
+        WM_RBUTTONUP => Some(InputPayload::PointerButton {
+            button: PointerButton::Right,
+            state: ButtonState::Released,
+        }),
+        WM_MBUTTONDOWN | WM_MBUTTONDBLCLK => Some(InputPayload::PointerButton {
+            button: PointerButton::Middle,
+            state: ButtonState::Pressed,
+        }),
+        WM_MBUTTONUP => Some(InputPayload::PointerButton {
+            button: PointerButton::Middle,
+            state: ButtonState::Released,
+        }),
+        WM_XBUTTONDOWN | WM_XBUTTONDBLCLK => low_level_x_button(record, ButtonState::Pressed),
+        WM_XBUTTONUP => low_level_x_button(record, ButtonState::Released),
+        WM_MOUSEWHEEL => Some(low_level_wheel(record.mouseData, false)),
+        WM_MOUSEHWHEEL => Some(low_level_wheel(record.mouseData, true)),
+        _ => None,
+    };
+    let Some(payload) = payload else {
+        if message != WM_MOUSEMOVE {
+            state
+                .counters
+                .untranslated_packets
+                .fetch_add(1, Ordering::Relaxed);
+            state
+                .counters
+                .untranslated_mouse_packets
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        // SAFETY: first/zero motion and unknown mouse messages remain local.
+        return unsafe { CallNextHookEx(None, code, wparam, lparam) };
+    };
+    state.counters.mouse_packets.fetch_add(1, Ordering::Relaxed);
+    if classification == EventClassification::Physical {
+        if let InputPayload::PointerButton {
+            button,
+            state: value,
+        } = payload
+        {
+            state.track_button(button, value);
+        }
+    }
+    if state.dispatch(
+        payload,
+        classification,
+        state.pointer_device,
+        Some(Point::new(f64::from(record.pt.x), f64::from(record.pt.y))),
+    ) {
+        LRESULT(1)
+    } else {
+        // SAFETY: all non-suppressed paths must remain in the local hook chain.
+        unsafe { CallNextHookEx(None, code, wparam, lparam) }
+    }
+}
+
+fn low_level_x_button(record: &MSLLHOOKSTRUCT, state: ButtonState) -> Option<InputPayload> {
+    let button = match (record.mouseData >> 16) as u16 {
+        1 => PointerButton::Back,
+        2 => PointerButton::Forward,
+        _ => return None,
+    };
+    Some(InputPayload::PointerButton { button, state })
+}
+
+fn low_level_wheel(mouse_data: u32, horizontal: bool) -> InputPayload {
+    let raw = (mouse_data >> 16) as u16;
+    let delta = f64::from(i16::from_ne_bytes(raw.to_ne_bytes())) / WHEEL_DELTA;
+    if horizontal {
+        InputPayload::Scroll {
+            horizontal: delta,
+            vertical: 0.0,
+        }
+    } else {
+        InputPayload::Scroll {
+            horizontal: 0.0,
+            vertical: delta,
+        }
+    }
+}
+
+fn whole_host_hook_thread(
+    generation: u32,
+    state: &Arc<WholeHostCallbackState>,
+    thread_id_sender: &SyncSender<u32>,
+    ready_sender: &SyncSender<Result<(), WindowsBackendError>>,
+    ready_ack_receiver: &Receiver<()>,
+) -> Result<(), WindowsBackendError> {
+    let mut message = MSG::default();
+    // SAFETY: a benign peek creates the hook thread's message queue before its
+    // ID is published to the owner for PostThreadMessageW shutdown.
+    let _ = unsafe { PeekMessageW(&raw mut message, None, 0, 0, PM_NOREMOVE) };
+    let thread_id = unsafe { GetCurrentThreadId() };
+    if thread_id_sender.send(thread_id).is_err() {
+        return Ok(());
+    }
+
+    if let Err(error) = claim_whole_host_state(state) {
+        let _ = ready_sender.send(Err(error));
+        return Ok(());
+    }
+    // SAFETY: low-level global hooks execute these callbacks on this installing
+    // thread; no DLL module handle is required for WH_*_LL callbacks.
+    let keyboard_hook = match unsafe {
+        SetWindowsHookExW(WH_KEYBOARD_LL, Some(low_level_keyboard_hook), None, 0)
+    } {
+        Ok(hook) => hook,
+        Err(error) => {
+            release_whole_host_state(state);
+            let _ = ready_sender.send(Err(binding_error(
+                "SetWindowsHookExW(WH_KEYBOARD_LL)",
+                &error,
+            )));
+            return Ok(());
+        }
+    };
+    // SAFETY: same lifetime/thread contract as the keyboard hook above.
+    let mouse_hook = match unsafe {
+        SetWindowsHookExW(WH_MOUSE_LL, Some(low_level_mouse_hook), None, 0)
+    } {
+        Ok(hook) => hook,
+        Err(error) => {
+            state.stop();
+            // SAFETY: this thread owns the successfully installed hook.
+            let removed = unsafe { UnhookWindowsHookEx(keyboard_hook) };
+            if removed.is_ok() {
+                release_whole_host_state(state);
+            } else {
+                state.fault();
+            }
+            let _ = ready_sender.send(Err(binding_error("SetWindowsHookExW(WH_MOUSE_LL)", &error)));
+            return Ok(());
+        }
+    };
+
+    let mut pointer = POINT::default();
+    // SAFETY: `pointer` is writable and the query retains no pointer.
+    if let Err(error) = unsafe { GetCursorPos(&raw mut pointer) } {
+        state.fault();
+        let cleanup = remove_whole_host_hooks(keyboard_hook, mouse_hook, state);
+        let startup = binding_error("GetCursorPos(whole-host baseline)", &error);
+        let combined = match cleanup {
+            Ok(()) => startup,
+            Err(cleanup) => WindowsBackendError::CaptureRuntime(format!(
+                "{startup}; native hook cleanup also failed: {cleanup}"
+            )),
+        };
+        let _ = ready_sender.send(Err(combined));
+        return Ok(());
+    }
+    state.seed_pointer(pointer.x, pointer.y);
+
+    if ready_sender.send(Ok(())).is_err()
+        || ready_ack_receiver
+            .recv_timeout(CAPTURE_START_TIMEOUT)
+            .is_err()
+    {
+        state.stop();
+        return remove_whole_host_hooks(keyboard_hook, mouse_hook, state).and_then(|()| {
+            Err(WindowsBackendError::CaptureRuntime(
+                "whole-host capture owner did not acknowledge startup".into(),
+            ))
+        });
+    }
+
+    let loop_result = whole_host_message_loop(generation);
+    if state.lifecycle() == CaptureLifecycleState::Running {
+        state.fault();
+    }
+    let cleanup_result = remove_whole_host_hooks(keyboard_hook, mouse_hook, state);
+    match (loop_result, cleanup_result) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Err(error), Ok(())) | (Ok(()), Err(error)) => Err(error),
+        (Err(loop_error), Err(cleanup_error)) => Err(WindowsBackendError::CaptureRuntime(format!(
+            "{loop_error}; native hook cleanup also failed: {cleanup_error}"
+        ))),
+    }
+}
+
+fn whole_host_message_loop(generation: u32) -> Result<(), WindowsBackendError> {
+    let mut message = MSG::default();
+    loop {
+        // SAFETY: message is writable and this thread owns the hook queue.
+        let result = unsafe { GetMessageW(&raw mut message, None, 0, 0) };
+        if result.0 == -1 {
+            return Err(last_api_error("GetMessageW(whole-host hooks)"));
+        }
+        if result.0 == 0 {
+            return Ok(());
+        }
+        if message.message == WHOLE_HOST_STOP_MESSAGE && message.wParam.0 == generation as usize {
+            return Ok(());
+        }
+        // SAFETY: initialized message remains alive for synchronous dispatch.
+        unsafe {
+            let _ = TranslateMessage(&raw const message);
+            let _ = DispatchMessageW(&raw const message);
+        }
+    }
+}
+
+fn remove_whole_host_hooks(
+    keyboard_hook: HHOOK,
+    mouse_hook: HHOOK,
+    state: &Arc<WholeHostCallbackState>,
+) -> Result<(), WindowsBackendError> {
+    state.active.store(false, Ordering::Release);
+    // SAFETY: both handles were installed and are owned by this hook thread.
+    let mouse_result = unsafe { UnhookWindowsHookEx(mouse_hook) };
+    // SAFETY: same ownership guarantee for the keyboard handle.
+    let keyboard_result = unsafe { UnhookWindowsHookEx(keyboard_hook) };
+    if hooks_can_release_callback_state(keyboard_result.is_ok(), mouse_result.is_ok()) {
+        release_whole_host_state(state);
+        Ok(())
+    } else {
+        state.fault();
+        // State deliberately remains allocated, inactive, and globally owned.
+        // A replacement could otherwise race an orphaned callback.
+        Err(WindowsBackendError::CaptureRuntime(format!(
+            "low-level hook removal failed: keyboard={keyboard_result:?}, mouse={mouse_result:?}"
+        )))
     }
 }
 

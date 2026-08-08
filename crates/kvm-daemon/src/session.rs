@@ -8,19 +8,29 @@
 use std::collections::BTreeMap;
 use std::fmt;
 
+use kvm_config::Config;
 use kvm_input::{ButtonState, InputEvent, InputPayload, KeyState, PressedState};
 use kvm_network::{
-    AdmittedPeer, ConnectionState, OutboundSendError, PeerEvent, PeerSender, TransportPeerIdentity,
+    AdmittedPeer, ConnectionGeneration, ConnectionState, OutboundSendError, PeerEvent, PeerSender,
+    TransportPeerIdentity,
 };
 use kvm_protocol::{HelloV1, MessageType, ReleaseInputV1, ValidationError, WireMessage};
 use kvm_security::{IdentityFingerprint, PeerIdentity};
-use kvm_types::{DeviceId, HostId, PeerId};
+use kvm_types::{DeviceId, HostId, PeerId, WorkspaceState};
 use thiserror::Error;
 
+use crate::core::{
+    CaptureDecision, CaptureOutcome, CoreCaptureError, RemoteInputEffect, RoutePolicyUpdateError,
+    RoutePolicyUpdateStatus,
+};
+use crate::session_endpoint::SessionEndpoint;
 use crate::wire::{key_code_from_wire, pointer_button_from_wire};
+use crate::CapturedInput;
+#[cfg(test)]
+use crate::CoreAction;
 use crate::{
-    input_from_wire, input_to_wire, release_to_wire, CoreAction, DaemonCore,
-    OutputInjectionBackend, PeerState, PlatformError, WireConversionError,
+    input_from_wire, input_to_wire, release_to_wire, DaemonCore, DaemonError,
+    OutputInjectionBackend, PeerState, WireConversionError,
 };
 
 /// Maximum number of source devices allowed to retain inbound held state.
@@ -38,6 +48,65 @@ pub trait OutboundPeer: Send {
     ///
     /// Returns whether the bounded channel is full or permanently closed.
     fn try_send(&mut self, message: WireMessage) -> Result<(), OutboundPeerError>;
+}
+
+/// Opaque manager-owned outbound facade for a production peer session.
+///
+/// The facade begins detached and can receive a network-minted sender only
+/// through `PeerManager::install_prepared_session`. Downstream code can
+/// therefore drive the runner and event pump without acquiring a cloneable
+/// authority to enqueue privileged protocol messages independently.
+pub struct ManagedSessionOutbound {
+    binding: Option<(ConnectionGeneration, PeerSender)>,
+}
+
+impl ManagedSessionOutbound {
+    /// Creates an outbound facade with no authorized session FIFO.
+    #[must_use]
+    pub const fn detached() -> Self {
+        Self { binding: None }
+    }
+
+    pub(crate) fn install(
+        &mut self,
+        generation: ConnectionGeneration,
+        sender: PeerSender,
+    ) -> Result<(), PeerSender> {
+        if self
+            .binding
+            .as_ref()
+            .is_some_and(|(current, _)| *current == generation)
+        {
+            return Err(sender);
+        }
+        self.binding = Some((generation, sender));
+        Ok(())
+    }
+}
+
+impl Default for ManagedSessionOutbound {
+    fn default() -> Self {
+        Self::detached()
+    }
+}
+
+impl fmt::Debug for ManagedSessionOutbound {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ManagedSessionOutbound")
+            .field("attached", &self.binding.is_some())
+            .finish_non_exhaustive()
+    }
+}
+
+impl OutboundPeer for ManagedSessionOutbound {
+    fn try_send(&mut self, message: WireMessage) -> Result<(), OutboundPeerError> {
+        let (_, sender) = self.binding.as_mut().ok_or(OutboundPeerError::Closed)?;
+        PeerSender::try_send(sender, message).map_err(|error| match error {
+            OutboundSendError::Full(_) => OutboundPeerError::Full,
+            OutboundSendError::Closed(_) => OutboundPeerError::Closed,
+        })
+    }
 }
 
 impl OutboundPeer for PeerSender {
@@ -66,9 +135,25 @@ pub enum PeerEventOutcome {
     Ignored,
 }
 
+/// Coarse failure while a retained route-policy candidate is being settled.
+#[derive(Clone, Copy)]
+pub(crate) enum RoutePolicyCoordinatorError {
+    Policy(RoutePolicyUpdateError),
+    Delivery,
+}
+
+impl fmt::Debug for RoutePolicyCoordinatorError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::Policy(_) => "RoutePolicyCoordinatorError::Policy",
+            Self::Delivery => "RoutePolicyCoordinatorError::Delivery",
+        })
+    }
+}
+
 /// Fail-closed composition error. Callers should terminate the corresponding
 /// peer task after any error except an explicitly returned deferred outcome.
-#[derive(Debug, Error)]
+#[derive(Error)]
 pub enum CoordinatorError {
     #[error("the expected peer is not present in daemon configuration")]
     ExpectedPeerNotConfigured,
@@ -80,7 +165,7 @@ pub enum CoordinatorError {
     NotAdmitted,
     #[error("the admitted identity does not match the expected peer")]
     IdentityMismatch,
-    #[error("input sequence {received} is not newer than {previous}")]
+    #[error("input sequence is not newer than the previous admitted record")]
     StaleSequence { previous: u64, received: u64 },
     #[error(transparent)]
     Wire(#[from] WireConversionError),
@@ -98,8 +183,18 @@ pub enum CoordinatorError {
     InboundPressedStateOverflow,
     #[error("outbound session sequence space is exhausted")]
     OutboundSequenceExhausted,
+    #[error("synthetic cleanup sequence space is exhausted")]
+    SyntheticSequenceExhausted,
+    #[error("a key repeat was received without an exact held key")]
+    UnmatchedRepeat,
+    #[error("release-proof traffic is unavailable until its exact session state is installed")]
+    UnsupportedReleaseProof,
     #[error("the core produced a non-release action during cleanup")]
     UnexpectedCleanupAction,
+    #[error("pointer workspace update failed")]
+    WorkspaceUpdate,
+    #[error("captured input routing failed")]
+    Core(#[from] CoreCaptureError),
     #[error("multiple cleanup operations failed ({first}; {second})")]
     MultipleCleanupFailures {
         first: Box<CoordinatorError>,
@@ -110,6 +205,68 @@ pub enum CoordinatorError {
         trigger: Box<CoordinatorError>,
         cleanup: Box<CoordinatorError>,
     },
+}
+
+impl fmt::Debug for CoordinatorError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let kind = match self {
+            Self::ExpectedPeerNotConfigured => "ExpectedPeerNotConfigured",
+            Self::InvalidConfiguredFingerprint => "InvalidConfiguredFingerprint",
+            Self::ConfiguredFingerprintMismatch => "ConfiguredFingerprintMismatch",
+            Self::NotAdmitted => "NotAdmitted",
+            Self::IdentityMismatch => "IdentityMismatch",
+            Self::StaleSequence { .. } => "StaleSequence",
+            Self::Wire(_) => "Wire",
+            Self::InvalidMessage(_) => "InvalidMessage",
+            Self::Injection => "Injection",
+            Self::Outbound(_) => "Outbound",
+            Self::WrongActionTarget => "WrongActionTarget",
+            Self::CleanupIncomplete => "CleanupIncomplete",
+            Self::InboundPressedStateOverflow => "InboundPressedStateOverflow",
+            Self::OutboundSequenceExhausted => "OutboundSequenceExhausted",
+            Self::SyntheticSequenceExhausted => "SyntheticSequenceExhausted",
+            Self::UnmatchedRepeat => "UnmatchedRepeat",
+            Self::UnsupportedReleaseProof => "UnsupportedReleaseProof",
+            Self::UnexpectedCleanupAction => "UnexpectedCleanupAction",
+            Self::WorkspaceUpdate => "WorkspaceUpdate",
+            Self::Core(_) => "Core",
+            Self::MultipleCleanupFailures { .. } => "MultipleCleanupFailures",
+            Self::SessionFailureWithCleanup { .. } => "SessionFailureWithCleanup",
+        };
+        formatter
+            .debug_struct("CoordinatorError")
+            .field("kind", &kind)
+            .finish()
+    }
+}
+
+/// Internal result of a capture failure after the core may already have made
+/// a safe local or quarantined disposition. Diagnostics deliberately expose
+/// neither the input nor its destination.
+pub(crate) struct CoordinatorCaptureFailure {
+    outcome: Option<CaptureOutcome>,
+    error: CoordinatorError,
+}
+
+impl CoordinatorCaptureFailure {
+    #[must_use]
+    pub(crate) const fn outcome(&self) -> Option<CaptureOutcome> {
+        self.outcome
+    }
+
+    #[must_use]
+    pub(crate) fn into_error(self) -> CoordinatorError {
+        self.error
+    }
+}
+
+impl fmt::Debug for CoordinatorCaptureFailure {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("CoordinatorCaptureFailure")
+            .field("has_safe_outcome", &self.outcome.is_some())
+            .finish_non_exhaustive()
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -125,11 +282,19 @@ struct PresentedPeer {
 /// Keeping every field makes equality equivalent to `AdmittedPeer` equality,
 /// including both fresh Hello nonces. Identity alone must never authorize a
 /// message from a previous admitted transport session.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, PartialEq)]
 struct AdmittedSessionBinding {
     transport_identity: TransportPeerIdentity,
     local_hello: HelloV1,
     remote_hello: HelloV1,
+    selected_protocol_version: u16,
+    session_id: [u8; 32],
+}
+
+impl fmt::Debug for AdmittedSessionBinding {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("AdmittedSessionBinding([REDACTED])")
+    }
 }
 
 impl AdmittedSessionBinding {
@@ -145,6 +310,7 @@ impl AdmittedSessionBinding {
 
 #[derive(Clone, Debug, PartialEq)]
 struct AuthorizedSession {
+    endpoint: SessionEndpoint,
     binding: AdmittedSessionBinding,
     last_sequence: Option<u64>,
     accepts_input: bool,
@@ -166,12 +332,169 @@ pub struct PeerSessionCoordinator<I, O> {
     outbound_sequence: u64,
 }
 
+/// Borrow-only routing composition for one exact current session.
+///
+/// The facade deliberately exposes neither its coordinator nor its core. Its
+/// private representation can therefore become two disjoint borrows when the
+/// core moves to `PeerManager`, without changing workspace-control APIs.
+pub(crate) struct SessionRoutingContext<'a, I, O> {
+    coordinator: &'a mut PeerSessionCoordinator<I, O>,
+    endpoint: SessionEndpoint,
+}
+
+impl<I, O> fmt::Debug for SessionRoutingContext<'_, I, O> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SessionRoutingContext")
+            .field("has_current_endpoint", &true)
+            .field("authority", &"[REDACTED]")
+            .finish_non_exhaustive()
+    }
+}
+
+impl<'a, I, O> SessionRoutingContext<'a, I, O>
+where
+    I: OutputInjectionBackend,
+    O: OutboundPeer,
+{
+    /// Borrows routing composition only when the supplied endpoint is exactly
+    /// the coordinator's current authenticated authority. Offline operations
+    /// deliberately have no `SessionRoutingContext` construction path.
+    pub(crate) fn new(
+        coordinator: &'a mut PeerSessionCoordinator<I, O>,
+        endpoint: SessionEndpoint,
+    ) -> Result<Self, CoordinatorError> {
+        let context = Self {
+            coordinator,
+            endpoint,
+        };
+        context.validate_fresh()?;
+        Ok(context)
+    }
+
+    pub(crate) fn require_endpoint(
+        &self,
+        endpoint: SessionEndpoint,
+    ) -> Result<(), CoordinatorError> {
+        self.validate_fresh()?;
+        if self.endpoint == endpoint {
+            Ok(())
+        } else {
+            Err(CoordinatorError::NotAdmitted)
+        }
+    }
+
+    pub(crate) fn core_workspace(&self) -> Result<WorkspaceState, CoordinatorError> {
+        self.validate_fresh()?;
+        Ok(self.coordinator.core.workspace())
+    }
+
+    pub(crate) fn try_send_control(
+        &mut self,
+        message: WireMessage,
+    ) -> Result<(), CoordinatorError> {
+        self.validate_fresh()?;
+        self.coordinator.try_send_control(message)
+    }
+
+    pub(crate) fn clear_workspace_routing_ready(
+        &mut self,
+        now_ns: u64,
+    ) -> Result<(), CoordinatorError> {
+        self.validate_fresh()?;
+        self.coordinator.clear_workspace_routing_ready(now_ns)
+    }
+
+    pub(crate) fn mark_workspace_routing_ready(
+        &mut self,
+        now_ns: u64,
+    ) -> Result<(), CoordinatorError> {
+        self.validate_fresh()?;
+        self.coordinator.mark_workspace_routing_ready(now_ns)
+    }
+
+    pub(crate) fn trigger_capture_emergency(
+        &mut self,
+        now_ns: u64,
+    ) -> Result<(), CoordinatorError> {
+        self.validate_fresh()?;
+        self.coordinator.trigger_capture_emergency(now_ns)
+    }
+
+    pub(crate) fn restore_local_device(
+        &mut self,
+        device: DeviceId,
+        now_ns: u64,
+    ) -> Result<(), CoordinatorError> {
+        self.validate_fresh()?;
+        self.coordinator.restore_local_device(device, now_ns)
+    }
+
+    pub(crate) fn release_inbound_device(
+        &mut self,
+        device: DeviceId,
+        now_ns: u64,
+    ) -> Result<(), CoordinatorError> {
+        self.validate_fresh()?;
+        self.coordinator.release_inbound_device(device, now_ns)
+    }
+
+    pub(crate) fn begin_pointer_handoff(&mut self, now_ns: u64) -> Result<(), CoordinatorError> {
+        self.validate_fresh()?;
+        self.coordinator.begin_pointer_handoff(now_ns)
+    }
+
+    pub(crate) fn begin_destination_handoff_barrier(
+        &mut self,
+        now_ns: u64,
+    ) -> Result<(), CoordinatorError> {
+        self.validate_fresh()?;
+        self.coordinator.begin_destination_handoff_barrier(now_ns)
+    }
+
+    pub(crate) fn cancel_pointer_handoff(&mut self, now_ns: u64) -> Result<(), CoordinatorError> {
+        self.validate_fresh()?;
+        self.coordinator.cancel_pointer_handoff(now_ns);
+        Ok(())
+    }
+
+    pub(crate) fn abort_destination_handoff_barrier(
+        &mut self,
+        now_ns: u64,
+    ) -> Result<(), CoordinatorError> {
+        self.validate_fresh()?;
+        self.coordinator.abort_destination_handoff_barrier(now_ns);
+        Ok(())
+    }
+
+    pub(crate) fn finish_pointer_handoff(
+        &mut self,
+        workspace: WorkspaceState,
+        now_ns: u64,
+    ) -> Result<(), CoordinatorError> {
+        self.validate_fresh()?;
+        self.coordinator.finish_pointer_handoff(workspace, now_ns)
+    }
+
+    fn validate_fresh(&self) -> Result<(), CoordinatorError> {
+        let current = self
+            .coordinator
+            .authorized
+            .as_ref()
+            .map(|session| session.endpoint);
+        if current == Some(self.endpoint) {
+            Ok(())
+        } else {
+            Err(CoordinatorError::NotAdmitted)
+        }
+    }
+}
+
 impl<I, O> fmt::Debug for PeerSessionCoordinator<I, O> {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("PeerSessionCoordinator")
-            .field("expected_host_id", &self.expected.host_id())
-            .field("expected_peer_id", &self.expected.peer_id())
+            .field("expected_identity", &"[REDACTED]")
             .field("admitted", &self.authorized.is_some())
             .field(
                 "accepts_input",
@@ -232,8 +555,12 @@ where
             authorized: None,
             inbound_pressed: BTreeMap::new(),
             synthetic_sequence: 0,
-            outbound_sequence: 0,
+            outbound_sequence: 1,
         })
+    }
+
+    pub(crate) const fn outbound_mut(&mut self) -> &mut O {
+        &mut self.outbound
     }
 
     #[must_use]
@@ -242,8 +569,306 @@ where
     }
 
     #[must_use]
+    pub(crate) const fn expected_host_id(&self) -> HostId {
+        self.expected.host_id()
+    }
+
+    #[must_use]
     pub const fn is_admitted(&self) -> bool {
         self.authorized.is_some()
+    }
+
+    pub(crate) fn authorizes_endpoint(&self, endpoint: SessionEndpoint) -> bool {
+        self.authorized
+            .as_ref()
+            .is_some_and(|session| session.endpoint == endpoint)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_injection_mut(&mut self) -> &mut I {
+        &mut self.injection
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_hold_inbound(
+        &mut self,
+        event: InputEvent,
+        now_ns: u64,
+    ) -> Result<(), CoordinatorError> {
+        self.inject_received(event, now_ns)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_handle_authorized_message(
+        &mut self,
+        message: WireMessage,
+        now_ns: u64,
+    ) -> Result<PeerEventOutcome, CoordinatorError> {
+        self.handle_authorized_message(message, now_ns)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn activate_workspace_test_binding(
+        &mut self,
+        endpoint: SessionEndpoint,
+        transport_identity: TransportPeerIdentity,
+        local_hello: HelloV1,
+        remote_hello: HelloV1,
+        now_ns: u64,
+    ) -> Result<(), CoordinatorError> {
+        self.activate_binding(
+            endpoint,
+            AdmittedSessionBinding {
+                transport_identity,
+                local_hello,
+                remote_hello,
+                selected_protocol_version: kvm_protocol::PROTOCOL_VERSION_V1,
+                session_id: [0xa5; 32],
+            },
+            now_ns,
+        )?;
+        Ok(())
+    }
+
+    /// Offers one already validated control-plane message on the same bounded
+    /// admitted session without consuming the input-event sequence domain.
+    ///
+    /// Pointer handoff owns a separate checked transition sequence. The
+    /// caller must reconcile its affine effect on both success and failure.
+    pub(crate) fn try_send_control(
+        &mut self,
+        message: WireMessage,
+    ) -> Result<(), CoordinatorError> {
+        if !self
+            .authorized
+            .as_ref()
+            .is_some_and(|session| session.accepts_input)
+        {
+            return Err(CoordinatorError::NotAdmitted);
+        }
+        message.validate()?;
+        self.outbound.try_send(message).map_err(Into::into)
+    }
+
+    pub(crate) fn validate_workspace_message(
+        &self,
+        peer: &AdmittedPeer,
+        message: &WireMessage,
+    ) -> Result<(), CoordinatorError> {
+        let binding = admitted_binding(peer);
+        if self
+            .authorized
+            .as_ref()
+            .is_none_or(|session| session.binding != binding || !session.accepts_input)
+        {
+            return Err(CoordinatorError::NotAdmitted);
+        }
+        message.validate()?;
+        Ok(())
+    }
+
+    pub(crate) fn begin_pointer_handoff(&mut self, now_ns: u64) -> Result<(), CoordinatorError> {
+        self.core.begin_pointer_handoff(now_ns)?;
+        if let Err(error) = self.drain_remote_cleanup(now_ns) {
+            self.core.cancel_pointer_handoff(now_ns);
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn begin_destination_handoff_barrier(
+        &mut self,
+        now_ns: u64,
+    ) -> Result<(), CoordinatorError> {
+        self.core.begin_pointer_handoff(now_ns)?;
+        if let Err(error) = self.drain_remote_cleanup(now_ns) {
+            self.core.abort_destination_handoff_barrier(now_ns);
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn cancel_pointer_handoff(&mut self, now_ns: u64) {
+        self.core.cancel_pointer_handoff(now_ns);
+    }
+
+    pub(crate) fn abort_destination_handoff_barrier(&mut self, now_ns: u64) {
+        self.core.abort_destination_handoff_barrier(now_ns);
+    }
+
+    pub(crate) fn finish_pointer_handoff(
+        &mut self,
+        workspace: kvm_types::WorkspaceState,
+        now_ns: u64,
+    ) -> Result<(), CoordinatorError> {
+        match self.core.finish_pointer_handoff(workspace, now_ns) {
+            Ok(()) => Ok(()),
+            Err(DaemonError::CleanupPending) => {
+                self.drain_remote_cleanup(now_ns)?;
+                self.core
+                    .finish_pointer_handoff(workspace, now_ns)
+                    .map_err(|_| CoordinatorError::WorkspaceUpdate)
+            }
+            Err(_) => Err(CoordinatorError::WorkspaceUpdate),
+        }
+    }
+
+    /// Routes one captured record through the exact admitted FIFO. A remote
+    /// disposition is returned only after that FIFO accepted the frame.
+    pub(crate) fn route_captured(
+        &mut self,
+        captured: CapturedInput,
+        now_ns: u64,
+    ) -> Result<CaptureOutcome, CoordinatorCaptureFailure> {
+        let decision = self
+            .core
+            .prepare_captured(captured, now_ns)
+            .map_err(|error| CoordinatorCaptureFailure {
+                outcome: None,
+                error: CoordinatorError::Core(error),
+            })?;
+        match decision {
+            CaptureDecision::Fault { outcome, error } => Err(CoordinatorCaptureFailure {
+                outcome: Some(outcome),
+                error: CoordinatorError::Core(error),
+            }),
+            CaptureDecision::Local(outcome) | CaptureDecision::Inert(outcome) => {
+                self.drain_remote_cleanup(now_ns)
+                    .map_err(|error| CoordinatorCaptureFailure {
+                        outcome: Some(outcome),
+                        error,
+                    })?;
+                Ok(outcome)
+            }
+            CaptureDecision::Remote(effect) => {
+                let dispatch = self.dispatch_remote_effect(&effect);
+                match dispatch {
+                    Ok(accepted_sequence) => self
+                        .core
+                        .confirm_remote_input(effect, accepted_sequence, now_ns)
+                        .map_err(|error| CoordinatorCaptureFailure {
+                            // The frame already entered the exact FIFO. Local
+                            // delivery would duplicate it even if the later
+                            // in-memory confirmation failed.
+                            outcome: Some(CaptureOutcome::remote_queued()),
+                            error: CoordinatorError::Core(error),
+                        }),
+                    Err(error) => {
+                        let outcome = self.core.fail_remote_input(effect, now_ns).ok();
+                        Err(CoordinatorCaptureFailure { outcome, error })
+                    }
+                }
+            }
+        }
+    }
+
+    pub(crate) fn clear_workspace_routing_ready(
+        &mut self,
+        now_ns: u64,
+    ) -> Result<(), CoordinatorError> {
+        self.core.clear_workspace_routing_ready(now_ns)?;
+        self.drain_remote_cleanup(now_ns)
+    }
+
+    pub(crate) fn mark_workspace_routing_ready(
+        &mut self,
+        now_ns: u64,
+    ) -> Result<(), CoordinatorError> {
+        self.core.mark_workspace_routing_ready(now_ns)?;
+        Ok(())
+    }
+
+    pub(crate) fn lifecycle_tick(&mut self, now_ns: u64) -> bool {
+        self.core.tick(now_ns)
+    }
+
+    fn trigger_capture_emergency(&mut self, now_ns: u64) -> Result<(), CoordinatorError> {
+        self.core.trigger_emergency(now_ns)?;
+        self.drain_remote_cleanup(now_ns)
+    }
+
+    pub(crate) const fn route_policy_revision(&self) -> u64 {
+        self.core.route_policy_revision()
+    }
+
+    pub(crate) const fn route_policy_update_pending(&self) -> bool {
+        self.core.route_policy_update_pending()
+    }
+
+    pub(crate) fn route_policy_config(&self) -> Config {
+        self.core.config().clone()
+    }
+
+    pub(crate) fn prepare_route_policy_update(
+        &mut self,
+        candidate: Config,
+        expected_revision: u64,
+        now_ns: u64,
+    ) -> Result<RoutePolicyUpdateStatus, RoutePolicyCoordinatorError> {
+        let mut status = self
+            .core
+            .prepare_route_policy_update(candidate, expected_revision, now_ns)
+            .map_err(RoutePolicyCoordinatorError::Policy)?;
+        if status == RoutePolicyUpdateStatus::CleanupPending {
+            self.drain_remote_cleanup(now_ns)
+                .map_err(|_| RoutePolicyCoordinatorError::Delivery)?;
+            status = self
+                .core
+                .retry_route_policy_update(now_ns)
+                .map_err(RoutePolicyCoordinatorError::Policy)?;
+        }
+        Ok(status)
+    }
+
+    pub(crate) fn retry_route_policy_update(
+        &mut self,
+        now_ns: u64,
+    ) -> Result<RoutePolicyUpdateStatus, RoutePolicyCoordinatorError> {
+        self.drain_remote_cleanup(now_ns)
+            .map_err(|_| RoutePolicyCoordinatorError::Delivery)?;
+        self.core
+            .retry_route_policy_update(now_ns)
+            .map_err(RoutePolicyCoordinatorError::Policy)
+    }
+
+    pub(crate) fn staged_route_policy(&self) -> Option<(u64, Config)> {
+        self.core
+            .staged_route_policy()
+            .map(|staged| (staged.revision(), staged.config().clone()))
+    }
+
+    pub(crate) fn commit_route_policy_update(
+        &mut self,
+        revision: u64,
+        now_ns: u64,
+    ) -> Result<u64, RoutePolicyUpdateError> {
+        self.core.commit_route_policy_update(revision, now_ns)
+    }
+
+    pub(crate) fn abort_route_policy_update(
+        &mut self,
+        revision: u64,
+        now_ns: u64,
+    ) -> Result<(), RoutePolicyUpdateError> {
+        self.core.abort_route_policy_update(revision, now_ns)
+    }
+
+    pub(crate) fn gate_local_devices(
+        &mut self,
+        devices: &[DeviceId],
+        now_ns: u64,
+    ) -> Result<(), CoordinatorError> {
+        self.core.gate_local_devices(devices, now_ns)?;
+        self.drain_remote_cleanup(now_ns)
+    }
+
+    pub(crate) fn restore_local_device(
+        &mut self,
+        device: DeviceId,
+        now_ns: u64,
+    ) -> Result<(), CoordinatorError> {
+        self.core.restore_local_device(device, now_ns)?;
+        Ok(())
     }
 
     /// Consumes one event from the persistent task bound to this expected peer.
@@ -258,15 +883,13 @@ where
         now_ns: u64,
     ) -> Result<PeerEventOutcome, CoordinatorError> {
         match event {
-            PeerEvent::Admitted(peer) => self.activate_admitted(&peer, now_ns),
-            PeerEvent::Message { peer, message } => {
-                self.handle_bound_message(&admitted_binding(&peer), message, now_ns)
+            rejected @ (PeerEvent::Admitted(_)
+            | PeerEvent::Message { .. }
+            | PeerEvent::Disconnected { .. }) => {
+                drop(rejected);
+                Err(self.fail_session(CoordinatorError::NotAdmitted, now_ns))
             }
-            PeerEvent::StateChanged(state) => self.handle_state(state, now_ns),
-            PeerEvent::Disconnected { .. } => {
-                self.disconnect(now_ns)?;
-                Ok(PeerEventOutcome::Applied)
-            }
+            PeerEvent::StateChanged(state) => Ok(self.handle_unbound_state(state, now_ns)),
             PeerEvent::ReconnectScheduled(_) => Ok(PeerEventOutcome::Ignored),
         }
     }
@@ -278,7 +901,8 @@ where
     ///
     /// Fails closed when no admitted session exists, an action targets another
     /// host, conversion fails, or the bounded outbound channel rejects work.
-    pub fn dispatch_actions(
+    #[cfg(test)]
+    pub(crate) fn dispatch_actions(
         &mut self,
         actions: impl IntoIterator<Item = CoreAction>,
         now_ns: u64,
@@ -342,7 +966,7 @@ where
     /// Returns a cleanup error while retaining any inbound held state whose
     /// synthetic release could not be injected.
     pub fn revoke(&mut self, now_ns: u64) -> Result<(), CoordinatorError> {
-        self.disconnect(now_ns)
+        self.session_fatal_cleanup(now_ns)
     }
 
     /// Reconciles both directions and permanently shuts down the owned core.
@@ -355,17 +979,18 @@ where
         if let Some(session) = &mut self.authorized {
             session.accepts_input = false;
         }
-        let injection_result = self
-            .release_all_inbound(now_ns)
-            .map_err(|_| CoordinatorError::Injection);
-        let actions = self.core.shutdown(now_ns);
+        let injection_result = self.release_all_inbound(now_ns);
+        let transition_result = self.core.shutdown(now_ns).map_err(CoordinatorError::Core);
         let outbound_result = if self.authorized.is_some() {
-            self.send_cleanup_actions(actions)
+            transition_result.and_then(|()| self.drain_remote_cleanup(now_ns))
         } else {
-            Ok(())
+            transition_result
         };
-        self.authorized = None;
-        combine_cleanup_results(injection_result, outbound_result)
+        let result = combine_cleanup_results(injection_result, outbound_result);
+        if result.is_ok() {
+            self.authorized = None;
+        }
+        result
     }
 
     /// Returns owned components for deterministic test inspection or orderly
@@ -375,16 +1000,27 @@ where
         (self.core, self.injection, self.outbound)
     }
 
-    fn activate_admitted(
+    pub(crate) fn activate_admitted_endpoint(
         &mut self,
+        endpoint: SessionEndpoint,
         peer: &AdmittedPeer,
         now_ns: u64,
     ) -> Result<PeerEventOutcome, CoordinatorError> {
-        self.activate_binding(admitted_binding(peer), now_ns)
+        let binding = admitted_binding(peer);
+        let identity = binding.presented_peer();
+        if endpoint.host_id() != identity.host_id
+            || endpoint.peer_id() != identity.peer_id
+            || endpoint.selected_protocol_version() != binding.selected_protocol_version
+            || endpoint.session_id() != binding.session_id
+        {
+            return Err(self.fail_session(CoordinatorError::IdentityMismatch, now_ns));
+        }
+        self.activate_binding(endpoint, binding, now_ns)
     }
 
     fn activate_binding(
         &mut self,
+        endpoint: SessionEndpoint,
         binding: AdmittedSessionBinding,
         now_ns: u64,
     ) -> Result<PeerEventOutcome, CoordinatorError> {
@@ -402,23 +1038,17 @@ where
         if !self.inbound_pressed.is_empty() {
             return Err(CoordinatorError::CleanupIncomplete);
         }
+        self.core.install_session_endpoint(endpoint, now_ns)?;
         self.authorized = Some(AuthorizedSession {
+            endpoint,
             binding,
             last_sequence: None,
             accepts_input: true,
         });
-        let actions =
-            self.core
-                .set_peer_state(self.expected.host_id(), PeerState::Connected, now_ns);
-        debug_assert!(actions.is_empty());
         Ok(PeerEventOutcome::Applied)
     }
 
-    fn handle_state(
-        &mut self,
-        state: ConnectionState,
-        now_ns: u64,
-    ) -> Result<PeerEventOutcome, CoordinatorError> {
+    fn handle_unbound_state(&mut self, state: ConnectionState, now_ns: u64) -> PeerEventOutcome {
         match state {
             ConnectionState::Connecting => {
                 if self.authorized.is_none() {
@@ -438,37 +1068,55 @@ where
                     );
                 }
             }
+            ConnectionState::Connected
+            | ConnectionState::Degraded
+            | ConnectionState::Disconnected => {
+                return PeerEventOutcome::Ignored;
+            }
+        }
+        PeerEventOutcome::Applied
+    }
+
+    pub(crate) fn handle_endpoint_state(
+        &mut self,
+        endpoint: SessionEndpoint,
+        state: ConnectionState,
+        now_ns: u64,
+    ) -> Result<PeerEventOutcome, CoordinatorError> {
+        if self
+            .authorized
+            .as_ref()
+            .is_none_or(|session| session.endpoint != endpoint)
+        {
+            return Err(self.fail_session(CoordinatorError::NotAdmitted, now_ns));
+        }
+        match state {
             ConnectionState::Connected => {
-                let Some(session) = &mut self.authorized else {
-                    // A state notification is not an authorization capability.
-                    return Ok(PeerEventOutcome::Ignored);
-                };
-                session.accepts_input = true;
-                let actions =
-                    self.core
-                        .set_peer_state(self.expected.host_id(), PeerState::Connected, now_ns);
-                debug_assert!(actions.is_empty());
+                if let Some(session) = &mut self.authorized {
+                    session.accepts_input = true;
+                }
+                self.core
+                    .set_endpoint_state(endpoint, PeerState::Connected, now_ns)?;
             }
             ConnectionState::Degraded => {
                 if let Some(session) = &mut self.authorized {
                     session.accepts_input = false;
                 }
-                let injection_result = self
-                    .release_all_inbound(now_ns)
-                    .map_err(|_| CoordinatorError::Injection);
-                let actions =
-                    self.core
-                        .set_peer_state(self.expected.host_id(), PeerState::Degraded, now_ns);
-                let outbound_result = if self.authorized.is_some() {
-                    self.send_cleanup_actions(actions)
-                } else {
-                    Ok(())
-                };
+                let injection_result = self.release_all_inbound(now_ns);
+                let transition_result = self
+                    .core
+                    .set_endpoint_state(endpoint, PeerState::Degraded, now_ns)
+                    .map_err(CoordinatorError::Core);
+                let outbound_result =
+                    transition_result.and_then(|()| self.drain_remote_cleanup(now_ns));
                 if let Err(error) = combine_cleanup_results(injection_result, outbound_result) {
                     return Err(self.fail_session(error, now_ns));
                 }
             }
             ConnectionState::Disconnected => self.disconnect(now_ns)?,
+            ConnectionState::Connecting | ConnectionState::Authenticating => {
+                return Ok(PeerEventOutcome::Ignored);
+            }
         }
         Ok(PeerEventOutcome::Applied)
     }
@@ -503,20 +1151,25 @@ where
                 self.handle_release(&release, now_ns)?;
                 Ok(PeerEventOutcome::Applied)
             }
+            WireMessage::ReleaseInputV2(_) | WireMessage::ReleaseAppliedAckV2(_) => {
+                Err(self.fail_session(CoordinatorError::UnsupportedReleaseProof, now_ns))
+            }
             other => Ok(PeerEventOutcome::Deferred(other.message_type())),
         }
     }
 
-    fn handle_bound_message(
+    pub(crate) fn handle_endpoint_message(
         &mut self,
-        binding: &AdmittedSessionBinding,
+        endpoint: SessionEndpoint,
+        peer: &AdmittedPeer,
         message: WireMessage,
         now_ns: u64,
     ) -> Result<PeerEventOutcome, CoordinatorError> {
+        let binding = admitted_binding(peer);
         if self
             .authorized
             .as_ref()
-            .is_none_or(|session| &session.binding != binding)
+            .is_none_or(|session| session.endpoint != endpoint || session.binding != binding)
         {
             return Err(self.fail_session(CoordinatorError::IdentityMismatch, now_ns));
         }
@@ -540,6 +1193,20 @@ where
     }
 
     fn inject_received(&mut self, event: InputEvent, now_ns: u64) -> Result<(), CoordinatorError> {
+        let repeated = match event.payload {
+            InputPayload::Key {
+                code,
+                state: KeyState::Repeated,
+            } => Some(code),
+            _ => None,
+        };
+        if repeated.is_some_and(|code| {
+            self.inbound_pressed
+                .get(&event.source_device)
+                .is_none_or(|state| !state.key_is_pressed(code))
+        }) {
+            return Err(self.fail_session(CoordinatorError::UnmatchedRepeat, now_ns));
+        }
         let release = matches!(
             event.payload,
             InputPayload::Key {
@@ -595,7 +1262,7 @@ where
             InputPayload::Key {
                 code,
                 state: KeyState::Pressed,
-            } => state.pressed_keys().any(|held| held == code),
+            } => state.key_is_pressed(code),
             InputPayload::PointerButton {
                 button,
                 state: ButtonState::Pressed,
@@ -651,7 +1318,7 @@ where
                         state: KeyState::Released,
                     },
                     now_ns,
-                );
+                )?;
                 self.inject_received(event, now_ns)?;
             }
             for button in &release.buttons {
@@ -662,7 +1329,7 @@ where
                         state: ButtonState::Released,
                     },
                     now_ns,
-                );
+                )?;
                 self.inject_received(event, now_ns)?;
             }
         }
@@ -676,24 +1343,47 @@ where
     ) -> Result<(), CoordinatorError> {
         let releases = self.inbound_releases(selected);
         for (device, payload) in releases {
-            let event = self.synthetic_event(device, payload, now_ns);
+            let event = self.synthetic_event(device, payload, now_ns)?;
             self.inject_received(event, now_ns)?;
         }
         Ok(())
     }
 
-    fn release_all_inbound(&mut self, now_ns: u64) -> Result<(), PlatformError> {
+    /// Releases every injected control attributed to one authenticated remote
+    /// device before its inventory record is removed or replaced.
+    pub(crate) fn release_inbound_device(
+        &mut self,
+        device: DeviceId,
+        now_ns: u64,
+    ) -> Result<(), CoordinatorError> {
+        if self.authorized.is_none() {
+            return Err(CoordinatorError::NotAdmitted);
+        }
+        self.release_selected_inbound(Some(device), now_ns)
+    }
+
+    fn release_all_inbound(&mut self, now_ns: u64) -> Result<(), CoordinatorError> {
         let releases = self.inbound_releases(None);
         let mut first_error = None;
         for (device, payload) in releases {
-            let event = self.synthetic_event(device, payload, now_ns);
+            let event = match self.synthetic_event(device, payload, now_ns) {
+                Ok(event) => event,
+                Err(error) => {
+                    if first_error.is_none() {
+                        first_error = Some(error);
+                    }
+                    break;
+                }
+            };
             match self.injection.inject(&event) {
                 Ok(()) => {
                     if let Some(state) = self.inbound_pressed.get_mut(&device) {
                         state.apply(&event.payload);
                     }
                 }
-                Err(error) if first_error.is_none() => first_error = Some(error),
+                Err(_) if first_error.is_none() => {
+                    first_error = Some(CoordinatorError::Injection);
+                }
                 Err(_) => {}
             }
         }
@@ -734,10 +1424,19 @@ where
         device: DeviceId,
         payload: InputPayload,
         now_ns: u64,
-    ) -> InputEvent {
+    ) -> Result<InputEvent, CoordinatorError> {
         let sequence = self.synthetic_sequence;
-        self.synthetic_sequence = self.synthetic_sequence.saturating_add(1);
-        InputEvent::new(sequence, now_ns, self.expected.host_id(), device, payload)
+        self.synthetic_sequence = self
+            .synthetic_sequence
+            .checked_add(1)
+            .ok_or(CoordinatorError::SyntheticSequenceExhausted)?;
+        Ok(InputEvent::new(
+            sequence,
+            now_ns,
+            self.expected.host_id(),
+            device,
+            payload,
+        ))
     }
 
     fn next_outbound_sequence(&mut self) -> Result<u64, CoordinatorError> {
@@ -748,46 +1447,123 @@ where
         Ok(sequence)
     }
 
-    fn send_cleanup_actions(&mut self, actions: Vec<CoreAction>) -> Result<(), CoordinatorError> {
-        for action in actions {
-            let CoreAction::Release(release) = action else {
-                return Err(CoordinatorError::UnexpectedCleanupAction);
-            };
-            if release.target != self.expected.host_id() {
-                return Err(CoordinatorError::WrongActionTarget);
-            }
-            let sequence = self.next_outbound_sequence()?;
-            let wire = release_to_wire(release, sequence, self.core.workspace().local_host)?;
-            if let Err(error) = self.outbound.try_send(WireMessage::ReleaseInput(wire)) {
-                return Err(CoordinatorError::Outbound(error));
+    fn dispatch_remote_effect(
+        &mut self,
+        effect: &RemoteInputEffect,
+    ) -> Result<u64, CoordinatorError> {
+        let Some(session) = self.authorized.as_ref() else {
+            return Err(CoordinatorError::NotAdmitted);
+        };
+        if !session.accepts_input {
+            return Err(CoordinatorError::NotAdmitted);
+        }
+        if effect.endpoint() != session.endpoint
+            || effect.endpoint().host_id() != self.expected.host_id()
+        {
+            return Err(CoordinatorError::WrongActionTarget);
+        }
+        let mut input = input_to_wire(&effect.event())?;
+        let accepted_sequence = self.next_outbound_sequence()?;
+        input.sequence = accepted_sequence;
+        self.outbound
+            .try_send(WireMessage::Input(input))
+            .map_err(CoordinatorError::from)?;
+        Ok(accepted_sequence)
+    }
+
+    fn drain_remote_cleanup(&mut self, now_ns: u64) -> Result<(), CoordinatorError> {
+        while let Some(effect) = self.core.take_next_cleanup_release() {
+            let release = effect.release();
+            let send = (|| {
+                let Some(session) = self.authorized.as_ref() else {
+                    return Err(CoordinatorError::NotAdmitted);
+                };
+                if effect.endpoint() != session.endpoint
+                    || release.target != effect.endpoint().host_id()
+                    || release.target != self.expected.host_id()
+                {
+                    return Err(CoordinatorError::WrongActionTarget);
+                }
+                let sequence = self.next_outbound_sequence()?;
+                if effect.covered_input_sequence() == 0
+                    || sequence <= effect.covered_input_sequence()
+                {
+                    return Err(CoordinatorError::UnexpectedCleanupAction);
+                }
+                let wire = release_to_wire(release, sequence, self.core.workspace().local_host)?;
+                self.outbound
+                    .try_send(WireMessage::ReleaseInput(wire))
+                    .map_err(CoordinatorError::Outbound)
+            })();
+            match send {
+                Ok(()) => self.core.confirm_cleanup_release(effect, now_ns)?,
+                Err(error) => {
+                    self.core.retry_cleanup_release(effect, now_ns)?;
+                    return Err(error);
+                }
             }
         }
         Ok(())
     }
 
     fn disconnect(&mut self, now_ns: u64) -> Result<(), CoordinatorError> {
+        let endpoint = self.authorized.as_ref().map(|session| session.endpoint);
         if let Some(session) = &mut self.authorized {
             session.accepts_input = false;
         }
-        let injection_result = self
-            .release_all_inbound(now_ns)
-            .map_err(|_| CoordinatorError::Injection);
-        let actions =
+        let injection_result = self.release_all_inbound(now_ns);
+        let transition_result = endpoint.map_or(Ok(()), |endpoint| {
             self.core
-                .set_peer_state(self.expected.host_id(), PeerState::Disconnected, now_ns);
-        let outbound_result = if self.authorized.is_some() {
-            self.send_cleanup_actions(actions)
-        } else if actions.is_empty() {
-            Ok(())
-        } else {
-            Err(CoordinatorError::NotAdmitted)
-        };
+                .set_endpoint_state(endpoint, PeerState::Disconnected, now_ns)
+                .map_err(CoordinatorError::Core)
+        });
+        if self.authorized.is_some() && transition_result.is_ok() {
+            let _ = self.drain_remote_cleanup(now_ns);
+        }
         self.authorized = None;
-        combine_cleanup_results(injection_result, outbound_result)
+        if let Some(endpoint) = endpoint {
+            self.core.confirm_transport_invalidated(endpoint, now_ns);
+        }
+        // Once the exact transport is certainly gone, any outbound Full,
+        // Closed, sequence, or core cleanup failure is settled by terminal
+        // invalidation. Only local synthetic injection remains retryable.
+        injection_result
+    }
+
+    /// Gates new input while retaining the exact admitted cleanup capability
+    /// until every release has entered its FIFO. Unlike `disconnect`, this
+    /// must not assert that the underlying transport has ended.
+    pub(crate) fn session_fatal_cleanup(&mut self, now_ns: u64) -> Result<(), CoordinatorError> {
+        let endpoint = self.authorized.as_ref().map(|session| session.endpoint);
+        if let Some(session) = &mut self.authorized {
+            session.accepts_input = false;
+        }
+        let injection_result = self.release_all_inbound(now_ns);
+        let transition_result = endpoint.map_or(Ok(()), |endpoint| {
+            self.core
+                .set_endpoint_state(endpoint, PeerState::Disconnected, now_ns)
+                .map_err(CoordinatorError::Core)
+        });
+        let outbound_result = if self.authorized.is_some() {
+            transition_result.and_then(|()| self.drain_remote_cleanup(now_ns))
+        } else {
+            transition_result
+        };
+        let result = combine_cleanup_results(injection_result, outbound_result).and_then(|()| {
+            endpoint.map_or(Ok(()), |endpoint| {
+                self.core
+                    .retire_session_endpoint(endpoint, now_ns)
+                    .map_err(CoordinatorError::Core)
+            })
+        });
+        if result.is_ok() {
+            self.authorized = None;
+        }
+        result
     }
 
     fn fail_session(&mut self, trigger: CoordinatorError, now_ns: u64) -> CoordinatorError {
-        match self.disconnect(now_ns) {
+        match self.session_fatal_cleanup(now_ns) {
             Ok(()) => trigger,
             Err(cleanup) => CoordinatorError::SessionFailureWithCleanup {
                 trigger: Box::new(trigger),
@@ -802,6 +1578,8 @@ fn admitted_binding(peer: &AdmittedPeer) -> AdmittedSessionBinding {
         transport_identity: peer.transport_identity().clone(),
         local_hello: peer.local_hello().clone(),
         remote_hello: peer.hello().clone(),
+        selected_protocol_version: peer.selected_protocol_version(),
+        session_id: peer.session_id(),
     }
 }
 
@@ -829,14 +1607,17 @@ mod tests {
 
     use kvm_config::{Config, PairedHostConfig};
     use kvm_input::{KeyCode, PointerButton};
+    use kvm_network::ConnectionGenerationGate;
     use kvm_protocol::{
-        InputEventV1, ReleaseReasonV1, WireButtonState, WireDeviceId, WireHostId,
-        WireInputPayloadV1, WireKeyCode, WireKeyState, WirePeerId, WirePlatform, WirePointerButton,
+        InputEventV1, ReleaseAppliedAckV2, ReleaseInputV2, ReleaseReasonV1, ReleaseReasonV2,
+        WireButtonState, WireDeviceId, WireHostId, WireInputPayloadV1, WireKeyCode, WireKeyState,
+        WirePeerId, WirePlatform, WirePointerButton,
     };
     use kvm_security::IdentityFingerprint;
     use kvm_types::{DisplayId, LogicalPointer, Platform, WorkspaceState};
 
     use super::*;
+    use crate::PlatformError;
 
     const LOCAL: HostId = HostId::from_bytes([1; 16]);
     const REMOTE: HostId = HostId::from_bytes([2; 16]);
@@ -911,7 +1692,7 @@ mod tests {
             identity_fingerprint: IdentityFingerprint::from_sha256(FINGERPRINT).to_string(),
             last_address: None,
         });
-        let workspace = WorkspaceState::new(local, remote, LogicalPointer::new(DISPLAY, 0.0, 0.0));
+        let workspace = WorkspaceState::new(local, local, LogicalPointer::new(DISPLAY, 0.0, 0.0));
         PeerSessionCoordinator::new(
             DaemonCore::new(config, workspace).unwrap(),
             expected_for(remote),
@@ -944,11 +1725,41 @@ mod tests {
             },
             local_hello: hello(local, [9; 16], nonce.wrapping_add(1)),
             remote_hello: hello(remote, PEER.into_bytes(), nonce),
+            selected_protocol_version: kvm_protocol::PROTOCOL_VERSION_V1,
+            session_id: [nonce.max(1); 32],
         }
     }
 
     fn binding(nonce: u8) -> AdmittedSessionBinding {
         binding_between(LOCAL, REMOTE, nonce)
+    }
+
+    fn endpoint_between(local: HostId, remote: HostId, nonce: u8) -> SessionEndpoint {
+        let mut gate = ConnectionGenerationGate::new(
+            WirePeerId(local.into_bytes()),
+            WirePeerId(remote.into_bytes()),
+        )
+        .unwrap();
+        let direction = gate.role().direction();
+        let pending = gate.begin_pending(direction).unwrap();
+        SessionEndpoint::for_test(
+            PEER,
+            remote,
+            pending.generation(),
+            kvm_protocol::PROTOCOL_VERSION_V1,
+            [nonce.max(1); 32],
+        )
+        .unwrap()
+    }
+
+    fn endpoint(nonce: u8) -> SessionEndpoint {
+        endpoint_between(LOCAL, REMOTE, nonce)
+    }
+
+    fn authorized_endpoint(
+        coordinator: &PeerSessionCoordinator<RecordingInjection, RecordingOutbound>,
+    ) -> SessionEndpoint {
+        coordinator.authorized.as_ref().unwrap().endpoint
     }
 
     fn input(sequence: u64, device: DeviceId, payload: WireInputPayloadV1) -> WireMessage {
@@ -997,7 +1808,9 @@ mod tests {
 
     fn admit(coordinator: &mut PeerSessionCoordinator<RecordingInjection, RecordingOutbound>) {
         assert_eq!(
-            coordinator.activate_binding(binding(1), 0).unwrap(),
+            coordinator
+                .activate_binding(endpoint(1), binding(1), 0)
+                .unwrap(),
             PeerEventOutcome::Applied
         );
     }
@@ -1006,9 +1819,7 @@ mod tests {
     fn connected_notification_alone_never_authorizes_input() {
         let mut coordinator = coordinator();
         assert_eq!(
-            coordinator
-                .handle_state(ConnectionState::Connected, 0)
-                .unwrap(),
+            coordinator.handle_unbound_state(ConnectionState::Connected, 0),
             PeerEventOutcome::Ignored
         );
         assert!(!coordinator.is_admitted());
@@ -1024,7 +1835,7 @@ mod tests {
         let mut wrong = binding(1);
         wrong.transport_identity.credential_fingerprint[0] ^= 1;
         assert!(matches!(
-            coordinator.activate_binding(wrong, 0),
+            coordinator.activate_binding(endpoint(1), wrong, 0),
             Err(CoordinatorError::IdentityMismatch)
         ));
 
@@ -1063,6 +1874,57 @@ mod tests {
     }
 
     #[test]
+    fn authenticated_repeat_requires_and_preserves_the_exact_held_key() {
+        let mut matched = coordinator();
+        admit(&mut matched);
+        for (sequence, state) in [
+            (1, WireKeyState::Down),
+            (2, WireKeyState::Repeat),
+            (3, WireKeyState::Up),
+        ] {
+            matched
+                .handle_authorized_message(key(sequence, DEVICE, 0x04, state), sequence)
+                .unwrap();
+        }
+        assert!(matched.inbound_pressed.is_empty());
+        assert!(matches!(
+            matched.injection.events.as_slice(),
+            [
+                InputEvent {
+                    payload: InputPayload::Key {
+                        state: KeyState::Pressed,
+                        ..
+                    },
+                    ..
+                },
+                InputEvent {
+                    payload: InputPayload::Key {
+                        state: KeyState::Repeated,
+                        ..
+                    },
+                    ..
+                },
+                InputEvent {
+                    payload: InputPayload::Key {
+                        state: KeyState::Released,
+                        ..
+                    },
+                    ..
+                }
+            ]
+        ));
+
+        let mut unmatched = coordinator();
+        admit(&mut unmatched);
+        assert!(matches!(
+            unmatched.handle_authorized_message(key(1, DEVICE, 0x04, WireKeyState::Repeat), 1,),
+            Err(CoordinatorError::UnmatchedRepeat)
+        ));
+        assert!(unmatched.injection.events.is_empty());
+        assert!(unmatched.inbound_pressed.is_empty());
+    }
+
+    #[test]
     fn repeated_or_mismatched_admission_releases_held_input_and_revokes() {
         for mismatched in [false, true] {
             let mut coordinator = coordinator();
@@ -1076,7 +1938,7 @@ mod tests {
             }
 
             assert!(matches!(
-                coordinator.activate_binding(next, 2),
+                coordinator.activate_binding(endpoint(1), next, 2),
                 Err(CoordinatorError::IdentityMismatch)
             ));
             assert!(!coordinator.is_admitted());
@@ -1306,17 +2168,58 @@ mod tests {
     }
 
     #[test]
+    fn release_proof_messages_fail_closed_until_exact_state_is_installed() {
+        let release = ReleaseInputV2 {
+            transaction_id: 1,
+            release_token: [8; 32],
+            old_session_id: [9; 32],
+            sequence: 2,
+            covered_input_sequence: 1,
+            source_host: WireHostId(REMOTE.into_bytes()),
+            applying_host: WireHostId(LOCAL.into_bytes()),
+            source_device: Some(WireDeviceId(DEVICE.into_bytes())),
+            reason: ReleaseReasonV2::StateResynchronization,
+            keys: Vec::new(),
+            buttons: Vec::new(),
+        };
+        let acknowledgement = ReleaseAppliedAckV2 {
+            transaction_id: release.transaction_id,
+            release_token: release.release_token,
+            old_session_id: release.old_session_id,
+            sequence: 1,
+            release_sequence: release.sequence,
+            covered_input_sequence: release.covered_input_sequence,
+            source_host: WireHostId(LOCAL.into_bytes()),
+            applying_host: WireHostId(REMOTE.into_bytes()),
+        };
+
+        for message in [
+            WireMessage::ReleaseInputV2(release),
+            WireMessage::ReleaseAppliedAckV2(acknowledgement),
+        ] {
+            let mut coordinator = coordinator();
+            admit(&mut coordinator);
+            assert!(matches!(
+                coordinator.handle_authorized_message(message, 1),
+                Err(CoordinatorError::UnsupportedReleaseProof)
+            ));
+            assert!(!coordinator.is_admitted());
+        }
+    }
+
+    #[test]
     fn degraded_disconnect_revocation_and_channel_close_reconcile() {
         for operation in 0..3 {
             let mut coordinator = coordinator();
             admit(&mut coordinator);
+            let endpoint = authorized_endpoint(&coordinator);
             coordinator
                 .handle_authorized_message(key(1, DEVICE, 0xe0, WireKeyState::Down), 1)
                 .unwrap();
             match operation {
                 0 => {
                     coordinator
-                        .handle_state(ConnectionState::Degraded, 2)
+                        .handle_endpoint_state(endpoint, ConnectionState::Degraded, 2)
                         .unwrap();
                     assert!(coordinator.is_admitted());
                 }
@@ -1389,12 +2292,16 @@ mod tests {
         assert!(format!("{:?}", active.injection).contains(INJECTION_SECRET));
         assert!(format!("{:?}", active.outbound).contains(OUTBOUND_SECRET));
         let coordinator_debug = format!("{active:?}");
+        let remote_id = REMOTE.to_string();
+        let peer_id = PEER.to_string();
         for sensitive in [
             INJECTION_SECRET,
             OUTBOUND_SECRET,
             "KeyA",
             "Primary",
             "PointerButton",
+            remote_id.as_str(),
+            peer_id.as_str(),
         ] {
             assert!(!coordinator_debug.contains(sensitive));
         }
@@ -1430,6 +2337,14 @@ mod tests {
             .unwrap_err();
         let diagnostics = format!("{error:?} {error} {outbound_failure:?}");
         assert!(!diagnostics.contains(OUTBOUND_SECRET));
+
+        let stale = CoordinatorError::StaleSequence {
+            previous: 8_765_432_101,
+            received: 8_765_432_100,
+        };
+        let diagnostics = format!("{stale:?} {stale}");
+        assert!(!diagnostics.contains("8765432101"));
+        assert!(!diagnostics.contains("8765432100"));
     }
 
     #[test]
@@ -1462,20 +2377,83 @@ mod tests {
         let WireMessage::Input(input) = &outbound.messages[0] else {
             panic!("expected input frame")
         };
-        assert_eq!(input.sequence, 0);
+        assert_eq!(input.sequence, 1);
         let WireMessage::ReleaseInput(release) = &outbound.messages[1] else {
             panic!("expected release frame")
         };
-        assert_eq!(release.sequence, 1);
+        assert_eq!(release.sequence, 2);
         assert_eq!(release.source_host, WireHostId(LOCAL.into_bytes()));
         assert_eq!(release.reason, ReleaseReasonV1::StateResynchronization);
+    }
+
+    #[test]
+    fn exact_cleanup_fifo_retains_first_sequence_until_graceful_replacement() {
+        let mut coordinator = coordinator();
+        admit(&mut coordinator);
+        let first = authorized_endpoint(&coordinator);
+        coordinator.core.mark_workspace_routing_ready(0).unwrap();
+        coordinator
+            .core
+            .update_workspace(
+                WorkspaceState::new(LOCAL, REMOTE, LogicalPointer::new(DISPLAY, 1.0, 1.0)),
+                1,
+            )
+            .unwrap();
+        let captured = CapturedInput::new(
+            InputEvent::new(
+                1,
+                1,
+                LOCAL,
+                DEVICE,
+                InputPayload::Key {
+                    code: KeyCode::KeyA,
+                    state: KeyState::Pressed,
+                },
+            ),
+            crate::EventClassification::Physical,
+        );
+        coordinator.route_captured(captured, 1).unwrap();
+        let WireMessage::Input(input) = &coordinator.outbound.messages[0] else {
+            panic!("expected input frame")
+        };
+        assert_eq!(input.sequence, 1);
+        let input_sequence = input.sequence;
+
+        coordinator.outbound.fail = Some(OutboundPeerError::Full);
+        assert!(matches!(
+            coordinator.session_fatal_cleanup(2),
+            Err(CoordinatorError::Outbound(OutboundPeerError::Full))
+        ));
+        assert_eq!(authorized_endpoint(&coordinator), first);
+        assert!(coordinator.core.cleanup_pending());
+
+        coordinator.session_fatal_cleanup(3).unwrap();
+        assert!(!coordinator.is_admitted());
+        let WireMessage::ReleaseInput(release) = &coordinator.outbound.messages[1] else {
+            panic!("expected cleanup frame")
+        };
+        assert_eq!(release.sequence, 3);
+        assert!(release.sequence > input_sequence);
+
+        let second = endpoint(2);
+        coordinator.activate_binding(second, binding(2), 4).unwrap();
+        coordinator.core.confirm_transport_invalidated(first, 5);
+        assert_eq!(authorized_endpoint(&coordinator), second);
+        coordinator
+            .core
+            .set_endpoint_state(second, PeerState::Connected, 6)
+            .unwrap();
     }
 
     #[test]
     fn forwarded_input_then_release_share_sequence_space_and_are_accepted() {
         let mut sender = coordinator_between(LOCAL, REMOTE);
         sender
-            .activate_binding(binding_between(LOCAL, REMOTE, 1), 0)
+            .activate_binding(
+                endpoint_between(LOCAL, REMOTE, 1),
+                binding_between(LOCAL, REMOTE, 1),
+                0,
+            )
             .unwrap();
         sender
             .dispatch_actions(
@@ -1509,7 +2487,11 @@ mod tests {
 
         let mut receiver = coordinator_between(REMOTE, LOCAL);
         receiver
-            .activate_binding(binding_between(REMOTE, LOCAL, 2), 0)
+            .activate_binding(
+                endpoint_between(REMOTE, LOCAL, 2),
+                binding_between(REMOTE, LOCAL, 2),
+                0,
+            )
             .unwrap();
         for message in sender_outbound.messages {
             receiver.handle_authorized_message(message, 3).unwrap();
@@ -1520,17 +2502,31 @@ mod tests {
     }
 
     #[test]
-    fn prior_admission_binding_cannot_send_into_a_new_session() {
+    fn prior_endpoint_cannot_change_a_new_session() {
         let mut coordinator = coordinator();
-        let old = binding(1);
         let current = binding(2);
-        coordinator.activate_binding(current, 0).unwrap();
+        coordinator
+            .activate_binding(endpoint(2), current, 0)
+            .unwrap();
 
         assert!(matches!(
-            coordinator.handle_bound_message(&old, key(1, DEVICE, 0x04, WireKeyState::Down), 1,),
-            Err(CoordinatorError::IdentityMismatch)
+            coordinator.handle_endpoint_state(endpoint(1), ConnectionState::Connected, 1),
+            Err(CoordinatorError::NotAdmitted)
         ));
         assert!(!coordinator.is_admitted());
+    }
+
+    #[test]
+    fn admission_binding_equality_includes_version_and_session_id_and_redacts_them() {
+        let binding = binding(17);
+        let mut different_version = binding.clone();
+        different_version.selected_protocol_version = kvm_protocol::PROTOCOL_VERSION_V2;
+        let mut different_session = binding.clone();
+        different_session.session_id = [99; 32];
+
+        assert_ne!(binding, different_version);
+        assert_ne!(binding, different_session);
+        assert_eq!(format!("{binding:?}"), "AdmittedSessionBinding([REDACTED])");
     }
 
     #[test]
@@ -1567,26 +2563,6 @@ mod tests {
             )
             .unwrap();
         assert!(coordinator.inbound_pressed.is_empty());
-    }
-
-    #[test]
-    fn cleanup_rejects_an_unexpected_forward_action() {
-        let mut coordinator = coordinator();
-        admit(&mut coordinator);
-        let unexpected = CoreAction::Forward {
-            target: REMOTE,
-            event: InputEvent::new(
-                1,
-                1,
-                LOCAL,
-                DEVICE,
-                InputPayload::PointerMove { dx: 1.0, dy: 1.0 },
-            ),
-        };
-        assert!(matches!(
-            coordinator.send_cleanup_actions(vec![unexpected]),
-            Err(CoordinatorError::UnexpectedCleanupAction)
-        ));
     }
 
     #[test]
@@ -1659,42 +2635,30 @@ mod tests {
     }
 
     #[test]
-    fn configured_fingerprint_must_be_canonical_and_match_expected() {
-        for (fingerprint, expected_error) in [
-            ("not-a-fingerprint".to_owned(), 0_u8),
-            (IdentityFingerprint::from_sha256([9; 32]).to_string(), 1_u8),
-        ] {
-            let mut config = Config::default();
-            config.paired_hosts.push(PairedHostConfig {
-                host_id: REMOTE,
-                peer_id: PEER,
-                name: "remote".into(),
-                platform: Platform::Windows,
-                identity_fingerprint: fingerprint,
-                last_address: None,
-            });
-            let core = DaemonCore::new(
-                config,
-                WorkspaceState::new(LOCAL, LOCAL, LogicalPointer::new(DISPLAY, 0.0, 0.0)),
-            )
-            .unwrap();
-            let result = PeerSessionCoordinator::new(
+    fn configured_fingerprint_must_match_expected() {
+        let mut config = Config::default();
+        config.paired_hosts.push(PairedHostConfig {
+            host_id: REMOTE,
+            peer_id: PEER,
+            name: "remote".into(),
+            platform: Platform::Windows,
+            identity_fingerprint: IdentityFingerprint::from_sha256([9; 32]).to_string(),
+            last_address: None,
+        });
+        let core = DaemonCore::new(
+            config,
+            WorkspaceState::new(LOCAL, LOCAL, LogicalPointer::new(DISPLAY, 0.0, 0.0)),
+        )
+        .unwrap();
+        assert!(matches!(
+            PeerSessionCoordinator::new(
                 core,
                 expected(),
                 RecordingInjection::default(),
                 RecordingOutbound::default(),
-            );
-            match expected_error {
-                0 => assert!(matches!(
-                    result,
-                    Err(CoordinatorError::InvalidConfiguredFingerprint)
-                )),
-                _ => assert!(matches!(
-                    result,
-                    Err(CoordinatorError::ConfiguredFingerprintMismatch)
-                )),
-            }
-        }
+            ),
+            Err(CoordinatorError::ConfiguredFingerprintMismatch)
+        ));
     }
 
     #[test]
@@ -1711,7 +2675,7 @@ mod tests {
         ));
         assert!(!coordinator.inbound_pressed.is_empty());
         assert!(matches!(
-            coordinator.activate_binding(binding(2), 3),
+            coordinator.activate_binding(endpoint(2), binding(2), 3),
             Err(CoordinatorError::CleanupIncomplete)
         ));
         assert!(!coordinator.is_admitted());
@@ -1722,6 +2686,7 @@ mod tests {
         for operation in 0..3 {
             let mut coordinator = coordinator();
             admit(&mut coordinator);
+            let endpoint = authorized_endpoint(&coordinator);
             coordinator
                 .handle_authorized_message(key(1, DEVICE, 0xe0, WireKeyState::Down), 1)
                 .unwrap();
@@ -1729,14 +2694,34 @@ mod tests {
 
             let result = match operation {
                 0 => coordinator
-                    .handle_state(ConnectionState::Disconnected, 2)
+                    .handle_endpoint_state(endpoint, ConnectionState::Disconnected, 2)
                     .map(drop),
                 1 => coordinator.revoke(2),
                 _ => coordinator.channel_closed(2),
             };
             assert!(matches!(result, Err(CoordinatorError::Injection)));
-            assert!(!coordinator.is_admitted());
+            assert_eq!(coordinator.is_admitted(), operation == 1);
             assert!(!coordinator.inbound_pressed.is_empty());
+        }
+    }
+
+    #[test]
+    fn synthetic_release_sequence_exhaustion_is_checked_and_retryable() {
+        let mut coordinator = coordinator();
+        admit(&mut coordinator);
+        coordinator
+            .handle_authorized_message(key(1, DEVICE, 0x04, WireKeyState::Down), 1)
+            .unwrap();
+        coordinator.synthetic_sequence = u64::MAX;
+
+        for now_ns in [2, 3] {
+            assert!(matches!(
+                coordinator.channel_closed(now_ns),
+                Err(CoordinatorError::SyntheticSequenceExhausted)
+            ));
+            assert_eq!(coordinator.synthetic_sequence, u64::MAX);
+            assert!(!coordinator.inbound_pressed.is_empty());
+            assert_eq!(coordinator.injection.events.len(), 1);
         }
     }
 
@@ -1765,19 +2750,18 @@ mod tests {
     fn failed_degraded_cleanup_revokes_the_session_before_recovery() {
         let mut coordinator = coordinator();
         admit(&mut coordinator);
+        let endpoint = authorized_endpoint(&coordinator);
         coordinator
             .handle_authorized_message(key(1, DEVICE, 0xe0, WireKeyState::Down), 1)
             .unwrap();
         coordinator.injection.fail_next = true;
         assert!(matches!(
-            coordinator.handle_state(ConnectionState::Degraded, 2),
+            coordinator.handle_endpoint_state(endpoint, ConnectionState::Degraded, 2),
             Err(CoordinatorError::Injection)
         ));
         assert!(!coordinator.is_admitted());
         assert_eq!(
-            coordinator
-                .handle_state(ConnectionState::Connected, 3)
-                .unwrap(),
+            coordinator.handle_unbound_state(ConnectionState::Connected, 3),
             PeerEventOutcome::Ignored
         );
         assert!(!coordinator.is_admitted());

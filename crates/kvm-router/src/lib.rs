@@ -4,12 +4,51 @@
 //! This keeps platform suppression code from needing to compare host IDs.
 
 use std::collections::HashMap;
+use std::error::Error;
+use std::fmt;
 
 use kvm_input::InputEvent;
 use kvm_types::{DeviceId, HostId, WorkspaceState};
-use serde::{Deserialize, Serialize};
+use serde::de::{self, IgnoredAny, MapAccess, Visitor};
+use serde::ser::SerializeStruct;
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 pub use kvm_types::DeviceRoute;
+
+/// Maximum number of explicit per-device policies retained at runtime.
+pub const MAX_DEVICE_ROUTES: usize = 1_024;
+
+/// Coarse validation failure for bounded runtime routing policy.
+#[derive(Clone, Copy, Eq, PartialEq)]
+pub enum RoutingTableError {
+    InvalidDevice,
+    InvalidTarget,
+    DuplicateDevice,
+    CapacityExceeded,
+}
+
+impl fmt::Debug for RoutingTableError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let kind = match self {
+            Self::InvalidDevice => "InvalidDevice",
+            Self::InvalidTarget => "InvalidTarget",
+            Self::DuplicateDevice => "DuplicateDevice",
+            Self::CapacityExceeded => "CapacityExceeded",
+        };
+        formatter
+            .debug_struct("RoutingTableError")
+            .field("kind", &kind)
+            .finish()
+    }
+}
+
+impl fmt::Display for RoutingTableError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("routing table policy is invalid")
+    }
+}
+
+impl Error for RoutingTableError {}
 
 /// The action a platform backend must take for a captured input event.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -30,9 +69,115 @@ pub trait InputRouter {
 /// Missing devices deliberately behave as `FollowActiveHost`. Newly attached
 /// keyboards and pointing devices therefore join the shared workspace without
 /// needing a configuration write on the latency-sensitive input path.
-#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Default, Eq, PartialEq)]
 pub struct RoutingTable {
     routes: HashMap<DeviceId, DeviceRoute>,
+}
+
+impl fmt::Debug for RoutingTable {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("RoutingTable")
+            .field("route_count", &self.routes.len())
+            .finish_non_exhaustive()
+    }
+}
+
+impl Serialize for RoutingTable {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let mut state = serializer.serialize_struct("RoutingTable", 1)?;
+        state.serialize_field("routes", &self.routes)?;
+        state.end()
+    }
+}
+
+impl<'de> Deserialize<'de> for RoutingTable {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        deserializer.deserialize_struct("RoutingTable", &["routes"], RoutingTableVisitor)
+    }
+}
+
+struct RoutingTableVisitor;
+
+impl<'de> Visitor<'de> for RoutingTableVisitor {
+    type Value = RoutingTable;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("a bounded routing table")
+    }
+
+    fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+    where
+        A: MapAccess<'de>,
+    {
+        let mut routes = None;
+        while let Some(field) = map.next_key::<RoutingTableField>()? {
+            match field {
+                RoutingTableField::Routes => {
+                    if routes.is_some() {
+                        return Err(de::Error::custom("routing table policy is invalid"));
+                    }
+                    routes = Some(map.next_value::<BoundedRoutes>()?.0);
+                }
+                RoutingTableField::Other => {
+                    map.next_value::<IgnoredAny>()?;
+                }
+            }
+        }
+        let routes = routes.ok_or_else(|| de::Error::missing_field("routes"))?;
+        Ok(RoutingTable { routes })
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(field_identifier, rename_all = "snake_case")]
+enum RoutingTableField {
+    Routes,
+    #[serde(other)]
+    Other,
+}
+
+struct BoundedRoutes(HashMap<DeviceId, DeviceRoute>);
+
+impl<'de> Deserialize<'de> for BoundedRoutes {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        deserializer.deserialize_map(BoundedRoutesVisitor)
+    }
+}
+
+struct BoundedRoutesVisitor;
+
+impl<'de> Visitor<'de> for BoundedRoutesVisitor {
+    type Value = BoundedRoutes;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("bounded per-device routes")
+    }
+
+    fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+    where
+        A: MapAccess<'de>,
+    {
+        let mut routes = HashMap::new();
+        while let Some((device, route)) = map.next_entry::<DeviceId, DeviceRoute>()? {
+            validate_entry(device, route)
+                .map_err(|_| de::Error::custom("routing table policy is invalid"))?;
+            if routes.contains_key(&device) || routes.len() >= MAX_DEVICE_ROUTES {
+                return Err(de::Error::custom("routing table policy is invalid"));
+            }
+            routes.insert(device, route);
+        }
+        Ok(BoundedRoutes(routes))
+    }
 }
 
 impl RoutingTable {
@@ -41,17 +186,47 @@ impl RoutingTable {
         Self::default()
     }
 
-    /// Builds a table from configured overrides. Later duplicate IDs win.
-    #[must_use]
-    pub fn from_routes(routes: impl IntoIterator<Item = (DeviceId, DeviceRoute)>) -> Self {
-        Self {
-            routes: routes.into_iter().collect(),
+    /// Builds a bounded table from validated configured overrides.
+    ///
+    /// # Errors
+    ///
+    /// Rejects nil device/host identifiers, duplicate devices, and inputs
+    /// exceeding [`MAX_DEVICE_ROUTES`] without returning partial state.
+    pub fn try_from_routes(
+        routes: impl IntoIterator<Item = (DeviceId, DeviceRoute)>,
+    ) -> Result<Self, RoutingTableError> {
+        let mut table = Self::new();
+        for (device, route) in routes {
+            validate_entry(device, route)?;
+            if table.routes.contains_key(&device) {
+                return Err(RoutingTableError::DuplicateDevice);
+            }
+            if table.routes.len() >= MAX_DEVICE_ROUTES {
+                return Err(RoutingTableError::CapacityExceeded);
+            }
+            table.routes.insert(device, route);
         }
+        Ok(table)
     }
 
-    /// Adds or replaces a configured route, returning the previous value.
-    pub fn set_route(&mut self, device: DeviceId, route: DeviceRoute) -> Option<DeviceRoute> {
-        self.routes.insert(device, route)
+    /// Adds or replaces one route transactionally.
+    ///
+    /// Replacement remains available at capacity because it does not grow
+    /// retained state.
+    ///
+    /// # Errors
+    ///
+    /// Rejects nil device/host identifiers and new entries above the bound.
+    pub fn set_route(
+        &mut self,
+        device: DeviceId,
+        route: DeviceRoute,
+    ) -> Result<Option<DeviceRoute>, RoutingTableError> {
+        validate_entry(device, route)?;
+        if !self.routes.contains_key(&device) && self.routes.len() >= MAX_DEVICE_ROUTES {
+            return Err(RoutingTableError::CapacityExceeded);
+        }
+        Ok(self.routes.insert(device, route))
     }
 
     /// Removes an explicit route. The device returns to `FollowActiveHost`.
@@ -107,6 +282,16 @@ impl RoutingTable {
             Destination::Remote(target)
         }
     }
+}
+
+fn validate_entry(device: DeviceId, route: DeviceRoute) -> Result<(), RoutingTableError> {
+    if device.into_bytes() == [0; 16] {
+        return Err(RoutingTableError::InvalidDevice);
+    }
+    if matches!(route, DeviceRoute::Host(host) if host.into_bytes() == [0; 16]) {
+        return Err(RoutingTableError::InvalidTarget);
+    }
+    Ok(())
 }
 
 impl InputRouter for RoutingTable {
@@ -167,7 +352,7 @@ mod tests {
     #[test]
     fn local_override_ignores_active_host() {
         let mut routes = RoutingTable::new();
-        routes.set_route(DEVICE, DeviceRoute::Local);
+        routes.set_route(DEVICE, DeviceRoute::Local).unwrap();
 
         assert_eq!(
             routes.destination(&event(DEVICE), &state(REMOTE)),
@@ -178,13 +363,13 @@ mod tests {
     #[test]
     fn explicit_host_is_local_or_remote_relative_to_this_daemon() {
         let mut routes = RoutingTable::new();
-        routes.set_route(DEVICE, DeviceRoute::Host(LOCAL));
+        routes.set_route(DEVICE, DeviceRoute::Host(LOCAL)).unwrap();
         assert_eq!(
             routes.destination(&event(DEVICE), &state(REMOTE)),
             Destination::Local
         );
 
-        routes.set_route(DEVICE, DeviceRoute::Host(THIRD));
+        routes.set_route(DEVICE, DeviceRoute::Host(THIRD)).unwrap();
         assert_eq!(
             routes.destination(&event(DEVICE), &state(LOCAL)),
             Destination::Remote(THIRD)
@@ -196,8 +381,10 @@ mod tests {
         let local_device = DeviceId::from_bytes([6; 16]);
         let remote_device = DeviceId::from_bytes([7; 16]);
         let mut routes = RoutingTable::new();
-        routes.set_route(local_device, DeviceRoute::Local);
-        routes.set_route(remote_device, DeviceRoute::Host(REMOTE));
+        routes.set_route(local_device, DeviceRoute::Local).unwrap();
+        routes
+            .set_route(remote_device, DeviceRoute::Host(REMOTE))
+            .unwrap();
 
         assert_eq!(
             routes.destination(&event(local_device), &state(REMOTE)),
@@ -211,7 +398,7 @@ mod tests {
 
     #[test]
     fn removing_override_restores_follow_active_default() {
-        let mut routes = RoutingTable::from_routes([(DEVICE, DeviceRoute::Local)]);
+        let mut routes = RoutingTable::try_from_routes([(DEVICE, DeviceRoute::Local)]).unwrap();
 
         assert_eq!(routes.remove_route(DEVICE), Some(DeviceRoute::Local));
         assert!(routes.is_empty());
@@ -219,5 +406,119 @@ mod tests {
             routes.destination(&event(DEVICE), &state(REMOTE)),
             Destination::Remote(REMOTE)
         );
+    }
+
+    fn indexed_device(index: usize) -> DeviceId {
+        let mut bytes = [0_u8; 16];
+        bytes[..8].copy_from_slice(&u64::try_from(index + 1).unwrap().to_be_bytes());
+        DeviceId::from_bytes(bytes)
+    }
+
+    #[test]
+    fn construction_rejects_invalid_duplicate_and_oversized_inputs() {
+        for entry in [
+            (DeviceId::from_bytes([0; 16]), DeviceRoute::Local),
+            (DEVICE, DeviceRoute::Host(HostId::from_bytes([0; 16]))),
+        ] {
+            assert!(RoutingTable::try_from_routes([entry]).is_err());
+        }
+        assert_eq!(
+            RoutingTable::try_from_routes([
+                (DEVICE, DeviceRoute::Local),
+                (DEVICE, DeviceRoute::FollowActiveHost),
+            ])
+            .unwrap_err(),
+            RoutingTableError::DuplicateDevice
+        );
+
+        let maximum = (0..MAX_DEVICE_ROUTES).map(|index| {
+            (
+                indexed_device(index),
+                if index % 2 == 0 {
+                    DeviceRoute::Local
+                } else {
+                    DeviceRoute::FollowActiveHost
+                },
+            )
+        });
+        let table = RoutingTable::try_from_routes(maximum).unwrap();
+        assert_eq!(table.len(), MAX_DEVICE_ROUTES);
+
+        let oversized =
+            (0..=MAX_DEVICE_ROUTES).map(|index| (indexed_device(index), DeviceRoute::Local));
+        assert_eq!(
+            RoutingTable::try_from_routes(oversized).unwrap_err(),
+            RoutingTableError::CapacityExceeded
+        );
+    }
+
+    #[test]
+    fn mutation_at_capacity_is_transactional_but_replacement_succeeds() {
+        let mut table = RoutingTable::try_from_routes(
+            (0..MAX_DEVICE_ROUTES).map(|index| (indexed_device(index), DeviceRoute::Local)),
+        )
+        .unwrap();
+        let before = table.clone();
+        assert_eq!(
+            table.set_route(indexed_device(MAX_DEVICE_ROUTES), DeviceRoute::Local),
+            Err(RoutingTableError::CapacityExceeded)
+        );
+        assert_eq!(table, before);
+
+        assert_eq!(
+            table
+                .set_route(indexed_device(0), DeviceRoute::FollowActiveHost)
+                .unwrap(),
+            Some(DeviceRoute::Local)
+        );
+        assert_eq!(table.len(), MAX_DEVICE_ROUTES);
+    }
+
+    #[test]
+    fn routing_diagnostics_are_count_only_and_redacted() {
+        let device = DeviceId::from_bytes([0x41; 16]);
+        let host = HostId::from_bytes([0x42; 16]);
+        let table = RoutingTable::try_from_routes([(device, DeviceRoute::Host(host))]).unwrap();
+        let rendered = format!(
+            "{table:?} {:?} {}",
+            RoutingTableError::InvalidTarget,
+            RoutingTableError::InvalidTarget
+        );
+
+        assert!(rendered.contains("route_count: 1"));
+        assert!(!rendered.contains(&device.to_string()));
+        assert!(!rendered.contains(&host.to_string()));
+    }
+
+    #[test]
+    fn serde_round_trip_preserves_bounds_and_rejects_duplicate_map_keys() {
+        let table = RoutingTable::try_from_routes([
+            (DEVICE, DeviceRoute::Host(REMOTE)),
+            (indexed_device(1), DeviceRoute::Local),
+        ])
+        .unwrap();
+        let encoded = serde_json::to_string(&table).unwrap();
+        assert_eq!(
+            serde_json::from_str::<RoutingTable>(&encoded).unwrap(),
+            table
+        );
+
+        let duplicate =
+            format!(r#"{{"routes":{{"{DEVICE}":"local","{DEVICE}":"follow_active_host"}}}}"#);
+        let error = serde_json::from_str::<RoutingTable>(&duplicate).unwrap_err();
+        assert!(!error.to_string().contains(&DEVICE.to_string()));
+
+        let mut value = serde_json::to_value(
+            RoutingTable::try_from_routes(
+                (0..MAX_DEVICE_ROUTES).map(|index| (indexed_device(index), DeviceRoute::Local)),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        value["routes"].as_object_mut().unwrap().insert(
+            indexed_device(MAX_DEVICE_ROUTES).to_string(),
+            serde_json::json!("local"),
+        );
+        assert!(serde_json::from_value::<RoutingTable>(value).is_err());
     }
 }

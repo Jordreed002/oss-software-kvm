@@ -1,3 +1,5 @@
+use std::fmt;
+
 use serde::{Deserialize, Serialize};
 
 /// A physical key position, independent of the source keyboard layout.
@@ -5,7 +7,7 @@ use serde::{Deserialize, Serialize};
 /// Named variants follow USB HID usage positions where possible. `Unidentified`
 /// preserves a usage that a backend understands but this version does not yet
 /// name, without admitting platform-native scan codes into the shared model.
-#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+#[derive(Clone, Copy, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 #[non_exhaustive]
 #[serde(rename_all = "snake_case")]
 pub enum KeyCode {
@@ -168,6 +170,12 @@ pub enum KeyCode {
     },
 }
 
+impl fmt::Debug for KeyCode {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("KeyCode([REDACTED])")
+    }
+}
+
 impl KeyCode {
     #[must_use]
     pub const fn is_modifier(self) -> bool {
@@ -212,5 +220,20 @@ mod tests {
                 usage_id: 0x1234
             }
         );
+    }
+
+    #[test]
+    fn key_diagnostics_hide_named_and_unidentified_controls() {
+        let rendered = format!(
+            "{:?} {:?}",
+            KeyCode::KeyA,
+            KeyCode::Unidentified {
+                usage_page: 54_321,
+                usage_id: 12_345,
+            }
+        );
+        for secret in ["KeyA", "Unidentified", "54321", "12345"] {
+            assert!(!rendered.contains(secret));
+        }
     }
 }

@@ -1,12 +1,23 @@
 use std::collections::HashSet;
+use std::fmt;
 
 use crate::{ButtonState, InputPayload, KeyCode, KeyState, PointerButton};
 
 /// Tracks remotely held keys and pointer buttons for safe cleanup.
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Default, Eq, PartialEq)]
 pub struct PressedState {
     keys: HashSet<KeyCode>,
     buttons: HashSet<PointerButton>,
+}
+
+impl fmt::Debug for PressedState {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PressedState")
+            .field("key_count", &self.keys.len())
+            .field("button_count", &self.buttons.len())
+            .finish_non_exhaustive()
+    }
 }
 
 impl PressedState {
@@ -41,6 +52,7 @@ impl PressedState {
         match *payload {
             InputPayload::Key { code, state } => match state {
                 KeyState::Pressed => self.keys.insert(code),
+                KeyState::Repeated => false,
                 KeyState::Released => self.keys.remove(&code),
             },
             InputPayload::PointerButton { button, state } => match state {
@@ -95,17 +107,25 @@ mod tests {
     use super::*;
 
     #[test]
-    fn repeat_press_does_not_duplicate_held_state() {
+    fn repeat_does_not_mutate_held_state() {
         let mut state = PressedState::new();
         let press = InputPayload::Key {
             code: KeyCode::ControlLeft,
             state: KeyState::Pressed,
         };
+        let repeat = InputPayload::Key {
+            code: KeyCode::ControlLeft,
+            state: KeyState::Repeated,
+        };
 
         assert!(state.apply(&press));
-        assert!(!state.apply(&press));
+        assert!(!state.apply(&repeat));
         assert_eq!(state.len(), 1);
         assert!(state.key_is_pressed(KeyCode::ControlLeft));
+
+        let mut unmatched = PressedState::new();
+        assert!(!unmatched.apply(&repeat));
+        assert!(unmatched.is_empty());
     }
 
     #[test]
@@ -181,5 +201,28 @@ mod tests {
         let second: Vec<_> = state.pressed_keys().collect();
         assert_eq!(first, second);
         assert_eq!(first.last(), Some(&KeyCode::ControlLeft));
+    }
+
+    #[test]
+    fn pressed_state_diagnostics_are_count_only() {
+        let mut state = PressedState::new();
+        state.apply(&InputPayload::Key {
+            code: KeyCode::Unidentified {
+                usage_page: 54_321,
+                usage_id: 12_345,
+            },
+            state: KeyState::Pressed,
+        });
+        state.apply(&InputPayload::PointerButton {
+            button: PointerButton::Other(43_210),
+            state: ButtonState::Pressed,
+        });
+
+        let rendered = format!("{state:?}");
+        assert!(rendered.contains("key_count: 1"));
+        assert!(rendered.contains("button_count: 1"));
+        for secret in ["54321", "12345", "43210", "Unidentified", "Other"] {
+            assert!(!rendered.contains(secret));
+        }
     }
 }

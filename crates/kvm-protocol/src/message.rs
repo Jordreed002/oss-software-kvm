@@ -1,12 +1,17 @@
 use crate::{
     AuthenticateV1, ClipboardV1, DeviceAddedV1, DeviceRemovedV1, DeviceSnapshotV1,
     DisplaySnapshotV1, DisplayUpdatedV1, HelloV1, InputEventV1, PingV1, PointerEnterV1,
-    PointerLeaveV1, PointerTransitionAckV1, PongV1, ProtocolError, ReleaseInputV1, ValidationError,
-    WireDisplayV1, WireInputDeviceV1, WireInputPayloadV1, MAX_AUTH_BYTES, MAX_CLIPBOARD_TEXT_BYTES,
-    MAX_DEVICE_NAME_BYTES, MAX_DISPLAY_NAME_BYTES, MAX_HOST_NAME_BYTES, MAX_RELEASE_KEYS,
-    MAX_SNAPSHOT_ITEMS, PROTOCOL_VERSION,
+    PointerLeaveV1, PointerTransitionAckV1, PointerTransitionCommitV1, PongV1, ProtocolError,
+    ReleaseAppliedAckV2, ReleaseInputV1, ReleaseInputV2, ValidationError, WireDisplayV1,
+    WireInputDeviceV1, WireInputPayloadV1, CURRENT_PROTOCOL_VERSION, MAX_AUTH_BYTES,
+    MAX_CLIPBOARD_TEXT_BYTES, MAX_DEVICE_NAME_BYTES, MAX_DISPLAY_LOGICAL_DIMENSION,
+    MAX_DISPLAY_NAME_BYTES, MAX_DISPLAY_NATIVE_COORDINATE_ABS, MAX_DISPLAY_PHYSICAL_DIMENSION,
+    MAX_DISPLAY_REFRESH_RATE_HZ, MAX_DISPLAY_SCALE_FACTOR, MAX_HOST_NAME_BYTES,
+    MAX_RELEASE_BUTTONS, MAX_RELEASE_CONTROLS, MAX_RELEASE_KEYS, MAX_SNAPSHOT_ITEMS,
+    MIN_SUPPORTED_PROTOCOL_VERSION, PROTOCOL_VERSION_V2,
 };
 use serde::de::DeserializeOwned;
+use std::collections::{BTreeSet, HashSet};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(u16)]
@@ -22,10 +27,13 @@ pub enum MessageType {
     PointerEnter = 31,
     PointerLeave = 32,
     PointerTransitionAck = 33,
+    PointerTransitionCommit = 34,
     Clipboard = 40,
     Ping = 50,
     Pong = 51,
     ReleaseInput = 60,
+    ReleaseInputV2 = 61,
+    ReleaseAppliedAckV2 = 62,
 }
 
 impl TryFrom<u16> for MessageType {
@@ -44,16 +52,19 @@ impl TryFrom<u16> for MessageType {
             31 => Ok(Self::PointerEnter),
             32 => Ok(Self::PointerLeave),
             33 => Ok(Self::PointerTransitionAck),
+            34 => Ok(Self::PointerTransitionCommit),
             40 => Ok(Self::Clipboard),
             50 => Ok(Self::Ping),
             51 => Ok(Self::Pong),
             60 => Ok(Self::ReleaseInput),
+            61 => Ok(Self::ReleaseInputV2),
+            62 => Ok(Self::ReleaseAppliedAckV2),
             other => Err(ProtocolError::UnknownMessageType(other)),
         }
     }
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, PartialEq)]
 pub enum WireMessage {
     Hello(HelloV1),
     Authenticate(AuthenticateV1),
@@ -66,13 +77,27 @@ pub enum WireMessage {
     PointerEnter(PointerEnterV1),
     PointerLeave(PointerLeaveV1),
     PointerTransitionAck(PointerTransitionAckV1),
+    PointerTransitionCommit(PointerTransitionCommitV1),
     Clipboard(ClipboardV1),
     Ping(PingV1),
     Pong(PongV1),
     ReleaseInput(ReleaseInputV1),
+    ReleaseInputV2(ReleaseInputV2),
+    ReleaseAppliedAckV2(ReleaseAppliedAckV2),
+}
+
+impl std::fmt::Debug for WireMessage {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_tuple("WireMessage")
+            .field(&self.message_type())
+            .field(&"[REDACTED]")
+            .finish()
+    }
 }
 
 impl WireMessage {
+    #[must_use]
     pub const fn message_type(&self) -> MessageType {
         match self {
             Self::Hello(_) => MessageType::Hello,
@@ -86,11 +111,20 @@ impl WireMessage {
             Self::PointerEnter(_) => MessageType::PointerEnter,
             Self::PointerLeave(_) => MessageType::PointerLeave,
             Self::PointerTransitionAck(_) => MessageType::PointerTransitionAck,
+            Self::PointerTransitionCommit(_) => MessageType::PointerTransitionCommit,
             Self::Clipboard(_) => MessageType::Clipboard,
             Self::Ping(_) => MessageType::Ping,
             Self::Pong(_) => MessageType::Pong,
             Self::ReleaseInput(_) => MessageType::ReleaseInput,
+            Self::ReleaseInputV2(_) => MessageType::ReleaseInputV2,
+            Self::ReleaseAppliedAckV2(_) => MessageType::ReleaseAppliedAckV2,
         }
+    }
+
+    /// Earliest framing version which may carry this message type.
+    #[must_use]
+    pub const fn minimum_protocol_version(&self) -> u16 {
+        self.message_type().minimum_protocol_version()
     }
 
     /// Validates message-specific size, ownership, and numeric invariants.
@@ -106,16 +140,21 @@ impl WireMessage {
             Self::Hello(value) => {
                 string_len("host_name", &value.host_name, MAX_HOST_NAME_BYTES, &invalid)?;
                 string_len("daemon_version", &value.daemon_version, 128, &invalid)?;
+                if value.minimum_protocol_version == 0 {
+                    return Err(invalid(
+                        "minimum protocol version must be positive".to_owned(),
+                    ));
+                }
                 if value.minimum_protocol_version > value.maximum_protocol_version {
                     return Err(invalid(
                         "minimum protocol version exceeds maximum".to_owned(),
                     ));
                 }
-                if !(value.minimum_protocol_version..=value.maximum_protocol_version)
-                    .contains(&PROTOCOL_VERSION)
+                if value.maximum_protocol_version < MIN_SUPPORTED_PROTOCOL_VERSION
+                    || value.minimum_protocol_version > CURRENT_PROTOCOL_VERSION
                 {
                     return Err(invalid(
-                        "peer does not advertise support for protocol v1".to_owned(),
+                        "peer does not advertise a supported protocol version".to_owned(),
                     ));
                 }
             }
@@ -131,34 +170,16 @@ impl WireMessage {
                 }
             }
             Self::DeviceSnapshot(value) => {
-                list_len("devices", value.devices.len(), MAX_SNAPSHOT_ITEMS, &invalid)?;
-                for device in &value.devices {
-                    validate_device(device, &invalid)?;
-                    if device.host_id != value.host_id {
-                        return Err(invalid(
-                            "snapshot contains a device owned by another host".to_owned(),
-                        ));
-                    }
-                }
+                value.validate()?;
             }
-            Self::DeviceAdded(value) => validate_device(&value.device, &invalid)?,
+            Self::DeviceAdded(value) => value.validate()?,
+            Self::DeviceRemoved(value) => value.validate()?,
             Self::DisplaySnapshot(value) => {
-                list_len(
-                    "displays",
-                    value.displays.len(),
-                    MAX_SNAPSHOT_ITEMS,
-                    &invalid,
-                )?;
-                for display in &value.displays {
-                    validate_display(display, &invalid)?;
-                    if display.host_id != value.host_id {
-                        return Err(invalid(
-                            "snapshot contains a display owned by another host".to_owned(),
-                        ));
-                    }
-                }
+                value.validate()?;
             }
-            Self::DisplayUpdated(value) => validate_display(&value.display, &invalid)?,
+            Self::DisplayUpdated(value) => {
+                value.validate()?;
+            }
             Self::Input(value) => validate_input(value, &invalid)?,
             Self::PointerEnter(value) => {
                 normalized(value.normalized_position, &invalid)?;
@@ -169,17 +190,28 @@ impl WireMessage {
                 }
             }
             Self::PointerLeave(value) => normalized(value.normalized_position, &invalid)?,
+            Self::PointerTransitionCommit(value) => {
+                if value.source_host == value.destination_host {
+                    return Err(invalid(
+                        "pointer-transition commit destination must be a different host".to_owned(),
+                    ));
+                }
+            }
             Self::Clipboard(value) => {
                 string_len("text", &value.text, MAX_CLIPBOARD_TEXT_BYTES, &invalid)?;
             }
             Self::ReleaseInput(value) => {
                 list_len("keys", value.keys.len(), MAX_RELEASE_KEYS, &invalid)?;
-                list_len("buttons", value.buttons.len(), 32, &invalid)?;
+                list_len(
+                    "buttons",
+                    value.buttons.len(),
+                    MAX_RELEASE_BUTTONS,
+                    &invalid,
+                )?;
             }
-            Self::DeviceRemoved(_)
-            | Self::PointerTransitionAck(_)
-            | Self::Ping(_)
-            | Self::Pong(_) => {}
+            Self::ReleaseInputV2(value) => value.validate()?,
+            Self::ReleaseAppliedAckV2(value) => value.validate()?,
+            Self::PointerTransitionAck(_) | Self::Ping(_) | Self::Pong(_) => {}
         }
         Ok(())
     }
@@ -197,10 +229,13 @@ impl WireMessage {
             Self::PointerEnter(value) => postcard::to_allocvec(value),
             Self::PointerLeave(value) => postcard::to_allocvec(value),
             Self::PointerTransitionAck(value) => postcard::to_allocvec(value),
+            Self::PointerTransitionCommit(value) => postcard::to_allocvec(value),
             Self::Clipboard(value) => postcard::to_allocvec(value),
             Self::Ping(value) => postcard::to_allocvec(value),
             Self::Pong(value) => postcard::to_allocvec(value),
             Self::ReleaseInput(value) => postcard::to_allocvec(value),
+            Self::ReleaseInputV2(value) => postcard::to_allocvec(value),
+            Self::ReleaseAppliedAckV2(value) => postcard::to_allocvec(value),
         }
     }
 
@@ -240,11 +275,189 @@ impl WireMessage {
             MessageType::PointerTransitionAck => {
                 Self::PointerTransitionAck(decode(message_type, bytes)?)
             }
+            MessageType::PointerTransitionCommit => {
+                Self::PointerTransitionCommit(decode(message_type, bytes)?)
+            }
             MessageType::Clipboard => Self::Clipboard(decode(message_type, bytes)?),
             MessageType::Ping => Self::Ping(decode(message_type, bytes)?),
             MessageType::Pong => Self::Pong(decode(message_type, bytes)?),
             MessageType::ReleaseInput => Self::ReleaseInput(decode(message_type, bytes)?),
+            MessageType::ReleaseInputV2 => Self::ReleaseInputV2(decode(message_type, bytes)?),
+            MessageType::ReleaseAppliedAckV2 => {
+                Self::ReleaseAppliedAckV2(decode(message_type, bytes)?)
+            }
         })
+    }
+}
+
+impl MessageType {
+    /// Earliest framing version in which this discriminant is valid.
+    #[must_use]
+    pub const fn minimum_protocol_version(self) -> u16 {
+        match self {
+            Self::ReleaseInputV2 | Self::ReleaseAppliedAckV2 => PROTOCOL_VERSION_V2,
+            Self::Hello
+            | Self::Authenticate
+            | Self::DeviceSnapshot
+            | Self::DeviceAdded
+            | Self::DeviceRemoved
+            | Self::DisplaySnapshot
+            | Self::DisplayUpdated
+            | Self::Input
+            | Self::PointerEnter
+            | Self::PointerLeave
+            | Self::PointerTransitionAck
+            | Self::PointerTransitionCommit
+            | Self::Clipboard
+            | Self::Ping
+            | Self::Pong
+            | Self::ReleaseInput => MIN_SUPPORTED_PROTOCOL_VERSION,
+        }
+    }
+}
+
+impl ReleaseInputV2 {
+    /// Revalidates the complete v2 release request without encoding it.
+    ///
+    /// # Errors
+    ///
+    /// Rejects zero correlation/session values, invalid ownership, unsafe
+    /// sequence coverage, duplicate controls, or any count above its bound.
+    pub fn validate(&self) -> Result<(), ValidationError> {
+        let invalid = |detail| ValidationError::new(MessageType::ReleaseInputV2, detail);
+        validate_release_v2(self, &invalid)
+    }
+}
+
+impl ReleaseAppliedAckV2 {
+    /// Revalidates the complete v2 applied-release acknowledgment.
+    ///
+    /// Exact equality with a retained request is intentionally a daemon state
+    /// machine check; this method validates only self-contained wire bounds.
+    ///
+    /// # Errors
+    ///
+    /// Rejects zero correlation/session values, invalid ownership, or unsafe
+    /// sequence coverage.
+    pub fn validate(&self) -> Result<(), ValidationError> {
+        let invalid = |detail| ValidationError::new(MessageType::ReleaseAppliedAckV2, detail);
+        validate_release_ack_v2(self, &invalid)
+    }
+}
+
+impl DeviceSnapshotV1 {
+    /// Revalidates every device-wire invariant without encoding or copying
+    /// peer-controlled values.
+    ///
+    /// # Errors
+    ///
+    /// Rejects nil or inconsistent ownership, zero revision, excessive count,
+    /// duplicate device IDs, or invalid device metadata.
+    pub fn validate(&self) -> Result<(), ValidationError> {
+        let invalid = |detail| ValidationError::new(MessageType::DeviceSnapshot, detail);
+        positive_revision("device", self.revision, &invalid)?;
+        non_nil_id("snapshot host", self.host_id.0, &invalid)?;
+        list_len("devices", self.devices.len(), MAX_SNAPSHOT_ITEMS, &invalid)?;
+        let mut device_ids = BTreeSet::new();
+        for device in &self.devices {
+            validate_device(device, &invalid)?;
+            if device.host_id != self.host_id {
+                return Err(invalid(
+                    "snapshot contains a device owned by another host".to_owned(),
+                ));
+            }
+            if !device_ids.insert(device.id) {
+                return Err(invalid(
+                    "snapshot contains duplicate device identifiers".to_owned(),
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+impl DeviceAddedV1 {
+    /// Revalidates a device-add delta without encoding or copying it.
+    ///
+    /// # Errors
+    ///
+    /// Rejects a zero revision or invalid device identifier, owner, or name.
+    pub fn validate(&self) -> Result<(), ValidationError> {
+        let invalid = |detail| ValidationError::new(MessageType::DeviceAdded, detail);
+        positive_revision("device", self.revision, &invalid)?;
+        validate_device(&self.device, &invalid)
+    }
+}
+
+impl DeviceRemovedV1 {
+    /// Revalidates a device-remove delta without encoding or copying it.
+    ///
+    /// # Errors
+    ///
+    /// Rejects a zero revision or nil host/device identifier.
+    pub fn validate(&self) -> Result<(), ValidationError> {
+        let invalid = |detail| ValidationError::new(MessageType::DeviceRemoved, detail);
+        positive_revision("device", self.revision, &invalid)?;
+        non_nil_id("device owner", self.host_id.0, &invalid)?;
+        non_nil_id("device", self.device_id.0, &invalid)
+    }
+}
+
+impl DisplaySnapshotV1 {
+    /// Revalidates every display-wire invariant without encoding or copying
+    /// peer-controlled values.
+    ///
+    /// # Errors
+    ///
+    /// Rejects nil or inconsistent ownership, zero revision, excessive count,
+    /// duplicate display IDs, invalid display metadata, or a primary-count
+    /// other than exactly one.
+    pub fn validate(&self) -> Result<(), ValidationError> {
+        let invalid = |detail| ValidationError::new(MessageType::DisplaySnapshot, detail);
+        positive_revision("display", self.revision, &invalid)?;
+        non_nil_id("snapshot host", self.host_id.0, &invalid)?;
+        list_len(
+            "displays",
+            self.displays.len(),
+            MAX_SNAPSHOT_ITEMS,
+            &invalid,
+        )?;
+        let mut display_ids = BTreeSet::new();
+        let mut primary_count = 0_usize;
+        for display in &self.displays {
+            validate_display(display, &invalid)?;
+            if display.host_id != self.host_id {
+                return Err(invalid(
+                    "snapshot contains a display owned by another host".to_owned(),
+                ));
+            }
+            if !display_ids.insert(display.id) {
+                return Err(invalid(
+                    "snapshot contains duplicate display identifiers".to_owned(),
+                ));
+            }
+            primary_count += usize::from(display.primary);
+        }
+        if primary_count != 1 {
+            return Err(invalid(
+                "snapshot must contain exactly one primary display".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+impl DisplayUpdatedV1 {
+    /// Revalidates one display update without encoding or copying it.
+    ///
+    /// # Errors
+    ///
+    /// Rejects a zero revision or invalid display identifier, owner, name, or
+    /// geometry.
+    pub fn validate(&self) -> Result<(), ValidationError> {
+        let invalid = |detail| ValidationError::new(MessageType::DisplayUpdated, detail);
+        positive_revision("display", self.revision, &invalid)?;
+        validate_display(&self.display, &invalid)
     }
 }
 
@@ -281,7 +494,14 @@ fn validate_device(
     device: &WireInputDeviceV1,
     invalid: &impl Fn(String) -> ValidationError,
 ) -> Result<(), ValidationError> {
-    string_len("device name", &device.name, MAX_DEVICE_NAME_BYTES, invalid)
+    string_len("device name", &device.name, MAX_DEVICE_NAME_BYTES, invalid)?;
+    if device.name.trim().is_empty() || device.name.chars().any(char::is_control) {
+        return Err(invalid(
+            "device name must be nonempty and contain no control characters".to_owned(),
+        ));
+    }
+    non_nil_id("device", device.id.0, invalid)?;
+    non_nil_id("device owner", device.host_id.0, invalid)
 }
 
 fn validate_display(
@@ -294,20 +514,77 @@ fn validate_display(
         MAX_DISPLAY_NAME_BYTES,
         invalid,
     )?;
-    positive("logical width", display.logical_size.width, invalid)?;
-    positive("logical height", display.logical_size.height, invalid)?;
+    if display.name.trim().is_empty() || display.name.chars().any(char::is_control) {
+        return Err(invalid(
+            "display name must be nonempty and contain no control characters".to_owned(),
+        ));
+    }
+    non_nil_id("display", display.id.0, invalid)?;
+    non_nil_id("display owner", display.host_id.0, invalid)?;
+    positive_bounded(
+        "logical width",
+        display.logical_size.width,
+        MAX_DISPLAY_LOGICAL_DIMENSION,
+        invalid,
+    )?;
+    positive_bounded(
+        "logical height",
+        display.logical_size.height,
+        MAX_DISPLAY_LOGICAL_DIMENSION,
+        invalid,
+    )?;
     if let Some(size) = display.physical_size {
-        positive("physical width", size.width, invalid)?;
-        positive("physical height", size.height, invalid)?;
+        positive_bounded(
+            "physical width",
+            size.width,
+            MAX_DISPLAY_PHYSICAL_DIMENSION,
+            invalid,
+        )?;
+        positive_bounded(
+            "physical height",
+            size.height,
+            MAX_DISPLAY_PHYSICAL_DIMENSION,
+            invalid,
+        )?;
     }
-    positive("scale factor", display.scale_factor, invalid)?;
+    positive_bounded(
+        "scale factor",
+        display.scale_factor,
+        MAX_DISPLAY_SCALE_FACTOR,
+        invalid,
+    )?;
     if let Some(refresh_rate) = display.refresh_rate {
-        positive("refresh rate", refresh_rate, invalid)?;
+        positive_bounded(
+            "refresh rate",
+            refresh_rate,
+            MAX_DISPLAY_REFRESH_RATE_HZ,
+            invalid,
+        )?;
     }
-    finite("native x", display.native_bounds.x, invalid)?;
-    finite("native y", display.native_bounds.y, invalid)?;
-    positive("native width", display.native_bounds.width, invalid)?;
-    positive("native height", display.native_bounds.height, invalid)
+    bounded_coordinate("native x", display.native_bounds.x, invalid)?;
+    bounded_coordinate("native y", display.native_bounds.y, invalid)?;
+    positive_bounded(
+        "native width",
+        display.native_bounds.width,
+        MAX_DISPLAY_PHYSICAL_DIMENSION,
+        invalid,
+    )?;
+    positive_bounded(
+        "native height",
+        display.native_bounds.height,
+        MAX_DISPLAY_PHYSICAL_DIMENSION,
+        invalid,
+    )?;
+    bounded_coordinate(
+        "native maximum x",
+        display.native_bounds.x + display.native_bounds.width,
+        invalid,
+    )?;
+    bounded_coordinate(
+        "native maximum y",
+        display.native_bounds.y + display.native_bounds.height,
+        invalid,
+    )
 }
 
 fn validate_input(
@@ -328,6 +605,141 @@ fn validate_input(
         }
         WireInputPayloadV1::Key { .. } | WireInputPayloadV1::PointerButton { .. } => Ok(()),
     }
+}
+
+fn validate_release_v2(
+    release: &ReleaseInputV2,
+    invalid: &impl Fn(String) -> ValidationError,
+) -> Result<(), ValidationError> {
+    positive_counter("release transaction", release.transaction_id, invalid)?;
+    nonzero_secret("release token", &release.release_token, invalid)?;
+    nonzero_secret("old session", &release.old_session_id, invalid)?;
+    if release.release_token == release.old_session_id {
+        return Err(invalid(
+            "release token and old session identifier must differ".to_owned(),
+        ));
+    }
+    positive_counter("release sequence", release.sequence, invalid)?;
+    positive_counter(
+        "covered input sequence",
+        release.covered_input_sequence,
+        invalid,
+    )?;
+    if release.covered_input_sequence >= release.sequence {
+        return Err(invalid(
+            "covered input sequence must precede the release sequence".to_owned(),
+        ));
+    }
+    non_nil_id("release source host", release.source_host.0, invalid)?;
+    non_nil_id("release applying host", release.applying_host.0, invalid)?;
+    if release.source_host == release.applying_host {
+        return Err(invalid(
+            "release source and applying hosts must differ".to_owned(),
+        ));
+    }
+    if let Some(device) = release.source_device {
+        non_nil_id("release source device", device.0, invalid)?;
+    }
+    list_len("keys", release.keys.len(), MAX_RELEASE_KEYS, invalid)?;
+    list_len(
+        "buttons",
+        release.buttons.len(),
+        MAX_RELEASE_BUTTONS,
+        invalid,
+    )?;
+    let control_count = release
+        .keys
+        .len()
+        .checked_add(release.buttons.len())
+        .ok_or_else(|| invalid("release control count exceeds maximum".to_owned()))?;
+    list_len("controls", control_count, MAX_RELEASE_CONTROLS, invalid)?;
+    if !all_unique(&release.keys) || !all_unique(&release.buttons) {
+        return Err(invalid(
+            "release controls must not contain duplicates".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_release_ack_v2(
+    acknowledgement: &ReleaseAppliedAckV2,
+    invalid: &impl Fn(String) -> ValidationError,
+) -> Result<(), ValidationError> {
+    positive_counter(
+        "release transaction",
+        acknowledgement.transaction_id,
+        invalid,
+    )?;
+    nonzero_secret("release token", &acknowledgement.release_token, invalid)?;
+    nonzero_secret("old session", &acknowledgement.old_session_id, invalid)?;
+    if acknowledgement.release_token == acknowledgement.old_session_id {
+        return Err(invalid(
+            "release token and old session identifier must differ".to_owned(),
+        ));
+    }
+    positive_counter(
+        "acknowledgement sequence",
+        acknowledgement.sequence,
+        invalid,
+    )?;
+    positive_counter(
+        "acknowledged release sequence",
+        acknowledgement.release_sequence,
+        invalid,
+    )?;
+    positive_counter(
+        "covered input sequence",
+        acknowledgement.covered_input_sequence,
+        invalid,
+    )?;
+    if acknowledgement.covered_input_sequence >= acknowledgement.release_sequence {
+        return Err(invalid(
+            "covered input sequence must precede the acknowledged release sequence".to_owned(),
+        ));
+    }
+    non_nil_id(
+        "acknowledgement source host",
+        acknowledgement.source_host.0,
+        invalid,
+    )?;
+    non_nil_id(
+        "acknowledgement applying host",
+        acknowledgement.applying_host.0,
+        invalid,
+    )?;
+    if acknowledgement.source_host == acknowledgement.applying_host {
+        return Err(invalid(
+            "acknowledgement source and applying hosts must differ".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn positive_counter(
+    name: &str,
+    value: u64,
+    invalid: &impl Fn(String) -> ValidationError,
+) -> Result<(), ValidationError> {
+    if value == 0 {
+        return Err(invalid(format!("{name} must be positive")));
+    }
+    Ok(())
+}
+
+fn nonzero_secret(
+    name: &str,
+    value: &[u8; 32],
+    invalid: &impl Fn(String) -> ValidationError,
+) -> Result<(), ValidationError> {
+    if value == &[0; 32] {
+        return Err(invalid(format!("{name} must be nonzero")));
+    }
+    Ok(())
+}
+
+fn all_unique<T: Copy + Eq + std::hash::Hash>(values: &[T]) -> bool {
+    let mut unique = HashSet::with_capacity(values.len());
+    values.iter().copied().all(|value| unique.insert(value))
 }
 
 fn normalized(
@@ -353,13 +765,51 @@ fn finite(
     Ok(())
 }
 
-fn positive(
+fn positive_bounded(
+    name: &str,
+    value: f64,
+    maximum: f64,
+    invalid: &impl Fn(String) -> ValidationError,
+) -> Result<(), ValidationError> {
+    if !value.is_finite() || value <= 0.0 || value > maximum {
+        return Err(invalid(format!(
+            "{name} must be finite, positive, and within its permitted bound"
+        )));
+    }
+    Ok(())
+}
+
+fn bounded_coordinate(
     name: &str,
     value: f64,
     invalid: &impl Fn(String) -> ValidationError,
 ) -> Result<(), ValidationError> {
-    if !value.is_finite() || value <= 0.0 {
-        return Err(invalid(format!("{name} must be finite and positive")));
+    if !value.is_finite() || value.abs() > MAX_DISPLAY_NATIVE_COORDINATE_ABS {
+        return Err(invalid(format!(
+            "{name} must be finite and within its permitted bound"
+        )));
+    }
+    Ok(())
+}
+
+fn positive_revision(
+    subject: &str,
+    revision: u64,
+    invalid: &impl Fn(String) -> ValidationError,
+) -> Result<(), ValidationError> {
+    if revision == 0 {
+        return Err(invalid(format!("{subject} revision must be positive")));
+    }
+    Ok(())
+}
+
+fn non_nil_id(
+    name: &str,
+    value: [u8; 16],
+    invalid: &impl Fn(String) -> ValidationError,
+) -> Result<(), ValidationError> {
+    if value == [0; 16] {
+        return Err(invalid(format!("{name} identifier must be non-nil")));
     }
     Ok(())
 }
@@ -394,6 +844,18 @@ mod tests {
         }
     }
 
+    fn indexed_device(index: usize) -> WireInputDeviceV1 {
+        let mut value = device();
+        let mut id = [0_u8; 16];
+        id[..8].copy_from_slice(
+            &u64::try_from(index + 1)
+                .expect("bounded test index fits in u64")
+                .to_be_bytes(),
+        );
+        value.id = WireDeviceId(id);
+        value
+    }
+
     fn display(id: WireDisplayId, host_id: WireHostId) -> WireDisplayV1 {
         WireDisplayV1 {
             id,
@@ -416,6 +878,46 @@ mod tests {
                 height: 2234.0,
             },
             primary: true,
+        }
+    }
+
+    fn display_snapshot(displays: Vec<WireDisplayV1>) -> WireMessage {
+        WireMessage::DisplaySnapshot(DisplaySnapshotV1 {
+            revision: 1,
+            host_id: HOST_A,
+            displays,
+        })
+    }
+
+    fn release_v2() -> ReleaseInputV2 {
+        ReleaseInputV2 {
+            transaction_id: 17,
+            release_token: [19; 32],
+            old_session_id: [21; 32],
+            sequence: 23,
+            covered_input_sequence: 22,
+            source_host: HOST_A,
+            applying_host: HOST_B,
+            source_device: Some(DEVICE),
+            reason: ReleaseReasonV2::RouteChanged,
+            keys: vec![WireKeyCode {
+                usage_page: 0x07,
+                usage: 0xe0,
+            }],
+            buttons: vec![WirePointerButton::Primary],
+        }
+    }
+
+    fn release_ack_v2() -> ReleaseAppliedAckV2 {
+        ReleaseAppliedAckV2 {
+            transaction_id: 17,
+            release_token: [19; 32],
+            old_session_id: [21; 32],
+            sequence: 29,
+            release_sequence: 23,
+            covered_input_sequence: 22,
+            source_host: HOST_A,
+            applying_host: HOST_B,
         }
     }
 
@@ -495,6 +997,15 @@ mod tests {
                 active_display: DISPLAY_B,
                 outcome: PointerTransitionOutcomeV1::Accepted,
             }),
+            WireMessage::PointerTransitionCommit(PointerTransitionCommitV1 {
+                transition_id: 5,
+                workspace_epoch: 9,
+                sequence: 5,
+                source_host: HOST_A,
+                destination_host: HOST_B,
+                source_display: DISPLAY_A,
+                destination_display: DISPLAY_B,
+            }),
             WireMessage::Clipboard(ClipboardV1 {
                 update_id: WireClipboardId([7; 16]),
                 origin_host: HOST_A,
@@ -533,6 +1044,274 @@ mod tests {
     }
 
     #[test]
+    fn v2_release_and_ack_require_and_round_trip_in_v2_framing() {
+        for message in [
+            WireMessage::ReleaseInputV2(release_v2()),
+            WireMessage::ReleaseAppliedAckV2(release_ack_v2()),
+        ] {
+            assert_eq!(message.minimum_protocol_version(), PROTOCOL_VERSION_V2);
+            assert!(matches!(
+                encode_frame(&message),
+                Err(ProtocolError::MessageVersionMismatch {
+                    version: PROTOCOL_VERSION_V1,
+                    ..
+                })
+            ));
+
+            let encoded = encode_frame_for_version(&message, PROTOCOL_VERSION_V2).unwrap();
+            assert_eq!(
+                FrameHeader::decode_supported(&encoded)
+                    .unwrap()
+                    .protocol_version,
+                PROTOCOL_VERSION_V2
+            );
+            assert_eq!(
+                decode_frame_for_version(&encoded, PROTOCOL_VERSION_V2).unwrap(),
+                message
+            );
+            assert!(matches!(
+                decode_frame_for_version(&encoded, PROTOCOL_VERSION_V1),
+                Err(ProtocolError::UnsupportedVersion {
+                    received: PROTOCOL_VERSION_V2,
+                    supported: PROTOCOL_VERSION_V1,
+                })
+            ));
+        }
+    }
+
+    #[test]
+    fn common_messages_support_exact_v1_and_v2_framing() {
+        let message = WireMessage::Ping(PingV1 {
+            nonce: 7,
+            sent_at_ns: 11,
+        });
+        let legacy = encode_frame(&message).unwrap();
+        assert_eq!(FrameHeader::decode(&legacy).unwrap().protocol_version, 1);
+        assert_eq!(decode_frame(&legacy).unwrap(), message);
+
+        let v2 = encode_frame_for_version(&message, PROTOCOL_VERSION_V2).unwrap();
+        assert_eq!(
+            FrameHeader::decode_supported(&v2).unwrap().protocol_version,
+            2
+        );
+        assert_eq!(
+            decode_frame_for_version(&v2, PROTOCOL_VERSION_V2).unwrap(),
+            message
+        );
+    }
+
+    #[test]
+    fn release_proof_capability_is_named_and_exactly_versioned() {
+        assert_eq!(RELEASE_PROOF_PROTOCOL_VERSION, PROTOCOL_VERSION_V2);
+        assert!(!supports_release_proof(0));
+        assert!(!supports_release_proof(PROTOCOL_VERSION_V1));
+        assert!(supports_release_proof(PROTOCOL_VERSION_V2));
+        assert!(!supports_release_proof(PROTOCOL_VERSION_V2 + 1));
+    }
+
+    #[test]
+    fn initial_hello_remains_v1_compatible_while_advertising_v2() {
+        let hello = WireMessage::Hello(HelloV1 {
+            host_id: HOST_A,
+            peer_id: PEER,
+            host_name: "negotiating-host".to_owned(),
+            platform: WirePlatform::Linux,
+            minimum_protocol_version: PROTOCOL_VERSION_V1,
+            maximum_protocol_version: PROTOCOL_VERSION_V2,
+            daemon_version: "0.2.0".to_owned(),
+            nonce: [13; 32],
+        });
+        let encoded = encode_frame(&hello).unwrap();
+        assert_eq!(FrameHeader::decode(&encoded).unwrap().protocol_version, 1);
+        assert_eq!(decode_frame(&encoded).unwrap(), hello);
+    }
+
+    #[test]
+    fn v2_release_validation_is_bounded_identity_exact_and_duplicate_free() {
+        let assert_invalid = |release: ReleaseInputV2| {
+            assert!(WireMessage::ReleaseInputV2(release).validate().is_err());
+        };
+
+        let mut invalid = release_v2();
+        invalid.transaction_id = 0;
+        assert_invalid(invalid);
+        let mut invalid = release_v2();
+        invalid.release_token = [0; 32];
+        assert_invalid(invalid);
+        let mut invalid = release_v2();
+        invalid.old_session_id = [0; 32];
+        assert_invalid(invalid);
+        let mut invalid = release_v2();
+        invalid.old_session_id = invalid.release_token;
+        assert_invalid(invalid);
+        let mut invalid = release_v2();
+        invalid.sequence = 0;
+        assert_invalid(invalid);
+        let mut invalid = release_v2();
+        invalid.covered_input_sequence = 0;
+        assert_invalid(invalid);
+        let mut invalid = release_v2();
+        invalid.covered_input_sequence = invalid.sequence;
+        assert_invalid(invalid);
+        let mut invalid = release_v2();
+        invalid.source_host = WireHostId([0; 16]);
+        assert_invalid(invalid);
+        let mut invalid = release_v2();
+        invalid.applying_host = WireHostId([0; 16]);
+        assert_invalid(invalid);
+        let mut invalid = release_v2();
+        invalid.applying_host = invalid.source_host;
+        assert_invalid(invalid);
+        let mut invalid = release_v2();
+        invalid.source_device = Some(WireDeviceId([0; 16]));
+        assert_invalid(invalid);
+
+        let mut invalid = release_v2();
+        invalid.keys.push(invalid.keys[0]);
+        assert_invalid(invalid);
+        let mut invalid = release_v2();
+        invalid.buttons.push(invalid.buttons[0]);
+        assert_invalid(invalid);
+
+        let mut maximum = release_v2();
+        maximum.keys = (0..MAX_RELEASE_KEYS)
+            .map(|usage| WireKeyCode {
+                usage_page: 0x07,
+                usage: u16::try_from(usage).unwrap(),
+            })
+            .collect();
+        maximum.buttons.clear();
+        WireMessage::ReleaseInputV2(maximum.clone())
+            .validate()
+            .unwrap();
+        maximum.keys.push(WireKeyCode {
+            usage_page: 0x0c,
+            usage: 1,
+        });
+        assert_invalid(maximum);
+
+        let mut oversized_buttons = release_v2();
+        oversized_buttons.keys.clear();
+        oversized_buttons.buttons = (0..MAX_RELEASE_BUTTONS)
+            .map(|button| WirePointerButton::Other(u16::try_from(button).unwrap()))
+            .collect();
+        WireMessage::ReleaseInputV2(oversized_buttons.clone())
+            .validate()
+            .unwrap();
+        oversized_buttons.buttons = (0..=MAX_RELEASE_BUTTONS)
+            .map(|button| WirePointerButton::Other(u16::try_from(button).unwrap()))
+            .collect();
+        assert_invalid(oversized_buttons);
+
+        let mut oversized_combined = release_v2();
+        oversized_combined.keys = (0..(MAX_RELEASE_CONTROLS - 1))
+            .map(|usage| WireKeyCode {
+                usage_page: 0x07,
+                usage: u16::try_from(usage).unwrap(),
+            })
+            .collect();
+        oversized_combined.buttons = vec![WirePointerButton::Primary, WirePointerButton::Secondary];
+        assert_invalid(oversized_combined);
+
+        let mut release_all = release_v2();
+        release_all.keys.clear();
+        release_all.buttons.clear();
+        WireMessage::ReleaseInputV2(release_all).validate().unwrap();
+    }
+
+    #[test]
+    fn v2_ack_validation_requires_positive_exact_distinct_authority() {
+        let assert_invalid = |acknowledgement: ReleaseAppliedAckV2| {
+            assert!(WireMessage::ReleaseAppliedAckV2(acknowledgement)
+                .validate()
+                .is_err());
+        };
+
+        let mut invalid = release_ack_v2();
+        invalid.transaction_id = 0;
+        assert_invalid(invalid);
+        let mut invalid = release_ack_v2();
+        invalid.release_token = [0; 32];
+        assert_invalid(invalid);
+        let mut invalid = release_ack_v2();
+        invalid.old_session_id = [0; 32];
+        assert_invalid(invalid);
+        let mut invalid = release_ack_v2();
+        invalid.old_session_id = invalid.release_token;
+        assert_invalid(invalid);
+        let mut invalid = release_ack_v2();
+        invalid.sequence = 0;
+        assert_invalid(invalid);
+        let mut invalid = release_ack_v2();
+        invalid.release_sequence = 0;
+        assert_invalid(invalid);
+        let mut invalid = release_ack_v2();
+        invalid.covered_input_sequence = 0;
+        assert_invalid(invalid);
+        let mut invalid = release_ack_v2();
+        invalid.covered_input_sequence = invalid.release_sequence;
+        assert_invalid(invalid);
+        let mut invalid = release_ack_v2();
+        invalid.source_host = WireHostId([0; 16]);
+        assert_invalid(invalid);
+        let mut invalid = release_ack_v2();
+        invalid.applying_host = WireHostId([0; 16]);
+        assert_invalid(invalid);
+        let mut invalid = release_ack_v2();
+        invalid.applying_host = invalid.source_host;
+        assert_invalid(invalid);
+    }
+
+    #[test]
+    fn v2_release_diagnostics_redact_authority_controls_and_correlation() {
+        let release = ReleaseInputV2 {
+            transaction_id: 8_675_309,
+            release_token: [181; 32],
+            old_session_id: [191; 32],
+            sequence: 8_675_310,
+            covered_input_sequence: 8_675_308,
+            source_host: WireHostId([211; 16]),
+            applying_host: WireHostId([223; 16]),
+            source_device: Some(WireDeviceId([199; 16])),
+            reason: ReleaseReasonV2::StateResynchronization,
+            keys: vec![WireKeyCode {
+                usage_page: 53_191,
+                usage: 54_321,
+            }],
+            buttons: vec![WirePointerButton::Other(43_219)],
+        };
+        let acknowledgement = ReleaseAppliedAckV2 {
+            transaction_id: release.transaction_id,
+            release_token: release.release_token,
+            old_session_id: release.old_session_id,
+            sequence: 8_675_311,
+            release_sequence: release.sequence,
+            covered_input_sequence: release.covered_input_sequence,
+            source_host: release.source_host,
+            applying_host: release.applying_host,
+        };
+        for debug in [
+            format!("{release:?}"),
+            format!("{acknowledgement:?}"),
+            format!("{:?}", WireMessage::ReleaseInputV2(release)),
+            format!("{:?}", WireMessage::ReleaseAppliedAckV2(acknowledgement)),
+        ] {
+            assert!(!debug.contains("8675309"));
+            assert!(!debug.contains("8675308"));
+            assert!(!debug.contains("8675310"));
+            assert!(!debug.contains("8675311"));
+            assert!(!debug.contains("211, 211"));
+            assert!(!debug.contains("223, 223"));
+            assert!(!debug.contains("199, 199"));
+            assert!(!debug.contains("181, 181"));
+            assert!(!debug.contains("191, 191"));
+            assert!(!debug.contains("53191"));
+            assert!(!debug.contains("54321"));
+            assert!(!debug.contains("43219"));
+        }
+    }
+
+    #[test]
     fn authentication_proof_is_redacted_from_debug_output() {
         let message = WireMessage::Authenticate(AuthenticateV1 {
             peer_id: PEER,
@@ -544,6 +1323,417 @@ mod tests {
         assert!(debug.contains("[REDACTED]"));
         assert!(!debug.contains("distinct-exporter-proof-marker"));
         assert!(!debug.contains("100, 105, 115, 116, 105, 110, 99, 116"));
+    }
+
+    #[test]
+    fn device_inventory_diagnostics_are_payload_free() {
+        let marked = WireInputDeviceV1 {
+            id: WireDeviceId([211; 16]),
+            host_id: WireHostId([223; 16]),
+            name: "peer-controlled-device-name-marker".to_owned(),
+            vendor_id: Some(45_321),
+            product_id: Some(54_321),
+            kind: WireDeviceKind::Keyboard,
+            capabilities: WireDeviceCapabilities {
+                keyboard: true,
+                ..WireDeviceCapabilities::default()
+            },
+        };
+        let snapshot = DeviceSnapshotV1 {
+            revision: 8_675_309,
+            host_id: marked.host_id,
+            devices: vec![marked.clone()],
+        };
+        let added = DeviceAddedV1 {
+            revision: 8_675_310,
+            device: marked.clone(),
+        };
+        let removed = DeviceRemovedV1 {
+            revision: 8_675_311,
+            host_id: marked.host_id,
+            device_id: marked.id,
+        };
+
+        assert_eq!(format!("{marked:?}"), "WireInputDeviceV1([REDACTED])");
+        assert_eq!(
+            format!("{snapshot:?}"),
+            "DeviceSnapshotV1 { device_count: 1, .. }"
+        );
+        assert_eq!(format!("{added:?}"), "DeviceAddedV1([REDACTED])");
+        assert_eq!(format!("{removed:?}"), "DeviceRemovedV1([REDACTED])");
+
+        for debug in [
+            format!("{snapshot:?}"),
+            format!("{added:?}"),
+            format!("{removed:?}"),
+            format!("{:?}", WireMessage::DeviceSnapshot(snapshot)),
+        ] {
+            assert!(!debug.contains("peer-controlled-device-name-marker"));
+            assert!(!debug.contains("8675309"));
+            assert!(!debug.contains("211, 211"));
+            assert!(!debug.contains("223, 223"));
+            assert!(!debug.contains("45321"));
+            assert!(!debug.contains("54321"));
+        }
+    }
+
+    #[test]
+    fn input_and_release_diagnostics_are_payload_free() {
+        let key = WireKeyCode {
+            usage_page: 53_191,
+            usage: 54_321,
+        };
+        let button = WirePointerButton::Other(43_219);
+        assert_eq!(format!("{key:?}"), "WireKeyCode([REDACTED])");
+        assert_eq!(
+            format!("{:?}", WireKeyState::Repeat),
+            "WireKeyState([REDACTED])"
+        );
+        assert_eq!(format!("{button:?}"), "WirePointerButton([REDACTED])");
+        assert_eq!(
+            format!("{:?}", WireButtonState::Down),
+            "WireButtonState([REDACTED])"
+        );
+
+        let payloads = [
+            WireInputPayloadV1::Key {
+                code: key,
+                state: WireKeyState::Repeat,
+            },
+            WireInputPayloadV1::PointerMove {
+                dx: 12_345.678_9,
+                dy: -98_765.432_1,
+            },
+            WireInputPayloadV1::PointerButton {
+                button,
+                state: WireButtonState::Down,
+            },
+            WireInputPayloadV1::Scroll {
+                horizontal: 23_456.789_1,
+                vertical: -87_654.321_9,
+            },
+        ];
+        for payload in &payloads {
+            let debug = format!("{payload:?}");
+            assert!(debug.contains("WireInputPayloadV1"));
+            assert!(!debug.contains("53191"));
+            assert!(!debug.contains("54321"));
+            assert!(!debug.contains("43219"));
+            assert!(!debug.contains("12345.6789"));
+            assert!(!debug.contains("98765.4321"));
+            assert!(!debug.contains("23456.7891"));
+            assert!(!debug.contains("87654.3219"));
+            assert!(!debug.contains("Repeat"));
+            assert!(!debug.contains("Down"));
+        }
+
+        let event = InputEventV1 {
+            sequence: 8_675_309,
+            timestamp_ns: 9_753_124_680,
+            source_host: WireHostId([211; 16]),
+            source_device: WireDeviceId([223; 16]),
+            payload: payloads[1].clone(),
+        };
+        let release = ReleaseInputV1 {
+            sequence: 8_675_310,
+            source_host: WireHostId([211; 16]),
+            source_device: Some(WireDeviceId([223; 16])),
+            reason: ReleaseReasonV1::StateResynchronization,
+            keys: vec![key],
+            buttons: vec![button],
+        };
+
+        let event_debug = format!("{event:?}");
+        assert!(event_debug.contains("PointerMove"));
+        assert!(event_debug.contains("[REDACTED]"));
+        let release_debug = format!("{release:?}");
+        assert!(release_debug.contains("StateResynchronization"));
+        assert!(release_debug.contains("key_count: 1"));
+        assert!(release_debug.contains("button_count: 1"));
+        assert!(release_debug.contains("[REDACTED]"));
+
+        for debug in [
+            event_debug,
+            release_debug,
+            format!("{:?}", WireMessage::Input(event)),
+            format!("{:?}", WireMessage::ReleaseInput(release)),
+        ] {
+            assert!(!debug.contains("8675309"));
+            assert!(!debug.contains("8675310"));
+            assert!(!debug.contains("9753124680"));
+            assert!(!debug.contains("211, 211"));
+            assert!(!debug.contains("223, 223"));
+            assert!(!debug.contains("53191"));
+            assert!(!debug.contains("54321"));
+            assert!(!debug.contains("43219"));
+            assert!(!debug.contains("12345.6789"));
+            assert!(!debug.contains("98765.4321"));
+        }
+    }
+
+    #[test]
+    fn device_snapshots_reject_revision_identity_owner_name_and_duplicates() {
+        let assert_invalid = |snapshot: DeviceSnapshotV1| {
+            assert!(matches!(
+                snapshot.validate(),
+                Err(ValidationError {
+                    message_type: MessageType::DeviceSnapshot,
+                    ..
+                })
+            ));
+        };
+
+        let mut snapshot = DeviceSnapshotV1 {
+            revision: 1,
+            host_id: HOST_A,
+            devices: vec![device()],
+        };
+        snapshot.revision = 0;
+        assert_invalid(snapshot.clone());
+        snapshot.revision = 1;
+        snapshot.host_id = WireHostId([0; 16]);
+        snapshot.devices[0].host_id = snapshot.host_id;
+        assert_invalid(snapshot.clone());
+        snapshot.host_id = HOST_A;
+        snapshot.devices[0].host_id = HOST_A;
+        snapshot.devices[0].id = WireDeviceId([0; 16]);
+        assert_invalid(snapshot.clone());
+        snapshot.devices[0].id = DEVICE;
+        snapshot.devices[0].host_id = WireHostId([0; 16]);
+        assert_invalid(snapshot.clone());
+        snapshot.devices[0].host_id = HOST_B;
+        assert_invalid(snapshot.clone());
+
+        snapshot.devices[0].host_id = HOST_A;
+        snapshot.devices[0].name.clear();
+        assert_invalid(snapshot.clone());
+        snapshot.devices[0].name = "   ".to_owned();
+        assert_invalid(snapshot.clone());
+        snapshot.devices[0].name = "control\nname".to_owned();
+        assert_invalid(snapshot.clone());
+        snapshot.devices[0].name = "x".repeat(MAX_DEVICE_NAME_BYTES + 1);
+        assert_invalid(snapshot);
+
+        let duplicate = device();
+        assert_invalid(DeviceSnapshotV1 {
+            revision: 1,
+            host_id: HOST_A,
+            devices: vec![duplicate.clone(), duplicate],
+        });
+    }
+
+    #[test]
+    fn device_snapshots_enforce_count_and_utf8_byte_bounds() {
+        let maximum = DeviceSnapshotV1 {
+            revision: 1,
+            host_id: HOST_A,
+            devices: (0..MAX_SNAPSHOT_ITEMS).map(indexed_device).collect(),
+        };
+        maximum.validate().unwrap();
+
+        let oversized = DeviceSnapshotV1 {
+            revision: 1,
+            host_id: HOST_A,
+            devices: (0..=MAX_SNAPSHOT_ITEMS).map(indexed_device).collect(),
+        };
+        assert!(oversized.validate().is_err());
+
+        let mut boundary = device();
+        boundary.name = format!("{}a", "é".repeat(127));
+        assert_eq!(boundary.name.len(), MAX_DEVICE_NAME_BYTES);
+        DeviceAddedV1 {
+            revision: 1,
+            device: boundary.clone(),
+        }
+        .validate()
+        .unwrap();
+        boundary.name.push('é');
+        assert!(DeviceAddedV1 {
+            revision: 1,
+            device: boundary,
+        }
+        .validate()
+        .is_err());
+    }
+
+    #[test]
+    fn device_deltas_reject_zero_revision_nil_ids_and_invalid_names() {
+        let mut added = DeviceAddedV1 {
+            revision: 0,
+            device: device(),
+        };
+        assert!(matches!(
+            added.validate(),
+            Err(ValidationError {
+                message_type: MessageType::DeviceAdded,
+                ..
+            })
+        ));
+        added.revision = 1;
+        added.device.id = WireDeviceId([0; 16]);
+        assert!(added.validate().is_err());
+        added.device.id = DEVICE;
+        added.device.host_id = WireHostId([0; 16]);
+        assert!(added.validate().is_err());
+        added.device.host_id = HOST_A;
+        added.device.name = "hidden\npeer-name-marker".to_owned();
+        let error = added.validate().unwrap_err();
+        assert!(!format!("{error:?} {error}").contains("hidden"));
+
+        for removed in [
+            DeviceRemovedV1 {
+                revision: 0,
+                host_id: HOST_A,
+                device_id: DEVICE,
+            },
+            DeviceRemovedV1 {
+                revision: 1,
+                host_id: WireHostId([0; 16]),
+                device_id: DEVICE,
+            },
+            DeviceRemovedV1 {
+                revision: 1,
+                host_id: HOST_A,
+                device_id: WireDeviceId([0; 16]),
+            },
+        ] {
+            assert!(matches!(
+                removed.validate(),
+                Err(ValidationError {
+                    message_type: MessageType::DeviceRemoved,
+                    ..
+                })
+            ));
+        }
+    }
+
+    #[test]
+    fn display_and_pointer_diagnostics_are_payload_free() {
+        let mut marked = display(DISPLAY_A, HOST_A);
+        marked.name = "peer-controlled-display-name-marker".to_owned();
+        let snapshot = DisplaySnapshotV1 {
+            revision: 91,
+            host_id: WireHostId([71; 16]),
+            displays: vec![marked.clone()],
+        };
+        let update = DisplayUpdatedV1 {
+            revision: 92,
+            display: marked.clone(),
+        };
+        let pointer = PointerEnterV1 {
+            transition_id: 93,
+            workspace_epoch: 94,
+            sequence: 95,
+            source_host: WireHostId([71; 16]),
+            destination_host: WireHostId([83; 16]),
+            source_display: WireDisplayId([97; 16]),
+            destination_display: WireDisplayId([101; 16]),
+            destination_edge: WireEdge::Left,
+            normalized_position: 0.123_456_789,
+        };
+
+        assert_eq!(format!("{marked:?}"), "WireDisplayV1([REDACTED])");
+        assert_eq!(
+            format!("{snapshot:?}"),
+            "DisplaySnapshotV1 { display_count: 1, .. }"
+        );
+        assert_eq!(format!("{update:?}"), "DisplayUpdatedV1([REDACTED])");
+        assert_eq!(format!("{pointer:?}"), "PointerEnterV1([REDACTED])");
+        let debug = format!("{:?}", WireMessage::DisplaySnapshot(snapshot));
+        assert!(debug.contains("DisplaySnapshot"));
+        assert!(debug.contains("[REDACTED]"));
+        assert!(!debug.contains("peer-controlled-display-name-marker"));
+        assert!(!debug.contains("0.123456789"));
+    }
+
+    #[test]
+    fn display_snapshots_reject_nil_wrong_duplicate_and_primary_invariants() {
+        let assert_invalid = |message: WireMessage| {
+            assert!(matches!(
+                message.validate(),
+                Err(ValidationError {
+                    message_type: MessageType::DisplaySnapshot,
+                    ..
+                })
+            ));
+        };
+
+        let mut nil_host = DisplaySnapshotV1 {
+            revision: 1,
+            host_id: WireHostId([0; 16]),
+            displays: vec![display(DISPLAY_A, WireHostId([0; 16]))],
+        };
+        assert_invalid(WireMessage::DisplaySnapshot(nil_host.clone()));
+        nil_host.host_id = HOST_A;
+        nil_host.displays[0].host_id = HOST_A;
+        nil_host.displays[0].id = WireDisplayId([0; 16]);
+        assert_invalid(WireMessage::DisplaySnapshot(nil_host));
+
+        let mut wrong_owner = display(DISPLAY_A, HOST_B);
+        wrong_owner.primary = true;
+        assert_invalid(display_snapshot(vec![wrong_owner]));
+        assert_invalid(display_snapshot(vec![
+            display(DISPLAY_A, HOST_A),
+            display(DISPLAY_A, HOST_A),
+        ]));
+        let mut no_primary = display(DISPLAY_A, HOST_A);
+        no_primary.primary = false;
+        assert_invalid(display_snapshot(vec![no_primary]));
+        assert_invalid(display_snapshot(vec![
+            display(DISPLAY_A, HOST_A),
+            display(DISPLAY_B, HOST_A),
+        ]));
+
+        let mut zero_revision = display_snapshot(vec![display(DISPLAY_A, HOST_A)]);
+        if let WireMessage::DisplaySnapshot(snapshot) = &mut zero_revision {
+            snapshot.revision = 0;
+        }
+        assert_invalid(zero_revision);
+    }
+
+    #[test]
+    fn display_messages_reject_invalid_names_and_excessive_geometry() {
+        let assert_invalid_display = |display: WireDisplayV1| {
+            assert!(display_snapshot(vec![display]).validate().is_err());
+        };
+        for name in [String::new(), "   ".to_owned(), "control\nname".to_owned()] {
+            let mut invalid = display(DISPLAY_A, HOST_A);
+            invalid.name = name;
+            assert_invalid_display(invalid);
+        }
+
+        let mut invalid_values = Vec::new();
+        let mut invalid = display(DISPLAY_A, HOST_A);
+        invalid.logical_size.width = MAX_DISPLAY_LOGICAL_DIMENSION + 1.0;
+        invalid_values.push(invalid);
+        let mut invalid = display(DISPLAY_A, HOST_A);
+        invalid.physical_size = Some(WireSize {
+            width: MAX_DISPLAY_PHYSICAL_DIMENSION + 1.0,
+            height: 1.0,
+        });
+        invalid_values.push(invalid);
+        let mut invalid = display(DISPLAY_A, HOST_A);
+        invalid.scale_factor = MAX_DISPLAY_SCALE_FACTOR + 1.0;
+        invalid_values.push(invalid);
+        let mut invalid = display(DISPLAY_A, HOST_A);
+        invalid.refresh_rate = Some(MAX_DISPLAY_REFRESH_RATE_HZ + 1.0);
+        invalid_values.push(invalid);
+        let mut invalid = display(DISPLAY_A, HOST_A);
+        invalid.native_bounds.x = MAX_DISPLAY_NATIVE_COORDINATE_ABS;
+        invalid_values.push(invalid);
+        let mut invalid = display(DISPLAY_A, HOST_A);
+        invalid.native_bounds.height = f64::INFINITY;
+        invalid_values.push(invalid);
+        for invalid in invalid_values {
+            assert_invalid_display(invalid);
+        }
+
+        assert!(WireMessage::DisplayUpdated(DisplayUpdatedV1 {
+            revision: 0,
+            display: display(DISPLAY_A, HOST_A),
+        })
+        .validate()
+        .is_err());
     }
 
     #[test]
@@ -604,6 +1794,54 @@ mod tests {
         assert_eq!(
             decode_frame(&trailing).unwrap_err(),
             ProtocolError::TrailingBytes(1)
+        );
+    }
+
+    #[test]
+    fn bootstrap_and_exact_header_parsers_reject_before_payload_buffering() {
+        let v2_ping = FrameHeader {
+            protocol_version: PROTOCOL_VERSION_V2,
+            message_type: MessageType::Ping,
+            payload_length: u32::try_from(MAX_FRAME_PAYLOAD).unwrap(),
+        }
+        .encode();
+        assert!(matches!(
+            FrameHeader::decode(&v2_ping),
+            Err(ProtocolError::UnsupportedVersion {
+                received: PROTOCOL_VERSION_V2,
+                supported: PROTOCOL_VERSION_V1,
+            })
+        ));
+        assert_eq!(
+            FrameHeader::decode_supported(&v2_ping)
+                .unwrap()
+                .protocol_version,
+            PROTOCOL_VERSION_V2
+        );
+        assert!(matches!(
+            FrameHeader::decode_for_version(&v2_ping, PROTOCOL_VERSION_V1),
+            Err(ProtocolError::UnsupportedVersion { .. })
+        ));
+
+        let v2_message_in_v1 = FrameHeader {
+            protocol_version: PROTOCOL_VERSION_V1,
+            message_type: MessageType::ReleaseAppliedAckV2,
+            payload_length: u32::try_from(MAX_FRAME_PAYLOAD).unwrap(),
+        }
+        .encode();
+        assert_eq!(
+            FrameHeader::decode(&v2_message_in_v1).unwrap_err(),
+            ProtocolError::MessageVersionMismatch {
+                message_type: MessageType::ReleaseAppliedAckV2,
+                version: PROTOCOL_VERSION_V1,
+            }
+        );
+        assert_eq!(
+            FrameHeader::decode_for_version(&v2_message_in_v1, PROTOCOL_VERSION_V1).unwrap_err(),
+            ProtocolError::MessageVersionMismatch {
+                message_type: MessageType::ReleaseAppliedAckV2,
+                version: PROTOCOL_VERSION_V1,
+            }
         );
     }
 

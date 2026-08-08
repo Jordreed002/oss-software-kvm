@@ -1,3 +1,4 @@
+use crate::{ConnectionDirection, LanPeerAddress};
 use kvm_protocol::{WireHostId, WirePeerId};
 use std::future::Future;
 use std::io;
@@ -8,6 +9,7 @@ use tokio::io::{AsyncRead, AsyncWrite};
 pub(crate) mod sealed {
     pub trait SecureStream {}
     pub trait Connector {}
+    pub trait Acceptor {}
 }
 
 /// An address entered explicitly during development.
@@ -42,12 +44,7 @@ pub struct TransportPeerIdentity {
 
 impl std::fmt::Debug for TransportPeerIdentity {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter
-            .debug_struct("TransportPeerIdentity")
-            .field("host_id", &self.host_id)
-            .field("peer_id", &self.peer_id)
-            .field("credential_fingerprint", &"[REDACTED]")
-            .finish()
+        formatter.write_str("TransportPeerIdentity([REDACTED])")
     }
 }
 
@@ -63,6 +60,11 @@ impl std::fmt::Debug for TransportPeerIdentity {
 /// reciprocal fact. Downstream safe code cannot bless a plaintext wrapper.
 pub trait SecurePeerStream: sealed::SecureStream + AsyncRead + AsyncWrite + Unpin + Send {
     fn authenticated_peer_identity(&self) -> &TransportPeerIdentity;
+
+    /// Direction in which this sealed transport was established at the local
+    /// endpoint. Application code cannot forge this value independently of the
+    /// in-crate authenticated adapter.
+    fn connection_direction(&self) -> ConnectionDirection;
 
     /// Derives 32 bytes bound to this completed authenticated TLS session.
     ///
@@ -95,4 +97,98 @@ pub trait AuthenticatedConnector: sealed::Connector {
         &'a mut self,
         address: DevelopmentAddress,
     ) -> Pin<Box<dyn Future<Output = io::Result<Self::Stream>> + Send + 'a>>;
+}
+
+/// Connects to a policy-validated production LAN reachability address while
+/// retaining the same sealed TLS identity and exporter guarantees.
+///
+/// Discovery and cached addresses must pass [`LanPeerAddress`] validation
+/// before they can reach this interface. The address remains reachability
+/// only; configured TLS identity is independently authenticated.
+pub trait AuthenticatedLanConnector: sealed::Connector {
+    type Stream: SecurePeerStream;
+
+    /// Establishes the same authenticated TLS transport used by development
+    /// dialing, but only after production LAN address validation.
+    ///
+    /// # Errors
+    ///
+    /// Returns a coarse I/O error when TCP connection, TLS authentication,
+    /// exact ALPN, or configured remote fingerprint verification fails.
+    fn connect_lan(
+        &mut self,
+        address: LanPeerAddress,
+    ) -> Pin<Box<dyn Future<Output = io::Result<Self::Stream>> + Send + '_>>;
+}
+
+/// Fail-closed outcomes from resolving an authenticated client credential.
+///
+/// These variants deliberately carry no resolver detail, identity, or
+/// fingerprint so callers can report them without disclosing paired-peer
+/// metadata.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ClientIdentityResolutionError {
+    Unavailable,
+    Unknown,
+    Ambiguous,
+    InvalidIdentity,
+}
+
+impl std::fmt::Display for ClientIdentityResolutionError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("paired client identity could not be resolved")
+    }
+}
+
+impl std::error::Error for ClientIdentityResolutionError {}
+
+/// Resolves an authenticated client leaf-certificate fingerprint to stable
+/// paired identity metadata.
+///
+/// The resolver is a caller-owned policy boundary. Implementations must use an
+/// immutable, bounded snapshot and fail closed for unavailable, unknown,
+/// ambiguous, changed, revoked, or invalid entries. Socket addresses,
+/// certificate subject names, display names, and discovery metadata are not
+/// identity inputs.
+pub trait PairedClientIdentityResolver: Send + Sync {
+    /// # Errors
+    ///
+    /// Returns a coarse, redacted error when the bounded snapshot is
+    /// unavailable or the fingerprint is unknown, ambiguous, revoked, changed,
+    /// or mapped to invalid identity metadata.
+    fn resolve(
+        &self,
+        credential_fingerprint: &[u8; 32],
+    ) -> Result<TransportPeerIdentity, ClientIdentityResolutionError>;
+}
+
+/// Accepts an already-established TCP socket and returns only a transport that
+/// completed encrypted client-certificate authentication and paired identity
+/// resolution.
+///
+/// Listener binding and interface selection remain outside this sealed trait.
+/// Downstream safe code cannot implement another acceptor that blesses a
+/// plaintext socket.
+pub trait AuthenticatedAcceptor: sealed::Acceptor {
+    type Stream: SecurePeerStream;
+
+    fn accept(
+        &self,
+        stream: tokio::net::TcpStream,
+    ) -> Pin<Box<dyn Future<Output = io::Result<Self::Stream>> + Send + '_>>;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn transport_identity_debug_redacts_every_stable_identifier() {
+        let identity = TransportPeerIdentity {
+            host_id: WireHostId([71; 16]),
+            peer_id: WirePeerId([83; 16]),
+            credential_fingerprint: [97; 32],
+        };
+        assert_eq!(format!("{identity:?}"), "TransportPeerIdentity([REDACTED])");
+    }
 }

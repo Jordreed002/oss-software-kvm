@@ -12,4 +12,4 @@ mod store;
 pub use error::ConfigError;
 pub use migrate::{decode_config, encode_config};
 pub use model::*;
-pub use store::{ConfigStore, FileConfigStore, MemoryConfigStore};
+pub use store::{ConfigStore, ConfigStoreAuthority, FileConfigStore, MemoryConfigStore};

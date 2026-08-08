@@ -9,21 +9,28 @@ use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 use kvm_daemon::{
-    CaptureCallback, CaptureDisposition, CapturedInput, DisplayBackend, InputCaptureBackend,
-    OutputInjectionBackend, PlatformError,
+    CaptureCallback, CaptureDisposition, CaptureLifecycleState, CapturedInput, DisplayBackend,
+    EventClassification, InputCaptureBackend, OutputInjectionBackend, PlatformError,
 };
-use kvm_input::{ButtonState, InputEvent, InputPayload, KeyState, PointerButton};
+use kvm_input::{ButtonState, InputEvent, InputPayload, PointerButton};
 use kvm_types::{
-    DeviceCapabilities, DeviceKind, Display, DisplayId, HostId, InputDevice, Rect, Size,
+    DeviceCapabilities, DeviceId, DeviceKind, Display, DisplayId, HostId, InputDevice, Point, Rect,
+    Size,
 };
 
 use crate::{
     capture::{
-        classify_iohid_observation, device_accepts_hid_value, mach_timestamp_ns, overflow_may_drop,
-        physical_device_evidence, translate_hid_value,
+        classify_iohid_observation, classify_quartz_capture, device_accepts_hid_value,
+        mach_timestamp_ns, overflow_may_drop, physical_device_evidence, quartz_key_is_down,
+        quartz_modifier_pressed, translate_hid_value, translate_quartz_keyboard,
+        translate_quartz_pointer, translate_quartz_scroll, CG_EVENT_FLAGS_CHANGED,
+        CG_EVENT_KEY_DOWN, CG_EVENT_KEY_UP, CG_EVENT_SCROLL_WHEEL,
+        CG_EVENT_TAP_DISABLED_BY_TIMEOUT, CG_EVENT_TAP_DISABLED_BY_USER_INPUT,
     },
-    derive_device_id, mac_virtual_key, CaptureHealth, CaptureStatistics, DeviceIdentityMaterial,
-    MacBackendError, PermissionStatus, KVM_EVENT_TAG,
+    derive_device_id,
+    identity::{derive_whole_host_device_id, WholeHostDeviceKind},
+    mac_virtual_key, CaptureHealth, CaptureStatistics, DeviceIdentityMaterial, MacBackendError,
+    MacCaptureMode, PermissionStatus, SuppressionScope, KVM_EVENT_TAG,
 };
 
 type CFIndex = isize;
@@ -36,7 +43,10 @@ type IOHIDDeviceRef = *mut c_void;
 type IOHIDElementRef = *mut c_void;
 type IOHIDValueRef = *mut c_void;
 type CFRunLoopRef = *mut c_void;
+type CFRunLoopSourceRef = *mut c_void;
+type CFMachPortRef = *mut c_void;
 type CGEventRef = *mut c_void;
+type CGEventTapProxy = *mut c_void;
 type CGDisplayModeRef = *const c_void;
 
 const UTF8_ENCODING: u32 = 0x0800_0100;
@@ -46,6 +56,17 @@ const CG_ERROR_SUCCESS: i32 = 0;
 const CG_HID_EVENT_TAP: u32 = 0;
 const CG_EVENT_SOURCE_USER_DATA: u32 = 42;
 const CG_SCROLL_EVENT_UNIT_PIXEL: u32 = 0;
+const CG_SESSION_EVENT_TAP: u32 = 1;
+const CG_HEAD_INSERT_EVENT_TAP: u32 = 0;
+const CG_EVENT_TAP_OPTION_DEFAULT: u32 = 0;
+const CG_KEYBOARD_EVENT_AUTOREPEAT: u32 = 8;
+const CG_KEYBOARD_EVENT_KEYCODE: u32 = 9;
+const CG_MOUSE_EVENT_BUTTON_NUMBER: u32 = 3;
+const CG_MOUSE_EVENT_DELTA_X: u32 = 4;
+const CG_MOUSE_EVENT_DELTA_Y: u32 = 5;
+const CG_SCROLL_FIXED_DELTA_AXIS_1: u32 = 93;
+const CG_SCROLL_FIXED_DELTA_AXIS_2: u32 = 94;
+const CG_EVENT_SOURCE_STATE_ID: u32 = 45;
 
 const CG_EVENT_LEFT_MOUSE_DOWN: u32 = 1;
 const CG_EVENT_LEFT_MOUSE_UP: u32 = 2;
@@ -60,6 +81,7 @@ const CG_EVENT_OTHER_MOUSE_DRAGGED: u32 = 27;
 const CAPTURE_QUEUE_CAPACITY: usize = 4_096;
 const CAPTURE_STARTUP_TIMEOUT: Duration = Duration::from_secs(5);
 const CAPTURE_STOP_TIMEOUT: Duration = Duration::from_secs(2);
+static WHOLE_HOST_CAPTURE_OWNED: AtomicBool = AtomicBool::new(false);
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default)]
@@ -116,6 +138,15 @@ extern "C" {
     fn CFRunLoopRunInMode(mode: CFStringRef, seconds: f64, return_after_source_handled: u8) -> i32;
     fn CFRunLoopStop(run_loop: CFRunLoopRef);
     fn CFRunLoopWakeUp(run_loop: CFRunLoopRef);
+    fn CFRunLoopAddSource(run_loop: CFRunLoopRef, source: CFRunLoopSourceRef, mode: CFStringRef);
+    fn CFRunLoopRemoveSource(run_loop: CFRunLoopRef, source: CFRunLoopSourceRef, mode: CFStringRef);
+    fn CFMachPortCreateRunLoopSource(
+        allocator: *const c_void,
+        port: CFMachPortRef,
+        order: CFIndex,
+    ) -> CFRunLoopSourceRef;
+    fn CFMachPortInvalidate(port: CFMachPortRef);
+    fn CFMachPortIsValid(port: CFMachPortRef) -> u8;
 
     #[allow(non_upper_case_globals)]
     static kCFRunLoopDefaultMode: CFStringRef;
@@ -201,8 +232,24 @@ extern "C" {
         wheel_3: i32,
     ) -> CGEventRef;
     fn CGEventGetLocation(event: CGEventRef) -> CGPoint;
+    fn CGEventGetTimestamp(event: CGEventRef) -> u64;
+    fn CGEventGetFlags(event: CGEventRef) -> u64;
+    fn CGEventGetIntegerValueField(event: CGEventRef, field: u32) -> i64;
+    fn CGEventGetDoubleValueField(event: CGEventRef, field: u32) -> f64;
     fn CGEventSetIntegerValueField(event: CGEventRef, field: u32, value: i64);
     fn CGEventPost(tap: u32, event: CGEventRef);
+    fn CGEventTapCreate(
+        tap: u32,
+        place: u32,
+        options: u32,
+        events_of_interest: u64,
+        callback: Option<
+            extern "C" fn(CGEventTapProxy, u32, CGEventRef, *mut c_void) -> CGEventRef,
+        >,
+        user_info: *mut c_void,
+    ) -> CFMachPortRef;
+    fn CGEventTapEnable(tap: CFMachPortRef, enable: bool);
+    fn CGEventTapIsEnabled(tap: CFMachPortRef) -> bool;
 
     fn CGGetActiveDisplayList(max_displays: u32, displays: *mut u32, count: *mut u32) -> i32;
     fn CGDisplayBounds(display: u32) -> CGRect;
@@ -241,6 +288,10 @@ struct CaptureCounters {
     transition_discontinuities: AtomicU64,
     delivery_disconnects: AtomicU64,
     ignored_suppression_requests: AtomicU64,
+    suppressed_events: AtomicU64,
+    untranslated_events: AtomicU64,
+    callback_panics: AtomicU64,
+    tap_disables: AtomicU64,
     health: AtomicU8,
 }
 
@@ -255,6 +306,9 @@ impl CaptureCounters {
             2 => CaptureHealth::Stopped,
             3 => CaptureHealth::TransitionDiscontinuity,
             4 => CaptureHealth::DeliveryDisconnected,
+            5 => CaptureHealth::TapDisabled,
+            6 => CaptureHealth::TapInvalidated,
+            7 => CaptureHealth::CallbackPanicked,
             _ => CaptureHealth::Idle,
         }
     }
@@ -266,6 +320,10 @@ impl CaptureCounters {
             transition_discontinuities: self.transition_discontinuities.load(Ordering::Relaxed),
             delivery_disconnects: self.delivery_disconnects.load(Ordering::Relaxed),
             ignored_suppression_requests: self.ignored_suppression_requests.load(Ordering::Relaxed),
+            suppressed_events: self.suppressed_events.load(Ordering::Relaxed),
+            untranslated_events: self.untranslated_events.load(Ordering::Relaxed),
+            callback_panics: self.callback_panics.load(Ordering::Relaxed),
+            tap_disables: self.tap_disables.load(Ordering::Relaxed),
             health: self.health(),
         }
     }
@@ -280,6 +338,82 @@ struct CaptureSession {
     capture_done: Receiver<()>,
     delivery_done: Receiver<()>,
     capture_outcome: Option<Result<(), MacBackendError>>,
+}
+
+#[derive(Debug)]
+struct WholeHostCaptureSession {
+    controller: Option<Arc<WholeHostController>>,
+    capture_thread: Option<JoinHandle<Result<(), MacBackendError>>>,
+    capture_done: Receiver<()>,
+    capture_outcome: Option<Result<(), MacBackendError>>,
+}
+
+#[derive(Debug)]
+struct WholeHostController {
+    run_loop: usize,
+    tap: usize,
+    active: Arc<AtomicBool>,
+}
+
+impl WholeHostController {
+    fn run_loop(&self) -> CFRunLoopRef {
+        self.run_loop as CFRunLoopRef
+    }
+
+    fn tap(&self) -> CFMachPortRef {
+        self.tap as CFMachPortRef
+    }
+
+    fn deactivate(&self) {
+        self.active.store(false, Ordering::Release);
+        // SAFETY: Both references are retained for this controller. Quartz
+        // permits disabling a tap and stopping/waking a run loop cross-thread.
+        unsafe {
+            CGEventTapEnable(self.tap(), false);
+            CFRunLoopStop(self.run_loop());
+            CFRunLoopWakeUp(self.run_loop());
+        }
+    }
+}
+
+impl Drop for WholeHostController {
+    fn drop(&mut self) {
+        // SAFETY: Construction performs one CFRetain for each non-null
+        // reference and this controller uniquely balances those retains.
+        unsafe {
+            CFRelease(self.tap().cast());
+            CFRelease(self.run_loop().cast());
+        }
+    }
+}
+
+#[derive(Debug)]
+struct WholeHostOwnershipClaim;
+
+impl WholeHostOwnershipClaim {
+    fn acquire() -> Result<Self, MacBackendError> {
+        WHOLE_HOST_CAPTURE_OWNED
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .map(|_| Self)
+            .map_err(|_| MacBackendError::CaptureRegistrationOwned)
+    }
+}
+
+impl Drop for WholeHostOwnershipClaim {
+    fn drop(&mut self) {
+        WHOLE_HOST_CAPTURE_OWNED.store(false, Ordering::Release);
+    }
+}
+
+struct WholeHostCallbackContext {
+    host_id: HostId,
+    keyboard_device: DeviceId,
+    pointer_device: DeviceId,
+    callback: CaptureCallback,
+    counters: Arc<CaptureCounters>,
+    active: Arc<AtomicBool>,
+    run_loop: CFRunLoopRef,
+    sequence: AtomicU64,
 }
 
 #[derive(Debug)]
@@ -319,19 +453,21 @@ struct CaptureContext {
     timebase: MachTimebaseInfo,
 }
 
-/// IOHID-backed device discovery and observation.
+/// macOS input discovery, observation, and explicit whole-host alpha capture.
 ///
-/// Capture is deliberately non-suppressing: IOHID identifies the source
-/// device but cannot prevent the corresponding event from reaching macOS.
-/// Returning [`CaptureDisposition::SuppressLocal`] from the callback is counted
-/// and ignored until a device-attributed suppression mechanism is validated.
+/// The default IOHID mode is deliberately non-suppressing: IOHID identifies
+/// the source device but cannot prevent the corresponding event from reaching
+/// macOS. Returning [`CaptureDisposition::SuppressLocal`] in that mode is
+/// counted and ignored until device-attributed suppression is validated.
 /// Only non-virtual elements on built-in or known physical transports are
 /// classified [`kvm_daemon::EventClassification::Physical`]; all other
 /// observations are conservatively unknown.
 #[derive(Debug)]
 pub struct MacInputBackend {
     host_id: HostId,
+    capture_mode: MacCaptureMode,
     capture: Option<CaptureSession>,
+    whole_host_capture: Option<WholeHostCaptureSession>,
     counters: Arc<CaptureCounters>,
 }
 
@@ -340,8 +476,38 @@ impl MacInputBackend {
     pub fn new(host_id: HostId) -> Self {
         Self {
             host_id,
+            capture_mode: MacCaptureMode::IoHidObservation,
             capture: None,
+            whole_host_capture: None,
             counters: Arc::new(CaptureCounters::default()),
+        }
+    }
+
+    /// Creates an explicitly opted-in aggregate Quartz suppression backend.
+    ///
+    /// This mode cannot attribute input to individual IOHID devices. It emits
+    /// one stable host-scoped keyboard ID and one stable host-scoped pointer ID.
+    #[must_use]
+    pub fn new_whole_host_alpha(host_id: HostId) -> Self {
+        Self {
+            host_id,
+            capture_mode: MacCaptureMode::WholeHostAlpha,
+            capture: None,
+            whole_host_capture: None,
+            counters: Arc::new(CaptureCounters::default()),
+        }
+    }
+
+    #[must_use]
+    pub const fn capture_mode(&self) -> MacCaptureMode {
+        self.capture_mode
+    }
+
+    #[must_use]
+    pub const fn suppression_scope(&self) -> SuppressionScope {
+        match self.capture_mode {
+            MacCaptureMode::IoHidObservation => SuppressionScope::None,
+            MacCaptureMode::WholeHostAlpha => SuppressionScope::WholeHostAlpha,
         }
     }
 
@@ -350,7 +516,7 @@ impl MacInputBackend {
         self.host_id
     }
 
-    /// Always false for this observation-only milestone.
+    /// Per-device suppression remains unavailable in both capture modes.
     #[must_use]
     pub const fn selective_suppression_supported() -> bool {
         false
@@ -362,8 +528,9 @@ impl MacInputBackend {
         self.counters.snapshot()
     }
 
+    #[allow(clippy::too_many_lines)] // Startup/timeout ownership paths stay explicit.
     fn start_observation(&mut self, callback: CaptureCallback) -> Result<(), PlatformError> {
-        if self.capture.is_some() {
+        if self.capture.is_some() || self.whole_host_capture.is_some() {
             return Err(MacBackendError::CaptureAlreadyRunning.into());
         }
 
@@ -379,7 +546,12 @@ impl MacInputBackend {
                         .delivered_events
                         .fetch_add(1, Ordering::Relaxed);
                     let disposition = catch_unwind(AssertUnwindSafe(|| callback(event)))
-                        .unwrap_or(CaptureDisposition::AllowLocal);
+                        .unwrap_or_else(|_| {
+                            worker_counters
+                                .callback_panics
+                                .fetch_add(1, Ordering::Relaxed);
+                            CaptureDisposition::AllowLocal
+                        });
                     if disposition == CaptureDisposition::SuppressLocal {
                         worker_counters
                             .ignored_suppression_requests
@@ -540,25 +712,166 @@ impl MacInputBackend {
             .unwrap_or(Ok(()))
             .map_err(Into::into)
     }
+
+    fn start_whole_host_alpha(&mut self, callback: CaptureCallback) -> Result<(), PlatformError> {
+        if self.capture.is_some() || self.whole_host_capture.is_some() {
+            return Err(MacBackendError::CaptureAlreadyRunning.into());
+        }
+        let permissions = probe_permissions()?;
+        if !permissions.input_monitoring {
+            return Err(MacBackendError::PermissionDenied("Input Monitoring").into());
+        }
+        if !permissions.accessibility {
+            return Err(MacBackendError::PermissionDenied("Accessibility").into());
+        }
+        let ownership = WholeHostOwnershipClaim::acquire()?;
+        let counters = Arc::new(CaptureCounters::default());
+        let active = Arc::new(AtomicBool::new(false));
+        let (ready_sender, ready_receiver) = sync_channel(1);
+        let (activation_sender, activation_receiver) = sync_channel(1);
+        let (capture_done_sender, capture_done) = sync_channel(1);
+        let host_id = self.host_id;
+        let thread_counters = Arc::clone(&counters);
+        let thread_active = Arc::clone(&active);
+        let capture_thread = thread::Builder::new()
+            .name("kvm-macos-whole-host-alpha".to_owned())
+            .spawn(move || {
+                let result = run_whole_host_capture_thread(
+                    host_id,
+                    callback,
+                    &thread_counters,
+                    &thread_active,
+                    &ready_sender,
+                    &activation_receiver,
+                    ownership,
+                );
+                let _ = capture_done_sender.send(());
+                result
+            })?;
+
+        let controller = match ready_receiver.recv_timeout(CAPTURE_STARTUP_TIMEOUT) {
+            Ok(Ok(controller)) => controller,
+            Ok(Err(error)) => {
+                capture_thread.join().map_err(|_| {
+                    MacBackendError::CaptureThreadPanicked("Quartz startup cleanup")
+                })??;
+                return Err(error.into());
+            }
+            Err(RecvTimeoutError::Disconnected) => {
+                capture_thread.join().map_err(|_| {
+                    MacBackendError::CaptureThreadPanicked("Quartz startup cleanup")
+                })??;
+                return Err(MacBackendError::CaptureStartupTerminated.into());
+            }
+            Err(RecvTimeoutError::Timeout) => {
+                // The activation sender is dropped on return. A late native
+                // setup therefore remains inactive, removes the tap, and only
+                // then releases process-global ownership.
+                drop(capture_thread);
+                return Err(MacBackendError::CaptureStartupTimedOut.into());
+            }
+        };
+
+        counters.set_health(CaptureHealth::Running);
+        activation_sender
+            .send(())
+            .map_err(|_| MacBackendError::CaptureThreadPanicked("Quartz startup activation"))?;
+        self.counters = counters;
+        self.whole_host_capture = Some(WholeHostCaptureSession {
+            controller: Some(controller),
+            capture_thread: Some(capture_thread),
+            capture_done,
+            capture_outcome: None,
+        });
+        Ok(())
+    }
+
+    fn stop_whole_host_alpha(&mut self) -> Result<(), PlatformError> {
+        let Some(mut session) = self.whole_host_capture.take() else {
+            return Ok(());
+        };
+        if let Some(controller) = &session.controller {
+            controller.deactivate();
+        }
+
+        if session.capture_thread.is_some() {
+            match session.capture_done.recv_timeout(CAPTURE_STOP_TIMEOUT) {
+                Ok(()) | Err(RecvTimeoutError::Disconnected) => {
+                    let thread = session
+                        .capture_thread
+                        .take()
+                        .expect("capture thread presence checked");
+                    session.capture_outcome = Some(
+                        thread
+                            .join()
+                            .map_err(|_| MacBackendError::CaptureThreadPanicked("Quartz"))
+                            .and_then(|result| result),
+                    );
+                }
+                Err(RecvTimeoutError::Timeout) => {
+                    self.whole_host_capture = Some(session);
+                    return Err(MacBackendError::CaptureStopTimedOut("Quartz").into());
+                }
+            }
+        }
+        session.controller.take();
+        if self.counters.health() == CaptureHealth::Running {
+            self.counters.set_health(CaptureHealth::Stopped);
+        }
+        session
+            .capture_outcome
+            .take()
+            .unwrap_or(Ok(()))
+            .map_err(Into::into)
+    }
+
+    fn lifecycle_state(&self) -> CaptureLifecycleState {
+        match self.counters.health() {
+            CaptureHealth::TransitionDiscontinuity
+            | CaptureHealth::DeliveryDisconnected
+            | CaptureHealth::TapDisabled
+            | CaptureHealth::TapInvalidated
+            | CaptureHealth::CallbackPanicked => CaptureLifecycleState::Faulted,
+            CaptureHealth::Running => CaptureLifecycleState::Running,
+            CaptureHealth::Stopped => CaptureLifecycleState::Stopped,
+            CaptureHealth::Idle => CaptureLifecycleState::Idle,
+        }
+    }
 }
 
 impl Drop for MacInputBackend {
     fn drop(&mut self) {
         let _ = self.stop_observation();
+        let _ = self.stop_whole_host_alpha();
     }
 }
 
 impl InputCaptureBackend for MacInputBackend {
     fn enumerate_devices(&self) -> Result<Vec<InputDevice>, PlatformError> {
-        enumerate_iohid_devices(self.host_id).map_err(Into::into)
+        match self.capture_mode {
+            MacCaptureMode::IoHidObservation => {
+                enumerate_iohid_devices(self.host_id).map_err(Into::into)
+            }
+            MacCaptureMode::WholeHostAlpha => Ok(whole_host_devices(self.host_id)),
+        }
     }
 
     fn start_capture(&mut self, callback: CaptureCallback) -> Result<(), PlatformError> {
-        self.start_observation(callback)
+        match self.capture_mode {
+            MacCaptureMode::IoHidObservation => self.start_observation(callback),
+            MacCaptureMode::WholeHostAlpha => self.start_whole_host_alpha(callback),
+        }
     }
 
     fn stop_capture(&mut self) -> Result<(), PlatformError> {
-        self.stop_observation()
+        match self.capture_mode {
+            MacCaptureMode::IoHidObservation => self.stop_observation(),
+            MacCaptureMode::WholeHostAlpha => self.stop_whole_host_alpha(),
+        }
+    }
+
+    fn capture_lifecycle(&self) -> CaptureLifecycleState {
+        self.lifecycle_state()
     }
 }
 
@@ -600,7 +913,7 @@ impl MacOutputBackend {
                 // SAFETY: Null selects the default event source; the returned
                 // owned event is checked before any Quartz operation.
                 let event = unsafe {
-                    CGEventCreateKeyboardEvent(ptr::null(), key, state == KeyState::Pressed)
+                    CGEventCreateKeyboardEvent(ptr::null(), key, quartz_key_is_down(state))
                 };
                 post_owned_event(event, "CGEventCreateKeyboardEvent")
             }
@@ -715,6 +1028,326 @@ pub fn probe_permissions() -> Result<PermissionStatus, MacBackendError> {
         accessibility,
         input_monitoring,
     })
+}
+
+fn whole_host_event_mask() -> u64 {
+    [
+        CG_EVENT_LEFT_MOUSE_DOWN,
+        CG_EVENT_LEFT_MOUSE_UP,
+        CG_EVENT_RIGHT_MOUSE_DOWN,
+        CG_EVENT_RIGHT_MOUSE_UP,
+        CG_EVENT_MOUSE_MOVED,
+        CG_EVENT_LEFT_MOUSE_DRAGGED,
+        CG_EVENT_RIGHT_MOUSE_DRAGGED,
+        CG_EVENT_KEY_DOWN,
+        CG_EVENT_KEY_UP,
+        CG_EVENT_FLAGS_CHANGED,
+        CG_EVENT_SCROLL_WHEEL,
+        CG_EVENT_OTHER_MOUSE_DOWN,
+        CG_EVENT_OTHER_MOUSE_UP,
+        CG_EVENT_OTHER_MOUSE_DRAGGED,
+    ]
+    .into_iter()
+    .fold(0_u64, |mask, event_type| mask | (1_u64 << event_type))
+}
+
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+fn run_whole_host_capture_thread(
+    host_id: HostId,
+    callback: CaptureCallback,
+    counters: &Arc<CaptureCounters>,
+    active: &Arc<AtomicBool>,
+    ready: &SyncSender<Result<Arc<WholeHostController>, MacBackendError>>,
+    activation: &Receiver<()>,
+    ownership: WholeHostOwnershipClaim,
+) -> Result<(), MacBackendError> {
+    // SAFETY: The current run loop is borrowed for this thread. It is retained
+    // before publication and remains live through source removal below.
+    let run_loop = unsafe { CFRunLoopGetCurrent() };
+    if run_loop.is_null() {
+        let _ = ready.send(Err(MacBackendError::NullResult {
+            operation: "CFRunLoopGetCurrent(Quartz)",
+        }));
+        return Ok(());
+    }
+
+    let mut context = Box::new(WholeHostCallbackContext {
+        host_id,
+        keyboard_device: derive_whole_host_device_id(host_id, WholeHostDeviceKind::Keyboard),
+        pointer_device: derive_whole_host_device_id(host_id, WholeHostDeviceKind::Pointer),
+        callback,
+        counters: Arc::clone(counters),
+        active: Arc::clone(active),
+        run_loop,
+        sequence: AtomicU64::new(1),
+    });
+    let context_ptr = (&raw mut *context).cast::<c_void>();
+    // SAFETY: The callback context remains boxed until after this tap is
+    // disabled, removed from the run loop, invalidated, and released.
+    let tap_ptr = unsafe {
+        CGEventTapCreate(
+            CG_SESSION_EVENT_TAP,
+            CG_HEAD_INSERT_EVENT_TAP,
+            CG_EVENT_TAP_OPTION_DEFAULT,
+            whole_host_event_mask(),
+            Some(quartz_event_tap_callback),
+            context_ptr,
+        )
+    };
+    let tap = match OwnedCF::new(tap_ptr.cast_const(), "CGEventTapCreate") {
+        Ok(tap) => tap,
+        Err(error) => {
+            let _ = ready.send(Err(error));
+            return Ok(());
+        }
+    };
+    // Creation enables a tap by default. Keep it inert until the owner has
+    // accepted the retained controller and acknowledges activation.
+    unsafe { CGEventTapEnable(tap_ptr, false) };
+    // SAFETY: The tap is live and the returned create-rule source is checked.
+    let source_ptr = unsafe { CFMachPortCreateRunLoopSource(ptr::null(), tap_ptr, 0) };
+    let source = match OwnedCF::new(source_ptr.cast_const(), "CFMachPortCreateRunLoopSource") {
+        Ok(source) => source,
+        Err(error) => {
+            unsafe { CFMachPortInvalidate(tap_ptr) };
+            let _ = ready.send(Err(error));
+            return Ok(());
+        }
+    };
+    // SAFETY: All objects are live on this run-loop thread. Adding the source
+    // does not transfer ownership.
+    unsafe { CFRunLoopAddSource(run_loop, source_ptr, kCFRunLoopDefaultMode) };
+
+    // SAFETY: Both references are non-null and live. The controller owns these
+    // two +1 retains independently of the thread's create-rule objects.
+    unsafe {
+        CFRetain(run_loop.cast());
+        CFRetain(tap_ptr.cast());
+    }
+    let controller = Arc::new(WholeHostController {
+        run_loop: run_loop.addr(),
+        tap: tap_ptr.addr(),
+        active: Arc::clone(active),
+    });
+
+    if ready.send(Ok(Arc::clone(&controller))).is_ok() && activation.recv().is_ok() {
+        active.store(true, Ordering::Release);
+        // SAFETY: Activation occurs on the owning run-loop thread after the
+        // callback authority and source lifetime are fully established.
+        unsafe { CGEventTapEnable(tap_ptr, true) };
+        while active.load(Ordering::Acquire) {
+            // SAFETY: The tap source is installed on this live run loop. The
+            // bounded interval also detects invalidation without relying on an
+            // unreviewed CFMachPort invalidation callback.
+            unsafe { CFRunLoopRunInMode(kCFRunLoopDefaultMode, 0.10, 0) };
+            if active.load(Ordering::Acquire) && unsafe { CFMachPortIsValid(tap_ptr) } == 0 {
+                counters.set_health(CaptureHealth::TapInvalidated);
+                active.store(false, Ordering::Release);
+            } else if active.load(Ordering::Acquire) && !unsafe { CGEventTapIsEnabled(tap_ptr) } {
+                counters.tap_disables.fetch_add(1, Ordering::Relaxed);
+                counters.set_health(CaptureHealth::TapDisabled);
+                active.store(false, Ordering::Release);
+            }
+        }
+    }
+
+    active.store(false, Ordering::Release);
+    // SAFETY: Callback authority is revoked before teardown. Removing the
+    // source and invalidating the tap prevents any callback after `context`
+    // is dropped. Releases are handled by OwnedCF/controller RAII.
+    unsafe {
+        CGEventTapEnable(tap_ptr, false);
+        CFRunLoopRemoveSource(run_loop, source_ptr, kCFRunLoopDefaultMode);
+        CFMachPortInvalidate(tap_ptr);
+    }
+    drop(controller);
+    drop(source);
+    drop(tap);
+    drop(context);
+    // Keep process-global ownership through native teardown and callback-context
+    // destruction so another tap generation cannot overlap this one.
+    drop(ownership);
+
+    match counters.health() {
+        CaptureHealth::TransitionDiscontinuity => Err(MacBackendError::CaptureDiscontinuity),
+        CaptureHealth::TapDisabled
+        | CaptureHealth::TapInvalidated
+        | CaptureHealth::CallbackPanicked => Err(MacBackendError::CaptureTapTerminated),
+        _ => Ok(()),
+    }
+}
+
+extern "C" fn quartz_event_tap_callback(
+    _proxy: CGEventTapProxy,
+    event_type: u32,
+    event: CGEventRef,
+    user_info: *mut c_void,
+) -> CGEventRef {
+    if user_info.is_null() {
+        return event;
+    }
+    // SAFETY: `user_info` points to the boxed context owned by the tap thread.
+    // Quartz serializes this callback on that thread's run loop, and teardown
+    // removes/invalidates the source before freeing the box.
+    let context = unsafe { &mut *user_info.cast::<WholeHostCallbackContext>() };
+    if matches!(
+        event_type,
+        CG_EVENT_TAP_DISABLED_BY_TIMEOUT | CG_EVENT_TAP_DISABLED_BY_USER_INPUT
+    ) {
+        context
+            .counters
+            .tap_disables
+            .fetch_add(1, Ordering::Relaxed);
+        context.counters.set_health(CaptureHealth::TapDisabled);
+        terminally_deactivate_whole_host(context);
+        return event;
+    }
+    if event.is_null() || !context.active.load(Ordering::Acquire) {
+        return event;
+    }
+
+    let suppress = catch_unwind(AssertUnwindSafe(|| {
+        dispatch_quartz_event(context, event_type, event)
+    }))
+    .unwrap_or_else(|_| {
+        context
+            .counters
+            .callback_panics
+            .fetch_add(1, Ordering::Relaxed);
+        context.counters.set_health(CaptureHealth::CallbackPanicked);
+        terminally_deactivate_whole_host(context);
+        false
+    });
+    if suppress && context.active.load(Ordering::Acquire) {
+        ptr::null_mut()
+    } else {
+        event
+    }
+}
+
+fn terminally_deactivate_whole_host(context: &WholeHostCallbackContext) {
+    context.active.store(false, Ordering::Release);
+    // SAFETY: The run loop remains live for the complete callback lifetime.
+    unsafe {
+        CFRunLoopStop(context.run_loop);
+        CFRunLoopWakeUp(context.run_loop);
+    }
+}
+
+#[allow(clippy::too_many_lines)] // Native fields stay explicit for ABI review.
+fn dispatch_quartz_event(
+    context: &WholeHostCallbackContext,
+    event_type: u32,
+    event: CGEventRef,
+) -> bool {
+    // SAFETY: All field accessors are pure reads of the callback-owned event.
+    let (user_data, source_state_id) = unsafe {
+        (
+            CGEventGetIntegerValueField(event, CG_EVENT_SOURCE_USER_DATA),
+            CGEventGetIntegerValueField(event, CG_EVENT_SOURCE_STATE_ID),
+        )
+    };
+    let classification = classify_quartz_capture(user_data, source_state_id);
+    let payload = if matches!(
+        event_type,
+        CG_EVENT_KEY_DOWN | CG_EVENT_KEY_UP | CG_EVENT_FLAGS_CHANGED
+    ) {
+        let key = unsafe { CGEventGetIntegerValueField(event, CG_KEYBOARD_EVENT_KEYCODE) };
+        u16::try_from(key).ok().and_then(|key| {
+            let autorepeat =
+                unsafe { CGEventGetIntegerValueField(event, CG_KEYBOARD_EVENT_AUTOREPEAT) } != 0;
+            let modifier_pressed = (event_type == CG_EVENT_FLAGS_CHANGED)
+                .then(|| quartz_modifier_pressed(key, unsafe { CGEventGetFlags(event) }))
+                .flatten();
+            translate_quartz_keyboard(event_type, key, autorepeat, modifier_pressed)
+        })
+    } else if event_type == CG_EVENT_SCROLL_WHEEL {
+        translate_quartz_scroll(
+            unsafe { CGEventGetDoubleValueField(event, CG_SCROLL_FIXED_DELTA_AXIS_2) },
+            unsafe { CGEventGetDoubleValueField(event, CG_SCROLL_FIXED_DELTA_AXIS_1) },
+        )
+    } else {
+        let button = unsafe { CGEventGetIntegerValueField(event, CG_MOUSE_EVENT_BUTTON_NUMBER) };
+        let delta_x =
+            i32::try_from(unsafe { CGEventGetIntegerValueField(event, CG_MOUSE_EVENT_DELTA_X) })
+                .ok()
+                .map(f64::from);
+        let delta_y =
+            i32::try_from(unsafe { CGEventGetIntegerValueField(event, CG_MOUSE_EVENT_DELTA_Y) })
+                .ok()
+                .map(f64::from);
+        delta_x.zip(delta_y).and_then(|(delta_x, delta_y)| {
+            translate_quartz_pointer(event_type, button, delta_x, delta_y)
+        })
+    };
+    let Some(payload) = payload else {
+        context
+            .counters
+            .untranslated_events
+            .fetch_add(1, Ordering::Relaxed);
+        return false;
+    };
+    let source_device = if matches!(payload, InputPayload::Key { .. }) {
+        context.keyboard_device
+    } else {
+        context.pointer_device
+    };
+    let Ok(sequence) =
+        context
+            .sequence
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                current.checked_add(1)
+            })
+    else {
+        context
+            .counters
+            .transition_discontinuities
+            .fetch_add(1, Ordering::Relaxed);
+        context
+            .counters
+            .set_health(CaptureHealth::TransitionDiscontinuity);
+        terminally_deactivate_whole_host(context);
+        return false;
+    };
+    let pointer_motion = matches!(payload, InputPayload::PointerMove { .. });
+    let mut captured = CapturedInput::new(
+        InputEvent::new(
+            sequence,
+            unsafe { CGEventGetTimestamp(event) },
+            context.host_id,
+            source_device,
+            payload,
+        ),
+        classification,
+    );
+    if pointer_motion {
+        // SAFETY: the callback owns a live event for the complete dispatch.
+        let location = unsafe { CGEventGetLocation(event) };
+        captured = captured.with_native_pointer_position(Point::new(location.x, location.y));
+    }
+    context
+        .counters
+        .delivered_events
+        .fetch_add(1, Ordering::Relaxed);
+    let disposition = (context.callback)(captured);
+    if disposition == CaptureDisposition::SuppressLocal
+        && classification == EventClassification::Physical
+        && context.active.load(Ordering::Acquire)
+    {
+        context
+            .counters
+            .suppressed_events
+            .fetch_add(1, Ordering::Relaxed);
+        true
+    } else {
+        if disposition == CaptureDisposition::SuppressLocal {
+            context
+                .counters
+                .ignored_suppression_requests
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        false
+    }
 }
 
 fn run_capture_thread(
@@ -1065,6 +1698,31 @@ fn enumerate_iohid_devices(host_id: HostId) -> Result<Vec<InputDevice>, MacBacke
         });
     }
     result
+}
+
+fn whole_host_devices(host_id: HostId) -> Vec<InputDevice> {
+    vec![
+        InputDevice::new(
+            derive_whole_host_device_id(host_id, WholeHostDeviceKind::Keyboard),
+            host_id,
+            "macOS whole-host keyboard (alpha)",
+            DeviceKind::Keyboard,
+            DeviceCapabilities::KEYBOARD,
+        ),
+        InputDevice::new(
+            derive_whole_host_device_id(host_id, WholeHostDeviceKind::Pointer),
+            host_id,
+            "macOS whole-host pointer (alpha)",
+            DeviceKind::Mouse,
+            DeviceCapabilities {
+                pointer: true,
+                keyboard: false,
+                vertical_scroll: true,
+                horizontal_scroll: true,
+                extra_buttons: true,
+            },
+        ),
+    ]
 }
 
 fn devices_from_set(host_id: HostId, set: CFSetRef) -> Result<Vec<InputDevice>, MacBackendError> {
@@ -1453,5 +2111,55 @@ mod tests {
         let host = HostId::from_bytes([8; 16]);
         assert_eq!(display_id(host, 12), display_id(host, 12));
         assert_ne!(display_id(host, 12), display_id(host, 13));
+    }
+
+    #[test]
+    fn whole_host_inventory_matches_callback_aggregate_ids() {
+        let host = HostId::from_bytes([0x64; 16]);
+        let backend = MacInputBackend::new_whole_host_alpha(host);
+        let devices = backend.enumerate_devices().expect("aggregate inventory");
+
+        assert_eq!(backend.capture_mode(), MacCaptureMode::WholeHostAlpha);
+        assert_eq!(
+            backend.suppression_scope(),
+            SuppressionScope::WholeHostAlpha
+        );
+        assert!(!MacInputBackend::selective_suppression_supported());
+        assert_eq!(devices.len(), 2);
+        assert_eq!(
+            devices[0].id,
+            derive_whole_host_device_id(host, WholeHostDeviceKind::Keyboard)
+        );
+        assert_eq!(
+            devices[1].id,
+            derive_whole_host_device_id(host, WholeHostDeviceKind::Pointer)
+        );
+        assert!(devices[0].capabilities.keyboard);
+        assert!(devices[1].capabilities.pointer);
+    }
+
+    #[test]
+    fn whole_host_mask_excludes_out_of_band_disable_sentinels() {
+        assert_eq!(whole_host_event_mask(), 0x0e40_1cfe);
+    }
+
+    #[test]
+    fn whole_host_owner_is_exclusive_and_recoverable() {
+        let first = WholeHostOwnershipClaim::acquire().expect("first owner");
+        assert!(matches!(
+            WholeHostOwnershipClaim::acquire(),
+            Err(MacBackendError::CaptureRegistrationOwned)
+        ));
+        drop(first);
+        let replacement = WholeHostOwnershipClaim::acquire().expect("replacement owner");
+        drop(replacement);
+    }
+
+    #[test]
+    fn terminal_tap_health_maps_to_shared_faulted_state() {
+        let backend = MacInputBackend::new_whole_host_alpha(HostId::from_bytes([0x65; 16]));
+        assert_eq!(backend.capture_lifecycle(), CaptureLifecycleState::Idle);
+        backend.counters.set_health(CaptureHealth::TapDisabled);
+        assert_eq!(backend.capture_lifecycle(), CaptureLifecycleState::Faulted);
     }
 }

@@ -1,16 +1,41 @@
-#[cfg(unix)]
-use std::fs::File;
-use std::fs::{self, OpenOptions};
-use std::io::Write;
+use std::fs::{self, File, OpenOptions};
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::RwLock;
+use std::sync::{Arc, RwLock};
 
-use crate::{decode_config, encode_config, Config, ConfigError};
+use crate::{decode_config, encode_config, Config, ConfigError, MAX_CONFIG_FILE_BYTES};
 
 static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
+/// Opaque process-local identity for one durable configuration authority.
+#[derive(Clone)]
+pub struct ConfigStoreAuthority(Arc<()>);
+
+impl ConfigStoreAuthority {
+    fn new() -> Self {
+        Self(Arc::new(()))
+    }
+}
+
+impl PartialEq for ConfigStoreAuthority {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+
+impl Eq for ConfigStoreAuthority {}
+
+impl std::fmt::Debug for ConfigStoreAuthority {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("ConfigStoreAuthority([REDACTED])")
+    }
+}
+
 pub trait ConfigStore: Send + Sync {
+    /// Returns the opaque identity shared by clones of this store authority.
+    fn authority(&self) -> ConfigStoreAuthority;
+
     /// Loads and migrates a configuration when one is present.
     ///
     /// # Errors
@@ -36,15 +61,28 @@ pub trait ConfigStore: Send + Sync {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct FileConfigStore {
     path: PathBuf,
+    authority: ConfigStoreAuthority,
+}
+
+impl std::fmt::Debug for FileConfigStore {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("FileConfigStore")
+            .field("path", &"[REDACTED]")
+            .finish_non_exhaustive()
+    }
 }
 
 impl FileConfigStore {
     #[must_use]
     pub fn new(path: impl Into<PathBuf>) -> Self {
-        Self { path: path.into() }
+        Self {
+            path: path.into(),
+            authority: ConfigStoreAuthority::new(),
+        }
     }
 
     #[must_use]
@@ -57,18 +95,38 @@ impl FileConfigStore {
     }
 
     fn read_path(path: &Path) -> Result<Option<String>, ConfigError> {
-        match fs::read_to_string(path) {
-            Ok(contents) => Ok(Some(contents)),
-            Err(source) if source.kind() == std::io::ErrorKind::NotFound => Ok(None),
-            Err(source) => Err(ConfigError::Read {
+        let file = match File::open(path) {
+            Ok(file) => file,
+            Err(source) if source.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(source) => {
+                return Err(ConfigError::Read {
+                    path: path.to_owned(),
+                    source,
+                });
+            }
+        };
+        let limit = u64::try_from(MAX_CONFIG_FILE_BYTES)
+            .expect("maximum configuration size fits in u64")
+            + 1;
+        let mut contents = String::new();
+        file.take(limit)
+            .read_to_string(&mut contents)
+            .map_err(|source| ConfigError::Read {
                 path: path.to_owned(),
                 source,
-            }),
+            })?;
+        if contents.len() > MAX_CONFIG_FILE_BYTES {
+            return Err(ConfigError::SizeLimit);
         }
+        Ok(Some(contents))
     }
 }
 
 impl ConfigStore for FileConfigStore {
+    fn authority(&self) -> ConfigStoreAuthority {
+        self.authority.clone()
+    }
+
     fn load(&self) -> Result<Option<Config>, ConfigError> {
         if let Some(contents) = Self::read_path(&self.path)? {
             return decode_config(&contents).map(Some);
@@ -143,23 +201,55 @@ impl ConfigStore for FileConfigStore {
     }
 }
 
-#[derive(Debug, Default)]
 pub struct MemoryConfigStore {
     value: RwLock<Option<Config>>,
+    authority: ConfigStoreAuthority,
 }
 
-impl MemoryConfigStore {
-    #[must_use]
-    pub fn with_config(config: Config) -> Self {
+impl Default for MemoryConfigStore {
+    fn default() -> Self {
         Self {
-            value: RwLock::new(Some(config)),
+            value: RwLock::new(None),
+            authority: ConfigStoreAuthority::new(),
         }
     }
 }
 
+impl std::fmt::Debug for MemoryConfigStore {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("MemoryConfigStore")
+            .field("state", &"[REDACTED]")
+            .finish_non_exhaustive()
+    }
+}
+
+impl MemoryConfigStore {
+    /// Creates an initialized memory store after validating the configuration.
+    ///
+    /// # Errors
+    ///
+    /// Returns a validation error rather than retaining invalid runtime state.
+    pub fn with_config(config: Config) -> Result<Self, ConfigError> {
+        config.validate()?;
+        Ok(Self {
+            value: RwLock::new(Some(config)),
+            authority: ConfigStoreAuthority::new(),
+        })
+    }
+}
+
 impl ConfigStore for MemoryConfigStore {
+    fn authority(&self) -> ConfigStoreAuthority {
+        self.authority.clone()
+    }
+
     fn load(&self) -> Result<Option<Config>, ConfigError> {
-        Ok(self.value.read().expect("config lock poisoned").clone())
+        let value = self.value.read().expect("config lock poisoned").clone();
+        if let Some(config) = &value {
+            config.validate()?;
+        }
+        Ok(value)
     }
 
     fn save(&self, config: &Config) -> Result<(), ConfigError> {
@@ -281,6 +371,36 @@ mod tests {
         fs::remove_dir_all(directory).unwrap();
     }
 
+    fn padded_default_config(length: usize) -> String {
+        let mut encoded = encode_config(&Config::default()).unwrap();
+        assert!(encoded.len() < length);
+        encoded.push('#');
+        encoded.extend(std::iter::repeat_n(' ', length - encoded.len()));
+        encoded
+    }
+
+    #[test]
+    fn file_reads_are_bounded_before_configuration_parsing() {
+        let directory = test_directory("bounded-read");
+        fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("config.toml");
+        let store = FileConfigStore::new(&path);
+
+        fs::write(&path, padded_default_config(MAX_CONFIG_FILE_BYTES)).unwrap();
+        assert_eq!(store.load().unwrap(), Some(Config::default()));
+
+        fs::write(&path, padded_default_config(MAX_CONFIG_FILE_BYTES + 1)).unwrap();
+        assert!(matches!(store.load(), Err(ConfigError::SizeLimit)));
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn file_store_debug_hides_configuration_path() {
+        let store = FileConfigStore::new("SECRET-CONFIG-PATH/config.toml");
+        let rendered = format!("{store:?}");
+        assert!(!rendered.contains("SECRET-CONFIG-PATH"));
+    }
+
     #[test]
     fn memory_store_validates_values() {
         let store = MemoryConfigStore::default();
@@ -288,5 +408,10 @@ mod tests {
         let mut invalid = Config::default();
         invalid.failsafe.shortcut.clear();
         assert!(store.save(&invalid).is_err());
+        assert!(MemoryConfigStore::with_config(invalid).is_err());
+        assert_eq!(
+            format!("{store:?}"),
+            "MemoryConfigStore { state: \"[REDACTED]\", .. }"
+        );
     }
 }

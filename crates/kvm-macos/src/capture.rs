@@ -6,6 +6,46 @@ use kvm_types::{DeviceCapabilities, DeviceKind};
 
 use crate::KVM_EVENT_TAG;
 
+pub(crate) const CG_EVENT_LEFT_MOUSE_DOWN: u32 = 1;
+pub(crate) const CG_EVENT_LEFT_MOUSE_UP: u32 = 2;
+pub(crate) const CG_EVENT_RIGHT_MOUSE_DOWN: u32 = 3;
+pub(crate) const CG_EVENT_RIGHT_MOUSE_UP: u32 = 4;
+pub(crate) const CG_EVENT_MOUSE_MOVED: u32 = 5;
+pub(crate) const CG_EVENT_LEFT_MOUSE_DRAGGED: u32 = 6;
+pub(crate) const CG_EVENT_RIGHT_MOUSE_DRAGGED: u32 = 7;
+pub(crate) const CG_EVENT_KEY_DOWN: u32 = 10;
+pub(crate) const CG_EVENT_KEY_UP: u32 = 11;
+pub(crate) const CG_EVENT_FLAGS_CHANGED: u32 = 12;
+pub(crate) const CG_EVENT_SCROLL_WHEEL: u32 = 22;
+pub(crate) const CG_EVENT_OTHER_MOUSE_DOWN: u32 = 25;
+pub(crate) const CG_EVENT_OTHER_MOUSE_UP: u32 = 26;
+pub(crate) const CG_EVENT_OTHER_MOUSE_DRAGGED: u32 = 27;
+pub(crate) const CG_EVENT_TAP_DISABLED_BY_TIMEOUT: u32 = 0xffff_fffe;
+pub(crate) const CG_EVENT_TAP_DISABLED_BY_USER_INPUT: u32 = 0xffff_ffff;
+pub(crate) const CG_EVENT_SOURCE_STATE_HID_SYSTEM: i64 = 1;
+
+pub(crate) const fn quartz_key_is_down(state: KeyState) -> bool {
+    !matches!(state, KeyState::Released)
+}
+
+pub(crate) const fn quartz_modifier_pressed(virtual_key: u16, flags: u64) -> Option<bool> {
+    // Caps Lock (0x39) intentionally falls through: Quartz exposes its toggle
+    // state rather than a reliable held-state transition, so it stays local.
+    let mask = match virtual_key {
+        0x3b => 0x0000_0001, // left Control
+        0x38 => 0x0000_0002, // left Shift
+        0x3c => 0x0000_0004, // right Shift
+        0x37 => 0x0000_0008, // left Command
+        0x36 => 0x0000_0010, // right Command
+        0x3a => 0x0000_0020, // left Option
+        0x3d => 0x0000_0040, // right Option
+        0x3e => 0x0000_2000, // right Control
+        0x3f => 0x0080_0000, // Fn
+        _ => return None,
+    };
+    Some(flags & mask != 0)
+}
+
 pub(crate) const HID_PAGE_GENERIC_DESKTOP: u32 = 0x01;
 pub(crate) const HID_PAGE_KEYBOARD: u32 = 0x07;
 pub(crate) const HID_PAGE_BUTTON: u32 = 0x09;
@@ -33,6 +73,114 @@ pub const fn classify_quartz_user_data(user_data: i64) -> EventClassification {
         EventClassification::InjectedByKvm
     } else {
         EventClassification::Unknown
+    }
+}
+
+/// Classifies one event received by the explicitly opted-in whole-host tap.
+///
+/// A Quartz source-state value is not a device identity. The HID system state
+/// is nevertheless positive evidence that the event came from the hardware
+/// input state table. Private and combined-session event sources remain
+/// unknown, even when they carry no user-data marker.
+pub(crate) const fn classify_quartz_capture(
+    user_data: i64,
+    source_state_id: i64,
+) -> EventClassification {
+    if user_data == KVM_EVENT_TAG {
+        EventClassification::InjectedByKvm
+    } else if source_state_id == CG_EVENT_SOURCE_STATE_HID_SYSTEM {
+        EventClassification::Physical
+    } else {
+        EventClassification::Unknown
+    }
+}
+
+pub(crate) fn translate_quartz_keyboard(
+    event_type: u32,
+    virtual_key: u16,
+    autorepeat: bool,
+    modifier_pressed: Option<bool>,
+) -> Option<InputPayload> {
+    let code = crate::keymap::key_from_mac_virtual_key(virtual_key)?;
+    let state = match event_type {
+        CG_EVENT_KEY_DOWN if autorepeat => KeyState::Repeated,
+        CG_EVENT_KEY_DOWN => KeyState::Pressed,
+        CG_EVENT_KEY_UP => KeyState::Released,
+        CG_EVENT_FLAGS_CHANGED => {
+            if modifier_pressed? {
+                KeyState::Pressed
+            } else {
+                KeyState::Released
+            }
+        }
+        _ => return None,
+    };
+    Some(InputPayload::Key { code, state })
+}
+
+pub(crate) fn translate_quartz_pointer(
+    event_type: u32,
+    button_number: i64,
+    delta_x: f64,
+    delta_y: f64,
+) -> Option<InputPayload> {
+    match event_type {
+        CG_EVENT_MOUSE_MOVED
+        | CG_EVENT_LEFT_MOUSE_DRAGGED
+        | CG_EVENT_RIGHT_MOUSE_DRAGGED
+        | CG_EVENT_OTHER_MOUSE_DRAGGED => {
+            (delta_x.is_finite() && delta_y.is_finite() && (delta_x != 0.0 || delta_y != 0.0))
+                .then_some(InputPayload::PointerMove {
+                    dx: delta_x,
+                    dy: delta_y,
+                })
+        }
+        CG_EVENT_LEFT_MOUSE_DOWN => Some(InputPayload::PointerButton {
+            button: PointerButton::Left,
+            state: ButtonState::Pressed,
+        }),
+        CG_EVENT_LEFT_MOUSE_UP => Some(InputPayload::PointerButton {
+            button: PointerButton::Left,
+            state: ButtonState::Released,
+        }),
+        CG_EVENT_RIGHT_MOUSE_DOWN => Some(InputPayload::PointerButton {
+            button: PointerButton::Right,
+            state: ButtonState::Pressed,
+        }),
+        CG_EVENT_RIGHT_MOUSE_UP => Some(InputPayload::PointerButton {
+            button: PointerButton::Right,
+            state: ButtonState::Released,
+        }),
+        CG_EVENT_OTHER_MOUSE_DOWN | CG_EVENT_OTHER_MOUSE_UP => {
+            let button = quartz_pointer_button(button_number)?;
+            Some(InputPayload::PointerButton {
+                button,
+                state: if event_type == CG_EVENT_OTHER_MOUSE_DOWN {
+                    ButtonState::Pressed
+                } else {
+                    ButtonState::Released
+                },
+            })
+        }
+        _ => None,
+    }
+}
+
+pub(crate) fn translate_quartz_scroll(horizontal: f64, vertical: f64) -> Option<InputPayload> {
+    (horizontal.is_finite() && vertical.is_finite() && (horizontal != 0.0 || vertical != 0.0))
+        .then_some(InputPayload::Scroll {
+            horizontal,
+            vertical,
+        })
+}
+
+fn quartz_pointer_button(number: i64) -> Option<PointerButton> {
+    match number {
+        2 => Some(PointerButton::Middle),
+        3 => Some(PointerButton::Back),
+        4 => Some(PointerButton::Forward),
+        5..=65_535 => u16::try_from(number).ok().map(PointerButton::Other),
+        _ => None,
     }
 }
 
@@ -533,5 +681,104 @@ mod tests {
         assert_eq!(mach_timestamp_ns(100, 125, 3), 4_166);
         assert_eq!(mach_timestamp_ns(u64::MAX, u32::MAX, 1), u64::MAX);
         assert_eq!(mach_timestamp_ns(100, 1, 0), 0);
+    }
+
+    #[test]
+    fn whole_host_quartz_classification_requires_hid_source_evidence() {
+        assert_eq!(CG_EVENT_SCROLL_WHEEL, 22);
+        assert_ne!(
+            CG_EVENT_TAP_DISABLED_BY_TIMEOUT,
+            CG_EVENT_TAP_DISABLED_BY_USER_INPUT
+        );
+        assert_eq!(
+            classify_quartz_capture(KVM_EVENT_TAG, CG_EVENT_SOURCE_STATE_HID_SYSTEM),
+            EventClassification::InjectedByKvm
+        );
+        assert_eq!(
+            classify_quartz_capture(0, CG_EVENT_SOURCE_STATE_HID_SYSTEM),
+            EventClassification::Physical
+        );
+        assert_eq!(classify_quartz_capture(0, 0), EventClassification::Unknown);
+        assert_eq!(classify_quartz_capture(0, -1), EventClassification::Unknown);
+    }
+
+    #[test]
+    fn quartz_keyboard_preserves_press_repeat_release_and_modifiers() {
+        assert!(quartz_key_is_down(KeyState::Pressed));
+        assert!(quartz_key_is_down(KeyState::Repeated));
+        assert!(!quartz_key_is_down(KeyState::Released));
+        assert_eq!(
+            translate_quartz_keyboard(CG_EVENT_KEY_DOWN, 0x00, false, None),
+            Some(InputPayload::Key {
+                code: KeyCode::KeyA,
+                state: KeyState::Pressed,
+            })
+        );
+        assert_eq!(
+            translate_quartz_keyboard(CG_EVENT_KEY_DOWN, 0x00, true, None),
+            Some(InputPayload::Key {
+                code: KeyCode::KeyA,
+                state: KeyState::Repeated,
+            })
+        );
+        assert_eq!(
+            translate_quartz_keyboard(CG_EVENT_KEY_UP, 0x00, true, None),
+            Some(InputPayload::Key {
+                code: KeyCode::KeyA,
+                state: KeyState::Released,
+            })
+        );
+        assert_eq!(
+            translate_quartz_keyboard(CG_EVENT_FLAGS_CHANGED, 0x38, false, Some(true)),
+            Some(InputPayload::Key {
+                code: KeyCode::ShiftLeft,
+                state: KeyState::Pressed,
+            })
+        );
+        assert_eq!(
+            translate_quartz_keyboard(CG_EVENT_FLAGS_CHANGED, 0x38, false, Some(false)),
+            Some(InputPayload::Key {
+                code: KeyCode::ShiftLeft,
+                state: KeyState::Released,
+            })
+        );
+        assert_eq!(quartz_modifier_pressed(0x38, 0x2), Some(true));
+        assert_eq!(quartz_modifier_pressed(0x38, 0), Some(false));
+        assert_eq!(quartz_modifier_pressed(0x39, 0x0001_0000), None);
+        assert_eq!(quartz_modifier_pressed(0x00, u64::MAX), None);
+    }
+
+    #[test]
+    fn quartz_pointer_and_scroll_translation_is_finite_and_role_correct() {
+        assert_eq!(
+            translate_quartz_pointer(CG_EVENT_LEFT_MOUSE_DRAGGED, 0, 4.0, -3.0),
+            Some(InputPayload::PointerMove { dx: 4.0, dy: -3.0 })
+        );
+        assert_eq!(
+            translate_quartz_pointer(CG_EVENT_OTHER_MOUSE_DOWN, 4, 0.0, 0.0),
+            Some(InputPayload::PointerButton {
+                button: PointerButton::Forward,
+                state: ButtonState::Pressed,
+            })
+        );
+        assert_eq!(
+            translate_quartz_pointer(CG_EVENT_OTHER_MOUSE_UP, 7, 0.0, 0.0),
+            Some(InputPayload::PointerButton {
+                button: PointerButton::Other(7),
+                state: ButtonState::Released,
+            })
+        );
+        assert_eq!(
+            translate_quartz_scroll(-1.25, 2.5),
+            Some(InputPayload::Scroll {
+                horizontal: -1.25,
+                vertical: 2.5,
+            })
+        );
+        assert_eq!(
+            translate_quartz_pointer(CG_EVENT_MOUSE_MOVED, 0, 0.0, 0.0),
+            None
+        );
+        assert_eq!(translate_quartz_scroll(f64::NAN, 1.0), None);
     }
 }

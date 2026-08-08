@@ -1,4 +1,5 @@
 use std::collections::BTreeMap;
+use std::fmt;
 
 use kvm_types::{HostId, PeerId};
 use thiserror::Error;
@@ -61,9 +62,18 @@ pub trait PairedPeerStore {
 }
 
 /// In-memory public-metadata store for deterministic tests and ephemeral tools.
-#[derive(Debug, Default)]
+#[derive(Default)]
 pub struct MemoryPairedPeerStore {
     peers: BTreeMap<PeerId, PairedPeer>,
+}
+
+impl fmt::Debug for MemoryPairedPeerStore {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("MemoryPairedPeerStore")
+            .field("peer_count", &self.peers.len())
+            .finish_non_exhaustive()
+    }
 }
 
 impl PairedPeerStore for MemoryPairedPeerStore {
@@ -83,7 +93,7 @@ impl PairedPeerStore for MemoryPairedPeerStore {
 }
 
 /// Public paired-peer persistence failure.
-#[derive(Clone, Debug, Eq, Error, PartialEq)]
+#[derive(Clone, Eq, Error, PartialEq)]
 pub enum PairedPeerStoreError {
     /// Storage is temporarily unavailable.
     #[error("paired-peer store is unavailable")]
@@ -92,8 +102,22 @@ pub enum PairedPeerStoreError {
     #[error("paired-peer metadata is corrupt")]
     Corrupt,
     /// Backend-specific failure without private key material.
-    #[error("paired-peer store failed: {0}")]
+    #[error("paired-peer store backend failed")]
     Backend(String),
+}
+
+impl fmt::Debug for PairedPeerStoreError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let kind = match self {
+            Self::Unavailable => "Unavailable",
+            Self::Corrupt => "Corrupt",
+            Self::Backend(_) => "Backend",
+        };
+        formatter
+            .debug_struct("PairedPeerStoreError")
+            .field("kind", &kind)
+            .finish_non_exhaustive()
+    }
 }
 
 /// TLS transport boundary that vouches for the connected peer identity.
@@ -111,7 +135,7 @@ pub trait AuthenticatedPeerTransport {
 }
 
 /// Failure at the encrypted transport authentication boundary.
-#[derive(Clone, Debug, Eq, Error, PartialEq)]
+#[derive(Clone, Eq, Error, PartialEq)]
 pub enum TransportAuthenticationError {
     /// The connection is not encrypted.
     #[error("remote input requires an encrypted connection")]
@@ -123,15 +147,36 @@ pub enum TransportAuthenticationError {
     #[error("peer credential is invalid")]
     InvalidCredential,
     /// Backend-specific authentication failure without credential material.
-    #[error("transport authentication failed: {0}")]
+    #[error("transport authentication backend failed")]
     Backend(String),
 }
 
+impl fmt::Debug for TransportAuthenticationError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let kind = match self {
+            Self::Unencrypted => "Unencrypted",
+            Self::Unauthenticated => "Unauthenticated",
+            Self::InvalidCredential => "InvalidCredential",
+            Self::Backend(_) => "Backend",
+        };
+        formatter
+            .debug_struct("TransportAuthenticationError")
+            .field("kind", &kind)
+            .finish_non_exhaustive()
+    }
+}
+
 /// Capability minted only after transport authentication and allowlist matching.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Eq, PartialEq)]
 pub struct InputAuthorization {
     peer_id: PeerId,
     host_id: HostId,
+}
+
+impl fmt::Debug for InputAuthorization {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("InputAuthorization([REDACTED])")
+    }
 }
 
 impl InputAuthorization {
@@ -150,9 +195,17 @@ impl InputAuthorization {
 
 /// Pairing allowlist service. Authorization fails closed on every store or
 /// transport error.
-#[derive(Debug)]
 pub struct PairedPeerAllowlist<S> {
     store: S,
+}
+
+impl<S> fmt::Debug for PairedPeerAllowlist<S> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PairedPeerAllowlist")
+            .field("store", &"[REDACTED]")
+            .finish_non_exhaustive()
+    }
 }
 
 impl<S> PairedPeerAllowlist<S>
@@ -236,7 +289,7 @@ where
 }
 
 /// Input authorization failure. Every variant must be treated as denial.
-#[derive(Clone, Debug, Eq, Error, PartialEq)]
+#[derive(Clone, Eq, Error, PartialEq)]
 pub enum AuthorizationError {
     /// The transport did not establish encrypted peer authentication.
     #[error(transparent)]
@@ -245,17 +298,30 @@ pub enum AuthorizationError {
     #[error(transparent)]
     Store(#[from] PairedPeerStoreError),
     /// The authenticated peer has never completed explicit pairing.
-    #[error("peer {0} is not paired and cannot authorize input")]
+    #[error("authenticated peer is not paired and cannot authorize input")]
     PeerNotPaired(PeerId),
     /// A known peer ID presented a different host identity or public key.
-    #[error(
-        "authenticated identity for peer {peer_id} does not match its paired fingerprint ({expected_fingerprint} != {presented_fingerprint})"
-    )]
+    #[error("authenticated identity does not match its paired public credential")]
     IdentityMismatch {
         peer_id: PeerId,
         expected_fingerprint: IdentityFingerprint,
         presented_fingerprint: IdentityFingerprint,
     },
+}
+
+impl fmt::Debug for AuthorizationError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let kind = match self {
+            Self::Transport(_) => "Transport",
+            Self::Store(_) => "Store",
+            Self::PeerNotPaired(_) => "PeerNotPaired",
+            Self::IdentityMismatch { .. } => "IdentityMismatch",
+        };
+        formatter
+            .debug_struct("AuthorizationError")
+            .field("kind", &kind)
+            .finish_non_exhaustive()
+    }
 }
 
 #[cfg(test)]
@@ -321,6 +387,39 @@ mod tests {
             allowlist.authorize_input(&TestTransport(Ok(presented))),
             Err(AuthorizationError::IdentityMismatch { .. })
         ));
+    }
+
+    #[test]
+    fn authorization_diagnostics_redact_stable_identity_metadata() {
+        let peer = PeerId::from_bytes([0x11; 16]);
+        let expected = IdentityFingerprint::from_sha256([0x22; 32]);
+        let presented = IdentityFingerprint::from_sha256([0x33; 32]);
+        let errors = [
+            AuthorizationError::PeerNotPaired(peer),
+            AuthorizationError::IdentityMismatch {
+                peer_id: peer,
+                expected_fingerprint: expected,
+                presented_fingerprint: presented,
+            },
+        ];
+        let rendered = format!(
+            "{:?} {} {:?} {}",
+            errors[0], errors[0], errors[1], errors[1]
+        );
+        for marker in [
+            peer.to_string(),
+            expected.to_string(),
+            presented.to_string(),
+        ] {
+            assert!(!rendered.contains(&marker));
+        }
+
+        let backend_marker = "SECRET-ALLOWLIST-BACKEND";
+        let store_error = PairedPeerStoreError::Backend(backend_marker.to_owned());
+        let transport_error = TransportAuthenticationError::Backend(backend_marker.to_owned());
+        let rendered =
+            format!("{store_error:?} {store_error} {transport_error:?} {transport_error}");
+        assert!(!rendered.contains(backend_marker));
     }
 
     #[test]

@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use crate::{
     Config, ConfigError, DeviceRouteConfig, DisplayPlacement, FailsafeSettings, KeyboardMode,
     KeyboardSettings, NetworkSettings, PairedHostConfig, ShortcutKey, StartupSettings,
-    TopologyConfig, CURRENT_CONFIG_VERSION,
+    TopologyConfig, CURRENT_CONFIG_VERSION, MAX_CONFIG_FILE_BYTES,
 };
 
 #[derive(Deserialize)]
@@ -19,6 +19,9 @@ struct VersionProbe {
 /// Returns [`ConfigError`] when TOML is malformed, its version is unsupported,
 /// or the decoded/migrated values fail validation.
 pub fn decode_config(source: &str) -> Result<Config, ConfigError> {
+    if source.len() > MAX_CONFIG_FILE_BYTES {
+        return Err(ConfigError::SizeLimit);
+    }
     let probe: VersionProbe = toml::from_str(source)?;
     let config = match probe.version {
         1 => ConfigV1::migrate(toml::from_str(source)?),
@@ -42,7 +45,11 @@ pub fn decode_config(source: &str) -> Result<Config, ConfigError> {
 /// Returns [`ConfigError`] when validation or TOML serialization fails.
 pub fn encode_config(config: &Config) -> Result<String, ConfigError> {
     config.validate()?;
-    Ok(toml::to_string_pretty(config)?)
+    let encoded = toml::to_string_pretty(config)?;
+    if encoded.len() > MAX_CONFIG_FILE_BYTES {
+        return Err(ConfigError::SizeLimit);
+    }
+    Ok(encoded)
 }
 
 /// Original flat settings schema. Kept private so all consumers immediately
@@ -85,6 +92,7 @@ impl ConfigV1 {
                 links: Vec::new(),
             },
             device_routes: old.device_routes,
+            device_route_revision: 0,
             keyboard: KeyboardSettings {
                 mode: old.keyboard_mode,
             },
@@ -157,7 +165,7 @@ mod tests {
                 peer_id: peer,
                 name: "MacBook".into(),
                 platform: Platform::MacOS,
-                identity_fingerprint: "sha256:public-key".into(),
+                identity_fingerprint: "11".repeat(32),
             }],
             display_layout: vec![DisplayPlacement {
                 display_id: display,
@@ -197,10 +205,20 @@ mod tests {
 
     #[test]
     fn current_config_round_trips_in_human_readable_form() {
-        let config = Config::default();
+        let config = Config {
+            device_route_revision: 7,
+            ..Config::default()
+        };
         let encoded = encode_config(&config).unwrap();
         assert!(encoded.contains("version = 2"));
+        assert!(encoded.contains("device_route_revision = 7"));
         assert_eq!(decode_config(&encoded).unwrap(), config);
+    }
+
+    #[test]
+    fn older_v2_without_route_revision_decodes_at_zero() {
+        let decoded = decode_config("version = 2").unwrap();
+        assert_eq!(decoded.device_route_revision, 0);
     }
 
     #[test]
@@ -213,5 +231,14 @@ mod tests {
                 supported: CURRENT_CONFIG_VERSION
             }
         ));
+    }
+
+    #[test]
+    fn direct_decode_rejects_oversized_input_before_toml_errors() {
+        let oversized =
+            "SECRET-CONFIG-MARKER".repeat(MAX_CONFIG_FILE_BYTES / "SECRET-CONFIG-MARKER".len() + 1);
+        let error = decode_config(&oversized).unwrap_err();
+        assert!(matches!(error, ConfigError::SizeLimit));
+        assert!(!format!("{error:?} {error}").contains("SECRET-CONFIG-MARKER"));
     }
 }

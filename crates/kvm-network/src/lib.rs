@@ -9,29 +9,49 @@
 //! TLS establishment and peer verification remain composition duties.
 
 mod codec;
+mod connection_role;
 mod connector;
 mod heartbeat;
+mod listener;
 mod peer;
 mod queue;
 mod reconnect;
+mod rustls_acceptor;
 mod rustls_connector;
 
 pub use codec::{FrameReader, FrameWriter, NetworkError};
+pub use connection_role::{
+    ActiveConnection, ConnectionDirection, ConnectionGeneration, ConnectionGenerationError,
+    ConnectionGenerationGate, ConnectionRole, ConnectionRoleError, PendingConnection,
+};
 pub use connector::{
-    AuthenticatedConnector, DevelopmentAddress, SecurePeerStream, TransportPeerIdentity,
+    AuthenticatedAcceptor, AuthenticatedConnector, AuthenticatedLanConnector,
+    ClientIdentityResolutionError, DevelopmentAddress, PairedClientIdentityResolver,
+    SecurePeerStream, TransportPeerIdentity,
 };
 pub use heartbeat::{
     HeartbeatAction, HeartbeatConfig, HeartbeatConfigError, HeartbeatController, HeartbeatError,
     PeerHealth, PeerState,
 };
+pub use listener::{
+    BoundedLanListener, LanAddressError, LanListenerBuildError, LanListenerConfig,
+    LanListenerConfigError, LanListenerEvent, LanListenerRejection, LanListenerReport,
+    LanPeerAddress,
+};
 pub use peer::{
-    AdmissionError, AdmittedPeer, ConnectionState, DisconnectReason, HandshakeTranscript,
+    AdmissionError, AdmittedPeer, AppliedGenerationEvent, ConnectionState, DisconnectReason,
+    GenerationBoundEventClassification, GenerationBoundPeerEvent, GenerationBoundPeerSession,
+    GenerationBoundSessionBuildError, GenerationBoundSessionError, HandshakeTranscript,
     NoReconnectJitter, OutboundSendError, PeerConfigError, PeerEvent, PeerSender, PersistentExit,
-    PersistentPeer, PersistentPeerConfig, ReconnectJitter, SessionAdmission, SessionEnd,
-    SessionError, UndeliveredMessage, UndeliveredTraffic,
+    PersistentPeer, PersistentPeerConfig, ReconnectJitter, SecurePeerSession, SessionAdmission,
+    SessionEnd, SessionError, UndeliveredMessage, UndeliveredTraffic,
 };
 pub use queue::{EnqueueError, OutboundQueue, QueueConfig, QueueConfigError, TrafficClass};
 pub use reconnect::{ReconnectBackoff, ReconnectPolicy, ReconnectPolicyError};
+pub use rustls_acceptor::{
+    RustlsAcceptedPeerStream, RustlsAcceptorConfig, RustlsAcceptorConfigError, RustlsClientTrust,
+    RustlsServerCredentials, RustlsTcpAcceptor,
+};
 pub use rustls_connector::{
     RustlsClientCredentials, RustlsConnectorConfig, RustlsConnectorConfigError, RustlsPeerStream,
     RustlsServerTrust, RustlsTcpConnector,

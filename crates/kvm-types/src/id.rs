@@ -19,7 +19,7 @@ impl std::error::Error for ParseIdError {}
 macro_rules! define_id {
     ($(#[$meta:meta])* $name:ident) => {
         $(#[$meta])*
-        #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+        #[derive(Clone, Copy, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
         #[serde(transparent)]
         pub struct $name(Uuid);
 
@@ -61,6 +61,12 @@ macro_rules! define_id {
         impl fmt::Display for $name {
             fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
                 self.0.fmt(formatter)
+            }
+        }
+
+        impl fmt::Debug for $name {
+            fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                formatter.write_str(concat!(stringify!($name), "([REDACTED])"))
             }
         }
 
@@ -128,5 +134,14 @@ mod tests {
 
         assert_ne!(first, second);
         assert_ne!(first.into_bytes(), [0; 16]);
+    }
+
+    #[test]
+    fn identifier_debug_omits_stable_bytes() {
+        let marker = "71717171-7171-7171-7171-717171717171";
+        let id = HostId::parse(marker).unwrap();
+
+        assert_eq!(format!("{id:?}"), "HostId([REDACTED])");
+        assert!(!format!("{id:?}").contains(marker));
     }
 }

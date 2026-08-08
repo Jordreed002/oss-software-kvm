@@ -30,8 +30,7 @@ impl<S> fmt::Debug for PairedSessionAdmission<S> {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("PairedSessionAdmission")
-            .field("local_peer_id", &self.local_identity.peer_id())
-            .field("local_host_id", &self.local_identity.host_id())
+            .field("local_identity", &"[REDACTED]")
             .field("hello_nonce", &"[REDACTED]")
             .finish_non_exhaustive()
     }

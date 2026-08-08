@@ -32,10 +32,7 @@ impl fmt::Display for VerificationCode {
 
 impl fmt::Debug for VerificationCode {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter
-            .debug_tuple("VerificationCode")
-            .field(&self.to_string())
-            .finish()
+        formatter.write_str("VerificationCode([REDACTED])")
     }
 }
 
@@ -85,11 +82,21 @@ pub enum PairingState {
 }
 
 /// One pairing attempt bound to an authenticated TLS transcript/exporter.
-#[derive(Debug)]
 pub struct PairingSession {
     remote_identity: PeerIdentity,
     verification_code: VerificationCode,
     state: PairingState,
+}
+
+impl fmt::Debug for PairingSession {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PairingSession")
+            .field("remote_identity", &"[REDACTED]")
+            .field("verification_code", &"[REDACTED]")
+            .field("state", &self.state)
+            .finish_non_exhaustive()
+    }
 }
 
 impl PairingSession {
@@ -423,5 +430,25 @@ mod tests {
         let code = session().verification_code();
         assert_eq!(code.to_string().len(), 6);
         assert_eq!(code.to_string().parse(), Ok(code));
+    }
+
+    #[test]
+    fn pairing_debug_redacts_code_and_identity() {
+        let pairing = session();
+        let code = pairing.verification_code().to_string();
+        let rendered = format!("{pairing:?} {:?}", pairing.verification_code());
+
+        assert!(!rendered.contains(&code));
+        assert!(!rendered.contains("MacBook"));
+    }
+
+    #[test]
+    fn pairing_error_redacts_channel_binding_backend_details() {
+        const MARKER: &str = "SECRET-TLS-EXPORTER-MARKER";
+        let error =
+            PairingError::ChannelBinding(ChannelBindingError::ExportFailed(MARKER.to_owned()));
+        let rendered = format!("{error:?} {error}");
+
+        assert!(!rendered.contains(MARKER));
     }
 }

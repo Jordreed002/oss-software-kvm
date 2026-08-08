@@ -1,9 +1,10 @@
 //! macOS platform boundary for Software KVM.
 //!
 //! Device enumeration uses IOHID so built-in and external devices retain their
-//! physical identity. Quartz injection is tagged with [`KVM_EVENT_TAG`] for a
-//! future event tap to classify and discard looped-back events. IOHID capture
-//! is observable through a bounded queue and never suppresses local input.
+//! physical identity. Quartz injection is tagged with [`KVM_EVENT_TAG`] for an
+//! explicitly opted-in Quartz event tap to discard looped-back events and
+//! synchronously suppress aggregate whole-host input. The default IOHID mode
+//! remains observable through a bounded queue and never suppresses local input.
 //! Proven hardware elements are classified physical; virtual or insufficiently
 //! attributed IOHID observations remain unknown.
 //! Selective suppression remains unavailable until IOHID identity can be
@@ -34,6 +35,24 @@ use thiserror::Error;
 /// Event-tap capture must compare this exact value before routing an event.
 pub const KVM_EVENT_TAG: i64 = 0x4f53_534b_564d_0001;
 
+/// Capture behavior selected before a backend is started.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum MacCaptureMode {
+    /// Device-attributed IOHID observation; suppression requests are ignored.
+    #[default]
+    IoHidObservation,
+    /// Explicit aggregate keyboard/pointer Quartz filtering for alpha testing.
+    WholeHostAlpha,
+}
+
+/// Native suppression scope, kept separate from per-device support.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SuppressionScope {
+    None,
+    WholeHostAlpha,
+    UnsupportedPlatform,
+}
+
 /// macOS privacy grants required by the production backend.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct PermissionStatus {
@@ -43,7 +62,7 @@ pub struct PermissionStatus {
     pub input_monitoring: bool,
 }
 
-/// Snapshot of the bounded observation pipeline.
+/// Snapshot of the current or most recently stopped capture pipeline.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct CaptureStatistics {
     /// Events dequeued and offered to the daemon callback.
@@ -54,27 +73,41 @@ pub struct CaptureStatistics {
     pub transition_discontinuities: u64,
     /// Sessions terminated because the delivery worker disconnected.
     pub delivery_disconnects: u64,
-    /// Requests to suppress locally that this observation-only backend ignored.
+    /// Suppression requests ignored in observation mode or for non-physical input.
     pub ignored_suppression_requests: u64,
-    /// Current or terminal health of the observation pipeline.
+    /// Physical Quartz events synchronously suppressed by whole-host alpha.
+    pub suppressed_events: u64,
+    /// Quartz records whose supported fields could not be translated.
+    pub untranslated_events: u64,
+    /// Panics contained at a native callback boundary.
+    pub callback_panics: u64,
+    /// Whole-host generations terminated by an out-of-band tap disable.
+    pub tap_disables: u64,
+    /// Current or terminal health of the capture pipeline.
     pub health: CaptureHealth,
 }
 
-/// Observable lifecycle and terminal state of macOS input observation.
+/// Observable lifecycle and terminal state of macOS input capture.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 #[repr(u8)]
 pub enum CaptureHealth {
     /// No observation session has started.
     #[default]
     Idle = 0,
-    /// IOHID capture and bounded delivery are active.
+    /// IOHID observation or whole-host Quartz capture is active.
     Running = 1,
-    /// Observation stopped normally.
+    /// Capture stopped normally.
     Stopped = 2,
     /// A key/button transition could not be queued; input state is unreliable.
     TransitionDiscontinuity = 3,
     /// The callback delivery worker disconnected unexpectedly.
     DeliveryDisconnected = 4,
+    /// Quartz disabled the event tap; the generation is terminal and fail-open.
+    TapDisabled = 5,
+    /// The tap's Mach port became invalid; the generation is terminal.
+    TapInvalidated = 6,
+    /// The synchronous daemon callback panicked; the generation is terminal.
+    CallbackPanicked = 7,
 }
 
 /// Failures at the platform boundary.
@@ -99,6 +132,8 @@ pub enum MacBackendError {
     UnsupportedInput(&'static str),
     #[error("macOS input capture is already running")]
     CaptureAlreadyRunning,
+    #[error("macOS whole-host event-tap ownership is held by another backend generation")]
+    CaptureRegistrationOwned,
     #[error("macOS input capture thread terminated during startup")]
     CaptureStartupTerminated,
     #[error("macOS input capture did not become ready before the startup deadline")]
@@ -109,6 +144,8 @@ pub enum MacBackendError {
     CaptureDiscontinuity,
     #[error("macOS input capture delivery worker disconnected unexpectedly")]
     CaptureDeliveryDisconnected,
+    #[error("macOS whole-host event tap became disabled or invalid; capture is discontinuous")]
+    CaptureTapTerminated,
     #[error("macOS input capture {0} did not stop before the shutdown deadline")]
     CaptureStopTimedOut(&'static str),
 }

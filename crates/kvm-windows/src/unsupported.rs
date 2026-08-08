@@ -4,11 +4,15 @@ use kvm_daemon::{
 use kvm_input::InputEvent;
 use kvm_types::{Display, HostId, InputDevice};
 
-use crate::{CapabilityState, CaptureStatistics, WindowsBackendError, WindowsCapabilities};
+use crate::{
+    CapabilityState, CaptureStatistics, SuppressionScope, WindowsBackendError, WindowsCapabilities,
+    WindowsCaptureMode,
+};
 
 #[derive(Debug)]
 pub struct WindowsInputBackend {
     host_id: HostId,
+    capture_mode: WindowsCaptureMode,
     statistics: CaptureStatistics,
 }
 
@@ -17,6 +21,7 @@ impl WindowsInputBackend {
     pub const fn new(host_id: HostId) -> Self {
         Self {
             host_id,
+            capture_mode: WindowsCaptureMode::RawInputObservation,
             statistics: CaptureStatistics {
                 captured_events: 0,
                 dropped_events: 0,
@@ -27,9 +32,36 @@ impl WindowsInputBackend {
                 untranslated_mouse_packets: 0,
                 callback_panics: 0,
                 suppression_requests_ignored: 0,
+                suppressed_events: 0,
                 capture_discontinuities: 0,
             },
         }
+    }
+
+    #[must_use]
+    pub const fn new_whole_host_alpha(host_id: HostId) -> Self {
+        Self {
+            host_id,
+            capture_mode: WindowsCaptureMode::WholeHostAlpha,
+            statistics: CaptureStatistics {
+                captured_events: 0,
+                dropped_events: 0,
+                untranslated_packets: 0,
+                keyboard_packets: 0,
+                mouse_packets: 0,
+                untranslated_keyboard_packets: 0,
+                untranslated_mouse_packets: 0,
+                callback_panics: 0,
+                suppression_requests_ignored: 0,
+                suppressed_events: 0,
+                capture_discontinuities: 0,
+            },
+        }
+    }
+
+    #[must_use]
+    pub const fn capture_mode(&self) -> WindowsCaptureMode {
+        self.capture_mode
     }
 
     #[must_use]
@@ -78,6 +110,7 @@ pub fn probe_capabilities() -> WindowsCapabilities {
         display_enumeration: CapabilityState::UnsupportedPlatform,
         device_aware_capture: CapabilityState::UnsupportedPlatform,
         per_device_suppression: CapabilityState::UnsupportedPlatform,
+        suppression_scope: SuppressionScope::UnsupportedPlatform,
         diagnostics: vec!["Windows APIs are unavailable on this operating system".into()],
     }
 }

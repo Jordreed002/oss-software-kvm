@@ -31,7 +31,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let mut lifecycle_timer = tokio::time::interval(Duration::from_millis(50));
     lifecycle_timer.set_missed_tick_behavior(MissedTickBehavior::Skip);
 
-    info!(host = %local_host, "daemon started");
+    info!("daemon started");
     loop {
         tokio::select! {
             _ = lifecycle_timer.tick() => {
@@ -47,11 +47,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
     }
     info!("shutdown signal received");
 
-    let release_actions = core.shutdown(monotonic_ns(started));
-    info!(
-        release_count = release_actions.len(),
-        "daemon stopped gracefully"
-    );
+    core.shutdown(monotonic_ns(started))?;
+    info!("daemon stopped gracefully");
     Ok(())
 }
 

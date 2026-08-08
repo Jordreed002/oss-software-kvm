@@ -12,6 +12,12 @@ pub enum ProtocolError {
     #[error("unsupported protocol version {received}; this implementation accepts {supported}")]
     UnsupportedVersion { received: u16, supported: u16 },
 
+    #[error("{message_type:?} is unavailable in protocol version {version}")]
+    MessageVersionMismatch {
+        message_type: MessageType,
+        version: u16,
+    },
+
     #[error("unknown message type {0}")]
     UnknownMessageType(u16),
 

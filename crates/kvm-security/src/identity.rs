@@ -38,10 +38,7 @@ impl fmt::Display for IdentityFingerprint {
 
 impl fmt::Debug for IdentityFingerprint {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter
-            .debug_tuple("IdentityFingerprint")
-            .field(&self.to_string())
-            .finish()
+        formatter.write_str("IdentityFingerprint([REDACTED])")
     }
 }
 
@@ -86,12 +83,23 @@ pub enum ParseFingerprintError {
 }
 
 /// Public metadata that identifies a peer and binds it to a long-term key.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Eq, PartialEq)]
 pub struct PeerIdentity {
     peer_id: PeerId,
     host_id: HostId,
     display_name: String,
     fingerprint: IdentityFingerprint,
+}
+
+impl fmt::Debug for PeerIdentity {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PeerIdentity")
+            .field("stable_ids", &"[REDACTED]")
+            .field("display_name", &"[REDACTED]")
+            .field("fingerprint", &"[REDACTED]")
+            .finish_non_exhaustive()
+    }
 }
 
 impl PeerIdentity {
@@ -228,5 +236,30 @@ mod tests {
         );
 
         assert_eq!(result, Err(IdentityError::EmptyDisplayName));
+    }
+
+    #[test]
+    fn identity_debug_redacts_stable_metadata_and_fingerprint() {
+        let fingerprint = IdentityFingerprint::from_sha256([0xab; 32]);
+        let identity = PeerIdentity::new(
+            PeerId::from_bytes([1; 16]),
+            HostId::from_bytes([2; 16]),
+            "SECRET-PEER-NAME",
+            fingerprint,
+        )
+        .unwrap();
+        let rendered = format!("{identity:?} {fingerprint:?}");
+        let fingerprint_marker = "ab".repeat(32);
+        let peer_marker = PeerId::from_bytes([1; 16]).to_string();
+        let host_marker = HostId::from_bytes([2; 16]).to_string();
+
+        for marker in [
+            "SECRET-PEER-NAME",
+            fingerprint_marker.as_str(),
+            peer_marker.as_str(),
+            host_marker.as_str(),
+        ] {
+            assert!(!rendered.contains(marker));
+        }
     }
 }

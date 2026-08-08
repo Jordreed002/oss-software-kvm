@@ -11,8 +11,10 @@ mod wire;
 
 pub use error::{ProtocolError, ValidationError};
 pub use frame::{
-    decode_frame, encode_frame, FrameHeader, FRAME_HEADER_LEN, FRAME_MAGIC, MAX_FRAME_PAYLOAD,
-    PROTOCOL_VERSION,
+    decode_frame, decode_frame_for_version, encode_frame, encode_frame_for_version,
+    is_supported_protocol_version, supports_release_proof, FrameHeader, CURRENT_PROTOCOL_VERSION,
+    FRAME_HEADER_LEN, FRAME_MAGIC, MAX_FRAME_PAYLOAD, MIN_SUPPORTED_PROTOCOL_VERSION,
+    PROTOCOL_VERSION, PROTOCOL_VERSION_V1, PROTOCOL_VERSION_V2, RELEASE_PROOF_PROTOCOL_VERSION,
 };
 pub use message::{MessageType, WireMessage};
 pub use wire::*;

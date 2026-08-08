@@ -46,16 +46,24 @@ fn run() -> DiagnosticResult {
 fn run_native(command: Command) -> DiagnosticResult {
     use kvm_windows::{probe_capabilities, WindowsDisplayBackend, WindowsInputBackend};
 
-    let host_id = diagnostic_host_id();
-    let mut input = WindowsInputBackend::new(host_id);
-    let display = WindowsDisplayBackend::new(host_id);
-
     match command {
         Command::Probe => print_windows_probe(&probe_capabilities()),
-        Command::Devices => print_devices(input.enumerate_devices()?),
-        Command::Displays => print_displays(display.enumerate_displays()?),
-        Command::Observe(options) => observe_windows(&mut input, options)?,
+        Command::Devices(options) => print_devices(
+            WindowsInputBackend::new(options.host_id.unwrap_or_else(diagnostic_host_id))
+                .enumerate_devices()?,
+        ),
+        Command::Displays(options) => print_displays(
+            WindowsDisplayBackend::new(options.host_id.unwrap_or_else(diagnostic_host_id))
+                .enumerate_displays()?,
+        ),
+        Command::Observe(options) => {
+            let mut input = WindowsInputBackend::new(diagnostic_host_id());
+            observe_windows(&mut input, options)?;
+        }
         Command::All(options) => {
+            let host_id = diagnostic_host_id();
+            let mut input = WindowsInputBackend::new(host_id);
+            let display = WindowsDisplayBackend::new(host_id);
             print_windows_probe(&probe_capabilities());
             print_devices(input.enumerate_devices()?);
             print_displays(display.enumerate_displays()?);
@@ -120,16 +128,24 @@ fn observe_windows(
 fn run_native(command: Command) -> DiagnosticResult {
     use kvm_macos::{probe_permissions, MacDisplayBackend, MacInputBackend};
 
-    let host_id = diagnostic_host_id();
-    let mut input = MacInputBackend::new(host_id);
-    let display = MacDisplayBackend::new(host_id);
-
     match command {
         Command::Probe => print_macos_probe(probe_permissions()?),
-        Command::Devices => print_devices(input.enumerate_devices()?),
-        Command::Displays => print_displays(display.enumerate_displays()?),
-        Command::Observe(options) => observe_macos(&mut input, options)?,
+        Command::Devices(options) => print_devices(
+            MacInputBackend::new(options.host_id.unwrap_or_else(diagnostic_host_id))
+                .enumerate_devices()?,
+        ),
+        Command::Displays(options) => print_displays(
+            MacDisplayBackend::new(options.host_id.unwrap_or_else(diagnostic_host_id))
+                .enumerate_displays()?,
+        ),
+        Command::Observe(options) => {
+            let mut input = MacInputBackend::new(diagnostic_host_id());
+            observe_macos(&mut input, options)?;
+        }
         Command::All(options) => {
+            let host_id = diagnostic_host_id();
+            let mut input = MacInputBackend::new(host_id);
+            let display = MacDisplayBackend::new(host_id);
             print_macos_probe(probe_permissions()?);
             print_devices(input.enumerate_devices()?);
             print_displays(display.enumerate_displays()?);

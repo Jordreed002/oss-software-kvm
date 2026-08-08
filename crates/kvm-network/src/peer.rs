@@ -1,14 +1,22 @@
 use crate::codec::FrameReadProgress;
+use crate::connection_role::{
+    ActiveConnection, ConnectionGeneration, ConnectionGenerationError, ConnectionGenerationGate,
+    ConnectionRole, ConnectionRoleError, PendingConnection,
+};
 use crate::{
     AuthenticatedConnector, DevelopmentAddress, FrameReader, FrameWriter, HeartbeatAction,
     HeartbeatConfig, HeartbeatController, NetworkError, OutboundQueue, QueueConfig,
     ReconnectBackoff, ReconnectPolicy, SecurePeerStream, TrafficClass, TransportPeerIdentity,
 };
-use kvm_protocol::{encode_frame, AuthenticateV1, HelloV1, MessageType, WireMessage};
+use kvm_protocol::{
+    decode_frame_for_version, encode_frame_for_version, AuthenticateV1, FrameHeader, HelloV1,
+    MessageType, WireMessage, CURRENT_PROTOCOL_VERSION, FRAME_HEADER_LEN,
+    MIN_SUPPORTED_PROTOCOL_VERSION, PROTOCOL_VERSION_V1,
+};
 use std::time::Duration;
 use subtle::ConstantTimeEq;
 use thiserror::Error;
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::{mpsc, watch};
 use tokio::time::{Instant, MissedTickBehavior};
 
@@ -33,16 +41,13 @@ pub struct AdmittedPeer {
     transport_identity: TransportPeerIdentity,
     local_hello: HelloV1,
     remote_hello: HelloV1,
+    selected_protocol_version: u16,
+    session_id: [u8; 32],
 }
 
 impl std::fmt::Debug for AdmittedPeer {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter
-            .debug_struct("AdmittedPeer")
-            .field("local_host_id", &self.local_hello.host_id)
-            .field("remote_host_id", &self.remote_hello.host_id)
-            .field("remote_peer_id", &self.remote_hello.peer_id)
-            .finish_non_exhaustive()
+        formatter.write_str("AdmittedPeer([REDACTED])")
     }
 }
 
@@ -58,6 +63,27 @@ impl AdmittedPeer {
     pub const fn local_hello(&self) -> &HelloV1 {
         &self.local_hello
     }
+
+    /// Exact framing version authenticated for this admitted connection.
+    #[must_use]
+    pub const fn selected_protocol_version(&self) -> u16 {
+        self.selected_protocol_version
+    }
+
+    /// Whether this exact admitted session can carry confirmed release proof.
+    #[must_use]
+    pub const fn supports_release_proof(&self) -> bool {
+        kvm_protocol::supports_release_proof(self.selected_protocol_version)
+    }
+
+    /// Opaque exporter-derived binding for this exact admitted transport.
+    ///
+    /// It may be retained with a cleanup obligation after this generation
+    /// closes, but is deliberately omitted from all debug output.
+    #[must_use]
+    pub const fn session_id(&self) -> [u8; 32] {
+        self.session_id
+    }
 }
 
 /// Exact immutable values covered by both authentication proof operations.
@@ -68,18 +94,13 @@ pub struct HandshakeTranscript {
     transport_identity: TransportPeerIdentity,
     local_exporter_proof: [u8; 32],
     remote_exporter_proof: [u8; 32],
+    selected_protocol_version: u16,
+    session_id: [u8; 32],
 }
 
 impl std::fmt::Debug for HandshakeTranscript {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter
-            .debug_struct("HandshakeTranscript")
-            .field("local_host_id", &self.local_hello.host_id)
-            .field("remote_host_id", &self.remote_hello.host_id)
-            .field("remote_peer_id", &self.remote_hello.peer_id)
-            .field("transport_identity", &self.transport_identity)
-            .field("exporter_proofs", &"[REDACTED]")
-            .finish_non_exhaustive()
+        formatter.write_str("HandshakeTranscript([REDACTED])")
     }
 }
 
@@ -94,6 +115,12 @@ impl HandshakeTranscript {
 
     pub const fn transport_identity(&self) -> &TransportPeerIdentity {
         &self.transport_identity
+    }
+
+    /// Highest mutually advertised protocol version bound into both proofs.
+    #[must_use]
+    pub const fn selected_protocol_version(&self) -> u16 {
+        self.selected_protocol_version
     }
 
     /// Returns the direction-bound proof this endpoint may send in its
@@ -182,30 +209,190 @@ impl std::fmt::Debug for PeerEvent {
             Self::StateChanged(state) => {
                 formatter.debug_tuple("StateChanged").field(state).finish()
             }
-            Self::Admitted(peer) => formatter
+            Self::Admitted(_) => formatter
                 .debug_struct("Admitted")
-                .field("host_id", &peer.remote_hello.host_id)
-                .field("peer_id", &peer.remote_hello.peer_id)
+                .field("peer", &"[REDACTED]")
                 .finish(),
-            Self::Message { peer, message } => formatter
+            Self::Message { message, .. } => formatter
                 .debug_struct("Message")
-                .field("peer_id", &peer.remote_hello.peer_id)
                 .field("message_type", &message.message_type())
-                .field("sequence", &message_sequence(message))
                 .finish_non_exhaustive(),
-            Self::Disconnected {
-                reason,
-                undelivered,
-            } => formatter
+            Self::Disconnected { reason, .. } => formatter
                 .debug_struct("Disconnected")
                 .field("reason", reason)
-                .field("undelivered", undelivered)
+                .field("undelivered", &"[REDACTED]")
                 .finish(),
             Self::ReconnectScheduled(delay) => formatter
                 .debug_tuple("ReconnectScheduled")
                 .field(delay)
                 .finish(),
         }
+    }
+}
+
+enum GenerationBoundPeerEventState {
+    Pending,
+    Admission(PendingConnection),
+    Active,
+    Cancelled(PendingConnection),
+}
+
+/// A network-minted event bound to one affine connection generation.
+///
+/// The private state prevents downstream code from attaching a cloned
+/// [`AdmittedPeer`] to a newer generation. Apply the event to its exact
+/// [`ConnectionGenerationGate`] before passing it to daemon coordination.
+pub struct GenerationBoundPeerEvent {
+    generation: ConnectionGeneration,
+    state: GenerationBoundPeerEventState,
+    event: Option<PeerEvent>,
+}
+
+impl std::fmt::Debug for GenerationBoundPeerEvent {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("GenerationBoundPeerEvent")
+            .field("classification", &self.classification())
+            .field("event", &self.event)
+            .finish_non_exhaustive()
+    }
+}
+
+/// Public, payload-free classification for a generation-bound event.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum GenerationBoundEventClassification {
+    PendingIgnored,
+    Activated,
+    Active,
+    Cancelled,
+}
+
+impl GenerationBoundPeerEvent {
+    #[must_use]
+    pub const fn generation(&self) -> ConnectionGeneration {
+        self.generation
+    }
+
+    #[must_use]
+    pub const fn classification(&self) -> GenerationBoundEventClassification {
+        match self.state {
+            GenerationBoundPeerEventState::Pending => {
+                GenerationBoundEventClassification::PendingIgnored
+            }
+            GenerationBoundPeerEventState::Admission(_) => {
+                GenerationBoundEventClassification::Activated
+            }
+            GenerationBoundPeerEventState::Active => GenerationBoundEventClassification::Active,
+            GenerationBoundPeerEventState::Cancelled(_) => {
+                GenerationBoundEventClassification::Cancelled
+            }
+        }
+    }
+
+    /// Applies the embedded affine capability to the exact generation gate.
+    ///
+    /// # Errors
+    ///
+    /// Returns a stale/duplicate generation error if this event did not come
+    /// from the gate supplied by the caller.
+    pub fn apply(
+        self,
+        gate: &mut ConnectionGenerationGate,
+    ) -> Result<AppliedGenerationEvent, ConnectionGenerationError> {
+        let Self {
+            generation,
+            state,
+            event,
+        } = self;
+        let state = match state {
+            GenerationBoundPeerEventState::Pending => AppliedGenerationEventState::PendingIgnored,
+            GenerationBoundPeerEventState::Admission(pending) => {
+                AppliedGenerationEventState::Activated(gate.activate(pending)?)
+            }
+            GenerationBoundPeerEventState::Active => {
+                gate.validate_active_generation(generation)?;
+                AppliedGenerationEventState::Active
+            }
+            GenerationBoundPeerEventState::Cancelled(pending) => {
+                gate.cancel_pending(pending)?;
+                AppliedGenerationEventState::Cancelled
+            }
+        };
+        Ok(AppliedGenerationEvent {
+            generation,
+            state,
+            event,
+        })
+    }
+}
+
+enum AppliedGenerationEventState {
+    PendingIgnored,
+    Activated(ActiveConnection),
+    Active,
+    Cancelled,
+}
+
+/// Successfully gate-validated event accepted by daemon supervision.
+///
+/// Construction is private; callers cannot re-tag an event or admitted peer.
+pub struct AppliedGenerationEvent {
+    generation: ConnectionGeneration,
+    state: AppliedGenerationEventState,
+    event: Option<PeerEvent>,
+}
+
+impl AppliedGenerationEvent {
+    #[must_use]
+    pub const fn generation(&self) -> ConnectionGeneration {
+        self.generation
+    }
+
+    #[must_use]
+    pub const fn classification(&self) -> GenerationBoundEventClassification {
+        match self.state {
+            AppliedGenerationEventState::PendingIgnored => {
+                GenerationBoundEventClassification::PendingIgnored
+            }
+            AppliedGenerationEventState::Activated(_) => {
+                GenerationBoundEventClassification::Activated
+            }
+            AppliedGenerationEventState::Active => GenerationBoundEventClassification::Active,
+            AppliedGenerationEventState::Cancelled => GenerationBoundEventClassification::Cancelled,
+        }
+    }
+
+    #[must_use]
+    pub const fn event(&self) -> Option<&PeerEvent> {
+        self.event.as_ref()
+    }
+
+    /// Consumes an activation event and returns the affine active token and
+    /// the actual network-minted admitted event.
+    pub fn into_activation(self) -> Option<(ActiveConnection, PeerEvent)> {
+        match (self.state, self.event) {
+            (AppliedGenerationEventState::Activated(active), Some(event)) => Some((active, event)),
+            _ => None,
+        }
+    }
+
+    /// Consumes a non-activation event after its classification was checked.
+    #[must_use]
+    pub fn into_event(self) -> Option<PeerEvent> {
+        match self.state {
+            AppliedGenerationEventState::Activated(_) => None,
+            _ => self.event,
+        }
+    }
+}
+
+impl std::fmt::Debug for AppliedGenerationEvent {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("AppliedGenerationEvent")
+            .field("classification", &self.classification())
+            .field("event", &self.event)
+            .finish_non_exhaustive()
     }
 }
 
@@ -226,7 +413,7 @@ pub enum DisconnectReason {
     QueueFull(TrafficClass),
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Eq, PartialEq)]
 pub struct UndeliveredMessage {
     pub message_type: MessageType,
     pub traffic_class: TrafficClass,
@@ -234,13 +421,38 @@ pub struct UndeliveredMessage {
     pub partially_sent: bool,
 }
 
+impl std::fmt::Debug for UndeliveredMessage {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("UndeliveredMessage")
+            .field("message_type", &self.message_type)
+            .field("traffic_class", &self.traffic_class)
+            .field("partially_sent", &self.partially_sent)
+            .finish_non_exhaustive()
+    }
+}
+
 /// Redacted traffic inventory that the daemon must reconcile after a failed
 /// session. Messages are deliberately not replayed on a new connection.
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Default, Eq, PartialEq)]
 pub struct UndeliveredTraffic {
     pub messages: Vec<UndeliveredMessage>,
     pub partial_inbound_bytes: usize,
     pub requires_input_reconciliation: bool,
+}
+
+impl std::fmt::Debug for UndeliveredTraffic {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("UndeliveredTraffic")
+            .field("message_count", &self.messages.len())
+            .field("has_partial_inbound", &(self.partial_inbound_bytes > 0))
+            .field(
+                "requires_input_reconciliation",
+                &self.requires_input_reconciliation,
+            )
+            .finish()
+    }
 }
 
 impl UndeliveredTraffic {
@@ -380,7 +592,6 @@ impl std::fmt::Debug for OutboundSendError {
             .debug_struct("OutboundSendError")
             .field("state", &state)
             .field("message_type", &message.message_type())
-            .field("sequence", &message_sequence(message))
             .finish_non_exhaustive()
     }
 }
@@ -405,7 +616,7 @@ pub enum PersistentExit {
     OutboundClosed,
 }
 
-#[derive(Debug, Error)]
+#[derive(Error)]
 pub enum SessionError {
     #[error(transparent)]
     Network(#[from] NetworkError),
@@ -417,13 +628,19 @@ pub enum SessionError {
     LocalIdentityMismatch,
     #[error("local and remote peer identities must be distinct")]
     PeerIdentityCollision,
+    #[error("connection direction is not canonical for this peer pair")]
+    NoncanonicalDirection,
+    #[error("peers did not advertise a compatible protocol version")]
+    NoCompatibleProtocolVersion,
+    #[error("authenticated transport produced an invalid session binding")]
+    InvalidSessionBinding,
     #[error("received {0:?} before peer admission")]
     PreAdmissionMessage(MessageType),
     #[error("received repeated handshake message {0:?} after admission")]
     RepeatedHandshake(MessageType),
     #[error("received {0:?} with an invalid sender or destination identity")]
     MessageIdentityMismatch(MessageType),
-    #[error("heartbeat validation failed: {0}")]
+    #[error("heartbeat validation failed")]
     Heartbeat(String),
     #[error("peer heartbeat timed out")]
     HeartbeatTimeout,
@@ -439,6 +656,32 @@ pub enum SessionError {
     EventChannelFull,
     #[error("peer event consumer has closed")]
     EventChannelClosed,
+}
+
+impl std::fmt::Debug for SessionError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let category = match self {
+            Self::Network(_) => "Network",
+            Self::Admission(_) => "Admission",
+            Self::TransportIdentityMismatch => "TransportIdentityMismatch",
+            Self::LocalIdentityMismatch => "LocalIdentityMismatch",
+            Self::PeerIdentityCollision => "PeerIdentityCollision",
+            Self::NoncanonicalDirection => "NoncanonicalDirection",
+            Self::NoCompatibleProtocolVersion => "NoCompatibleProtocolVersion",
+            Self::InvalidSessionBinding => "InvalidSessionBinding",
+            Self::PreAdmissionMessage(_) => "PreAdmissionMessage",
+            Self::RepeatedHandshake(_) => "RepeatedHandshake",
+            Self::MessageIdentityMismatch(_) => "MessageIdentityMismatch",
+            Self::Heartbeat(_) => "Heartbeat",
+            Self::HeartbeatTimeout => "HeartbeatTimeout",
+            Self::AdmissionTimeout => "AdmissionTimeout",
+            Self::QueueFull { .. } => "QueueFull",
+            Self::EventChannelFull => "EventChannelFull",
+            Self::EventChannelClosed => "EventChannelClosed",
+        };
+        formatter.write_str("SessionError::")?;
+        formatter.write_str(category)
+    }
 }
 
 #[derive(Debug)]
@@ -465,15 +708,559 @@ struct PendingFrame {
     metadata: UndeliveredMessage,
 }
 
+/// One-shot direction-neutral owner for an already established secure stream.
+///
+/// This is the accepted-session entry point. It creates fresh bounded channels
+/// for exactly one connection generation, performs exporter-bound admission,
+/// and never carries queued or partially written traffic into another stream.
+pub struct SecurePeerSession<A> {
+    admission: A,
+    config: PersistentPeerConfig,
+    outbound: mpsc::Receiver<WireMessage>,
+    events: mpsc::Sender<PeerEvent>,
+}
+
+/// One-shot session whose events are cryptographically and affinely bound to
+/// a pending connection generation.
+pub struct GenerationBoundPeerSession<A> {
+    admission: A,
+    config: PersistentPeerConfig,
+    outbound: mpsc::Receiver<WireMessage>,
+    internal_events: mpsc::Sender<PeerEvent>,
+    internal_event_receiver: mpsc::Receiver<PeerEvent>,
+    bound_events: mpsc::Sender<GenerationBoundPeerEvent>,
+    pending: PendingConnection,
+}
+
+impl<A> std::fmt::Debug for GenerationBoundPeerSession<A> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("GenerationBoundPeerSession")
+            .field("config", &self.config)
+            .field("generation", &self.pending.generation())
+            .field("admission", &"[REDACTED]")
+            .finish_non_exhaustive()
+    }
+}
+
+/// Terminal failure from a generation-bound session.
+///
+/// If terminal delivery encountered local backpressure, the unsent opaque
+/// cancellation or active-disconnection event is returned here so the owner
+/// can still reconcile the exact gate capability.
+pub struct GenerationBoundSessionError {
+    error: SessionError,
+    terminal_event: Option<Box<GenerationBoundPeerEvent>>,
+}
+
+impl GenerationBoundSessionError {
+    #[must_use]
+    pub const fn error(&self) -> &SessionError {
+        &self.error
+    }
+
+    #[must_use]
+    pub fn into_terminal_event(self) -> Option<GenerationBoundPeerEvent> {
+        self.terminal_event.map(|event| *event)
+    }
+}
+
+impl std::fmt::Debug for GenerationBoundSessionError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("GenerationBoundSessionError")
+            .field("error", &self.error)
+            .field("has_terminal_event", &self.terminal_event.is_some())
+            .finish()
+    }
+}
+
+impl std::fmt::Display for GenerationBoundSessionError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.error.fmt(formatter)
+    }
+}
+
+impl std::error::Error for GenerationBoundSessionError {}
+
+/// Recoverable construction failure for a generation-bound session.
+pub struct GenerationBoundSessionBuildError {
+    error: PeerConfigError,
+    cancellation: Box<GenerationBoundPeerEvent>,
+}
+
+impl GenerationBoundSessionBuildError {
+    #[must_use]
+    pub const fn error(&self) -> PeerConfigError {
+        self.error
+    }
+
+    #[must_use]
+    pub fn into_cancellation(self) -> GenerationBoundPeerEvent {
+        *self.cancellation
+    }
+}
+
+impl std::fmt::Debug for GenerationBoundSessionBuildError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("GenerationBoundSessionBuildError")
+            .field("error", &self.error)
+            .field("generation", &self.cancellation.generation())
+            .finish_non_exhaustive()
+    }
+}
+
+impl std::fmt::Display for GenerationBoundSessionBuildError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.error.fmt(formatter)
+    }
+}
+
+impl std::error::Error for GenerationBoundSessionBuildError {}
+
+impl<A> std::fmt::Debug for SecurePeerSession<A> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("SecurePeerSession")
+            .field("config", &self.config)
+            .field("admission", &"[REDACTED]")
+            .finish_non_exhaustive()
+    }
+}
+
+impl<A: SessionAdmission> SecurePeerSession<A> {
+    /// Creates a one-shot secure session plus its bounded outbound and event
+    /// channels.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for any invalid bound or timing relationship.
+    pub fn new(
+        admission: A,
+        config: PersistentPeerConfig,
+    ) -> Result<(Self, PeerSender, mpsc::Receiver<PeerEvent>), PeerConfigError> {
+        config.validate()?;
+        let (outbound_sender, outbound) = mpsc::channel(config.outbound_channel_capacity);
+        let (events, event_receiver) = mpsc::channel(config.event_channel_capacity);
+        Ok((
+            Self {
+                admission,
+                config,
+                outbound,
+                events,
+            },
+            PeerSender {
+                sender: outbound_sender,
+            },
+            event_receiver,
+        ))
+    }
+
+    /// Runs exporter-bound admission and application transport over one sealed
+    /// inbound or outbound stream.
+    ///
+    /// On connection failure this method emits the same redacted disconnected
+    /// inventory as [`PersistentPeer`], drains this generation's outbound
+    /// channel, and returns without reconnecting.
+    ///
+    /// # Errors
+    ///
+    /// Returns the session failure or an event-channel backpressure failure.
+    pub async fn run<S: SecurePeerStream>(
+        mut self,
+        stream: S,
+        mut shutdown: watch::Receiver<bool>,
+    ) -> Result<SessionEnd, SessionError> {
+        match run_session(
+            stream,
+            &self.admission,
+            self.config,
+            &mut self.outbound,
+            &self.events,
+            &mut shutdown,
+        )
+        .await
+        {
+            Ok(end) => Ok(end),
+            Err(failure) => {
+                if matches!(
+                    failure.error,
+                    SessionError::EventChannelFull | SessionError::EventChannelClosed
+                ) {
+                    return Err(failure.error);
+                }
+                let SessionFailure {
+                    error,
+                    mut undelivered,
+                    ..
+                } = failure;
+                drain_outbound(&mut self.outbound, &mut undelivered);
+                let reason = disconnect_reason(&error);
+                send_event(
+                    &self.events,
+                    PeerEvent::StateChanged(ConnectionState::Disconnected),
+                )?;
+                send_event(
+                    &self.events,
+                    PeerEvent::Disconnected {
+                        reason,
+                        undelivered,
+                    },
+                )?;
+                Err(error)
+            }
+        }
+    }
+}
+
+impl<A: SessionAdmission> GenerationBoundPeerSession<A> {
+    /// Creates a one-shot session and consumes the exact pending generation
+    /// capability that will be attached to its admission or cancellation.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for invalid resource or timing bounds.
+    pub fn new(
+        admission: A,
+        config: PersistentPeerConfig,
+        pending: PendingConnection,
+    ) -> Result<
+        (Self, PeerSender, mpsc::Receiver<GenerationBoundPeerEvent>),
+        GenerationBoundSessionBuildError,
+    > {
+        if let Err(error) = config.validate() {
+            let generation = pending.generation();
+            return Err(GenerationBoundSessionBuildError {
+                error,
+                cancellation: Box::new(cancelled_event(generation, pending)),
+            });
+        }
+        let (outbound_sender, outbound) = mpsc::channel(config.outbound_channel_capacity);
+        let (internal_events, internal_event_receiver) =
+            mpsc::channel(config.event_channel_capacity.max(4));
+        let (bound_events, bound_event_receiver) = mpsc::channel(config.event_channel_capacity);
+        Ok((
+            Self {
+                admission,
+                config,
+                outbound,
+                internal_events,
+                internal_event_receiver,
+                bound_events,
+                pending,
+            },
+            PeerSender {
+                sender: outbound_sender,
+            },
+            bound_event_receiver,
+        ))
+    }
+
+    /// Runs exactly one sealed stream and emits only network-minted,
+    /// generation-bound events.
+    ///
+    /// # Errors
+    ///
+    /// Returns the underlying session error. Before admission, an unsent
+    /// terminal capability is retained in the error if event delivery is
+    /// locally unavailable. Every admitted normal end also emits an active
+    /// disconnection event before this method returns.
+    // This is intentionally one linear state machine: splitting the admission
+    // token relay from session termination makes capability loss easier.
+    #[allow(clippy::too_many_lines)]
+    pub async fn run<S: SecurePeerStream>(
+        self,
+        stream: S,
+        mut shutdown: watch::Receiver<bool>,
+    ) -> Result<SessionEnd, GenerationBoundSessionError> {
+        let Self {
+            admission,
+            config,
+            mut outbound,
+            internal_events,
+            mut internal_event_receiver,
+            bound_events,
+            pending,
+        } = self;
+        let generation = pending.generation();
+        let mut pending = Some(pending);
+        let mut admitted = false;
+        let result = {
+            let session = run_session(
+                stream,
+                &admission,
+                config,
+                &mut outbound,
+                &internal_events,
+                &mut shutdown,
+            );
+            tokio::pin!(session);
+
+            loop {
+                tokio::select! {
+                    biased;
+                    result = &mut session => break result,
+                    event = internal_event_receiver.recv() => {
+                        if let Some(event) = event {
+                            let bound = bind_generation_event(
+                                generation,
+                                event,
+                                &mut pending,
+                                &mut admitted,
+                            ).map_err(|error| GenerationBoundSessionError {
+                                error,
+                                terminal_event: pending
+                                    .take()
+                                    .map(|value| Box::new(cancelled_event(generation, value))),
+                            })?;
+                            if let Some(bound) = bound {
+                                if let Err(error) = try_send_bound_event(&bound_events, bound) {
+                                    reclaim_pending_event(error, &mut pending, &mut admitted);
+                                    return Err(bound_session_delivery_error(pending, generation, admitted));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        };
+
+        while let Ok(event) = internal_event_receiver.try_recv() {
+            let bound = bind_generation_event(generation, event, &mut pending, &mut admitted)
+                .map_err(|error| GenerationBoundSessionError {
+                    error,
+                    terminal_event: pending
+                        .take()
+                        .map(|value| Box::new(cancelled_event(generation, value))),
+                })?;
+            if let Some(bound) = bound {
+                if let Err(error) = try_send_bound_event(&bound_events, bound) {
+                    reclaim_pending_event(error, &mut pending, &mut admitted);
+                    return Err(bound_session_delivery_error(pending, generation, admitted));
+                }
+            }
+        }
+
+        match result {
+            Ok(end) => {
+                if let Some(pending) = pending {
+                    let cancellation = cancelled_event(generation, pending);
+                    if let Err(cancellation) = try_send_bound_event(&bound_events, cancellation) {
+                        return Err(GenerationBoundSessionError {
+                            error: SessionError::EventChannelFull,
+                            terminal_event: Some(cancellation),
+                        });
+                    }
+                } else if admitted {
+                    let terminal = active_termination_event(generation);
+                    if let Err(terminal) = try_send_bound_event(&bound_events, terminal) {
+                        return Err(GenerationBoundSessionError {
+                            error: SessionError::EventChannelFull,
+                            terminal_event: Some(terminal),
+                        });
+                    }
+                }
+                Ok(end)
+            }
+            Err(failure) => {
+                let SessionFailure {
+                    error,
+                    mut undelivered,
+                    ..
+                } = failure;
+                drain_outbound(&mut outbound, &mut undelivered);
+                if matches!(
+                    error,
+                    SessionError::EventChannelFull | SessionError::EventChannelClosed
+                ) {
+                    return Err(GenerationBoundSessionError {
+                        error,
+                        terminal_event: pending
+                            .map(|value| Box::new(cancelled_event(generation, value)))
+                            .or_else(|| {
+                                admitted.then(|| Box::new(active_termination_event(generation)))
+                            }),
+                    });
+                }
+
+                if admitted {
+                    let state = GenerationBoundPeerEvent {
+                        generation,
+                        state: GenerationBoundPeerEventState::Active,
+                        event: Some(PeerEvent::StateChanged(ConnectionState::Disconnected)),
+                    };
+                    if let Err(terminal) = try_send_bound_event(&bound_events, state) {
+                        return Err(GenerationBoundSessionError {
+                            error: SessionError::EventChannelFull,
+                            terminal_event: recover_terminal_event(terminal, generation, true),
+                        });
+                    }
+                }
+
+                let event = PeerEvent::Disconnected {
+                    reason: disconnect_reason(&error),
+                    undelivered,
+                };
+                let bound =
+                    bind_terminal_generation_event(generation, event, &mut pending, admitted)?;
+                if let Err(terminal) = try_send_bound_event(&bound_events, bound) {
+                    return Err(GenerationBoundSessionError {
+                        error: SessionError::EventChannelFull,
+                        terminal_event: recover_terminal_event(terminal, generation, admitted),
+                    });
+                }
+                Err(GenerationBoundSessionError {
+                    error,
+                    terminal_event: None,
+                })
+            }
+        }
+    }
+}
+
+fn bind_generation_event(
+    generation: ConnectionGeneration,
+    event: PeerEvent,
+    pending: &mut Option<PendingConnection>,
+    admitted: &mut bool,
+) -> Result<Option<GenerationBoundPeerEvent>, SessionError> {
+    let state = if matches!(event, PeerEvent::Admitted(_)) && !*admitted {
+        *admitted = true;
+        let capability = pending.take().ok_or(SessionError::EventChannelClosed)?;
+        GenerationBoundPeerEventState::Admission(capability)
+    } else if *admitted {
+        GenerationBoundPeerEventState::Active
+    } else {
+        // Pre-admission lifecycle state is deliberately suppressed. It cannot
+        // reach the coordinator and this reserves external queue capacity for
+        // the actual admission capability or terminal cancellation.
+        return Ok(None);
+    };
+    Ok(Some(GenerationBoundPeerEvent {
+        generation,
+        state,
+        event: Some(event),
+    }))
+}
+
+fn bind_terminal_generation_event(
+    generation: ConnectionGeneration,
+    event: PeerEvent,
+    pending: &mut Option<PendingConnection>,
+    admitted: bool,
+) -> Result<GenerationBoundPeerEvent, GenerationBoundSessionError> {
+    let state = if admitted {
+        GenerationBoundPeerEventState::Active
+    } else if matches!(event, PeerEvent::Disconnected { .. }) {
+        let capability = pending.take().ok_or(GenerationBoundSessionError {
+            error: SessionError::EventChannelClosed,
+            terminal_event: None,
+        })?;
+        GenerationBoundPeerEventState::Cancelled(capability)
+    } else {
+        GenerationBoundPeerEventState::Pending
+    };
+    Ok(GenerationBoundPeerEvent {
+        generation,
+        state,
+        event: Some(event),
+    })
+}
+
+fn try_send_bound_event(
+    sender: &mpsc::Sender<GenerationBoundPeerEvent>,
+    event: GenerationBoundPeerEvent,
+) -> Result<(), Box<GenerationBoundPeerEvent>> {
+    sender.try_send(event).map_err(|error| match error {
+        mpsc::error::TrySendError::Full(event) | mpsc::error::TrySendError::Closed(event) => {
+            Box::new(event)
+        }
+    })
+}
+
+fn reclaim_pending_event(
+    event: Box<GenerationBoundPeerEvent>,
+    pending: &mut Option<PendingConnection>,
+    admitted: &mut bool,
+) {
+    if let GenerationBoundPeerEventState::Admission(capability)
+    | GenerationBoundPeerEventState::Cancelled(capability) = event.state
+    {
+        *pending = Some(capability);
+        *admitted = false;
+    }
+}
+
+fn recover_terminal_event(
+    event: Box<GenerationBoundPeerEvent>,
+    generation: ConnectionGeneration,
+    admitted: bool,
+) -> Option<Box<GenerationBoundPeerEvent>> {
+    match event.state {
+        GenerationBoundPeerEventState::Cancelled(pending)
+        | GenerationBoundPeerEventState::Admission(pending) => {
+            Some(Box::new(GenerationBoundPeerEvent {
+                generation,
+                state: GenerationBoundPeerEventState::Cancelled(pending),
+                event: None,
+            }))
+        }
+        GenerationBoundPeerEventState::Active if admitted => {
+            Some(Box::new(active_termination_event(generation)))
+        }
+        GenerationBoundPeerEventState::Pending | GenerationBoundPeerEventState::Active => None,
+    }
+}
+
+fn bound_session_delivery_error(
+    pending: Option<PendingConnection>,
+    generation: ConnectionGeneration,
+    admitted: bool,
+) -> GenerationBoundSessionError {
+    GenerationBoundSessionError {
+        error: SessionError::EventChannelFull,
+        terminal_event: pending
+            .map(|value| Box::new(cancelled_event(generation, value)))
+            .or_else(|| admitted.then(|| Box::new(active_termination_event(generation)))),
+    }
+}
+
+fn cancelled_event(
+    generation: ConnectionGeneration,
+    pending: PendingConnection,
+) -> GenerationBoundPeerEvent {
+    GenerationBoundPeerEvent {
+        generation,
+        state: GenerationBoundPeerEventState::Cancelled(pending),
+        event: None,
+    }
+}
+
+fn active_termination_event(generation: ConnectionGeneration) -> GenerationBoundPeerEvent {
+    GenerationBoundPeerEvent {
+        generation,
+        state: GenerationBoundPeerEventState::Active,
+        event: Some(PeerEvent::Disconnected {
+            reason: DisconnectReason::TransportIo(std::io::ErrorKind::Other),
+            undelivered: UndeliveredTraffic {
+                requires_input_reconciliation: true,
+                ..UndeliveredTraffic::default()
+            },
+        }),
+    }
+}
+
 enum FrameWriteProgress {
     Bytes(usize),
     Flushed,
 }
 
 impl PendingFrame {
-    fn encode(message: &WireMessage) -> Result<Self, SessionError> {
+    fn encode(message: &WireMessage, selected_protocol_version: u16) -> Result<Self, SessionError> {
         Ok(Self {
-            bytes: encode_frame(message).map_err(NetworkError::from)?,
+            bytes: encode_frame_for_version(message, selected_protocol_version)
+                .map_err(NetworkError::from)?,
             committed: 0,
             metadata: undelivered_metadata(message, false),
         })
@@ -676,6 +1463,7 @@ async fn run_session<S: SecurePeerStream, A: SessionAdmission>(
     heartbeat_tick.tick().await;
     let mut queue = OutboundQueue::new(config.queue);
     let mut pending = None;
+    let selected_protocol_version = admitted.selected_protocol_version();
     let mut read_progress = FrameReadProgress::default();
     let mut outbound_open = true;
     let mut reset_backoff = false;
@@ -689,7 +1477,7 @@ async fn run_session<S: SecurePeerStream, A: SessionAdmission>(
             pending = queue
                 .pop_next()
                 .as_ref()
-                .map(PendingFrame::encode)
+                .map(|message| PendingFrame::encode(message, selected_protocol_version))
                 .transpose()?;
         }
         if !outbound_open && pending.is_none() && queue.is_empty() {
@@ -797,6 +1585,7 @@ fn collect_session_failure(
     }
 }
 
+#[allow(clippy::too_many_lines)]
 async fn perform_admission<S: SecurePeerStream, A: SessionAdmission>(
     mut stream: S,
     admission: &A,
@@ -810,17 +1599,26 @@ async fn perform_admission<S: SecurePeerStream, A: SessionAdmission>(
     )>,
     SessionError,
 > {
+    let transport_identity = stream.authenticated_peer_identity().clone();
+    let direction = stream.connection_direction();
+    let local_hello = admission.local_hello()?;
+    let role = ConnectionRole::for_peers(local_hello.peer_id, transport_identity.peer_id).map_err(
+        |error| match error {
+            ConnectionRoleError::IdentityCollision => SessionError::PeerIdentityCollision,
+            ConnectionRoleError::NoncanonicalDirection => SessionError::NoncanonicalDirection,
+        },
+    )?;
+    role.validate(direction)
+        .map_err(|_| SessionError::NoncanonicalDirection)?;
     send_event(
         events,
         PeerEvent::StateChanged(ConnectionState::Authenticating),
     )?;
-    let transport_identity = stream.authenticated_peer_identity().clone();
-    let local_hello = admission.local_hello()?;
     {
-        let mut writer = FrameWriter::new_authenticated(&mut stream);
-        if !write_or_shutdown(
-            &mut writer,
+        if !write_or_shutdown_for_version(
+            &mut stream,
             &WireMessage::Hello(local_hello.clone()),
+            PROTOCOL_VERSION_V1,
             shutdown,
         )
         .await?
@@ -829,8 +1627,9 @@ async fn perform_admission<S: SecurePeerStream, A: SessionAdmission>(
         }
     }
     let first_message = {
-        let mut reader = FrameReader::new_authenticated(&mut stream);
-        let Some(message) = read_or_shutdown(&mut reader, shutdown).await? else {
+        let Some(message) =
+            read_or_shutdown_for_version(&mut stream, PROTOCOL_VERSION_V1, shutdown).await?
+        else {
             return Ok(None);
         };
         message
@@ -844,21 +1643,23 @@ async fn perform_admission<S: SecurePeerStream, A: SessionAdmission>(
     {
         return Err(SessionError::TransportIdentityMismatch);
     }
+    let selected_protocol_version = negotiate_protocol_version(&local_hello, &remote_hello)?;
     let transcript = build_handshake_transcript(
         &stream,
         local_hello.clone(),
         remote_hello,
         transport_identity,
+        selected_protocol_version,
     )?;
     let local_auth = admission.authentication_message(&transcript)?;
     if local_auth.peer_id != local_hello.peer_id {
         return Err(SessionError::LocalIdentityMismatch);
     }
     {
-        let mut writer = FrameWriter::new_authenticated(&mut stream);
-        if !write_or_shutdown(
-            &mut writer,
+        if !write_or_shutdown_for_version(
+            &mut stream,
             &WireMessage::Authenticate(local_auth),
+            selected_protocol_version,
             shutdown,
         )
         .await?
@@ -867,8 +1668,9 @@ async fn perform_admission<S: SecurePeerStream, A: SessionAdmission>(
         }
     }
     let second_message = {
-        let mut reader = FrameReader::new_authenticated(&mut stream);
-        let Some(message) = read_or_shutdown(&mut reader, shutdown).await? else {
+        let Some(message) =
+            read_or_shutdown_for_version(&mut stream, selected_protocol_version, shutdown).await?
+        else {
             return Ok(None);
         };
         message
@@ -886,37 +1688,58 @@ async fn perform_admission<S: SecurePeerStream, A: SessionAdmission>(
         transport_identity: transcript.transport_identity,
         local_hello: transcript.local_hello,
         remote_hello: transcript.remote_hello,
+        selected_protocol_version: transcript.selected_protocol_version,
+        session_id: transcript.session_id,
     };
     send_event(events, PeerEvent::Admitted(admitted.clone()))?;
     send_event(events, PeerEvent::StateChanged(ConnectionState::Connected))?;
     let (read, write) = tokio::io::split(stream);
-    let reader = FrameReader::new_authenticated(read);
+    let reader = FrameReader::new_authenticated_for_version(read, selected_protocol_version);
     let writer = FrameWriter::new_authenticated(write);
     Ok(Some((reader, writer, admitted)))
 }
 
 const AUTHENTICATION_EXPORTER_LABEL: &[u8] = b"EXPORTER-software-kvm-session-auth-v1";
 const AUTHENTICATION_CONTEXT_DOMAIN: &[u8] = b"software-kvm/session-auth-context/v1";
+const SESSION_ID_EXPORTER_LABEL: &[u8] = b"EXPORTER-software-kvm-session-id-v1";
+const SESSION_ID_CONTEXT_DOMAIN: &[u8] = b"software-kvm/session-id-context/v1";
 
 fn build_handshake_transcript<S: SecurePeerStream>(
     stream: &S,
     local_hello: HelloV1,
     remote_hello: HelloV1,
     transport_identity: TransportPeerIdentity,
+    selected_protocol_version: u16,
 ) -> Result<HandshakeTranscript, SessionError> {
     if remote_hello.peer_id == local_hello.peer_id {
         return Err(SessionError::PeerIdentityCollision);
     }
-    let local_context =
-        authentication_exporter_context(&local_hello, &remote_hello, local_hello.peer_id)?;
-    let remote_context =
-        authentication_exporter_context(&local_hello, &remote_hello, remote_hello.peer_id)?;
+    let local_context = authentication_exporter_context(
+        &local_hello,
+        &remote_hello,
+        local_hello.peer_id,
+        selected_protocol_version,
+    )?;
+    let remote_context = authentication_exporter_context(
+        &local_hello,
+        &remote_hello,
+        remote_hello.peer_id,
+        selected_protocol_version,
+    )?;
     let local_exporter_proof = stream
         .export_keying_material(AUTHENTICATION_EXPORTER_LABEL, &local_context)
         .map_err(NetworkError::from)?;
     let remote_exporter_proof = stream
         .export_keying_material(AUTHENTICATION_EXPORTER_LABEL, &remote_context)
         .map_err(NetworkError::from)?;
+    let session_context =
+        session_exporter_context(&local_hello, &remote_hello, selected_protocol_version)?;
+    let session_id = stream
+        .export_keying_material(SESSION_ID_EXPORTER_LABEL, &session_context)
+        .map_err(NetworkError::from)?;
+    if bool::from(session_id.ct_eq(&[0; 32])) {
+        return Err(SessionError::InvalidSessionBinding);
+    }
 
     Ok(HandshakeTranscript {
         local_hello,
@@ -924,21 +1747,47 @@ fn build_handshake_transcript<S: SecurePeerStream>(
         transport_identity,
         local_exporter_proof,
         remote_exporter_proof,
+        selected_protocol_version,
+        session_id,
     })
+}
+
+fn negotiate_protocol_version(
+    local_hello: &HelloV1,
+    remote_hello: &HelloV1,
+) -> Result<u16, SessionError> {
+    let minimum = local_hello
+        .minimum_protocol_version
+        .max(remote_hello.minimum_protocol_version)
+        .max(MIN_SUPPORTED_PROTOCOL_VERSION);
+    let maximum = local_hello
+        .maximum_protocol_version
+        .min(remote_hello.maximum_protocol_version)
+        .min(CURRENT_PROTOCOL_VERSION);
+    (minimum <= maximum)
+        .then_some(maximum)
+        .ok_or(SessionError::NoCompatibleProtocolVersion)
 }
 
 fn authentication_exporter_context(
     local_hello: &HelloV1,
     remote_hello: &HelloV1,
     sender: kvm_protocol::WirePeerId,
+    selected_protocol_version: u16,
 ) -> Result<Vec<u8>, SessionError> {
     if local_hello.peer_id == remote_hello.peer_id {
         return Err(SessionError::PeerIdentityCollision);
     }
-    let local_frame =
-        encode_frame(&WireMessage::Hello(local_hello.clone())).map_err(NetworkError::from)?;
-    let remote_frame =
-        encode_frame(&WireMessage::Hello(remote_hello.clone())).map_err(NetworkError::from)?;
+    let local_frame = encode_frame_for_version(
+        &WireMessage::Hello(local_hello.clone()),
+        PROTOCOL_VERSION_V1,
+    )
+    .map_err(NetworkError::from)?;
+    let remote_frame = encode_frame_for_version(
+        &WireMessage::Hello(remote_hello.clone()),
+        PROTOCOL_VERSION_V1,
+    )
+    .map_err(NetworkError::from)?;
     let mut hellos = [
         (local_hello.peer_id, local_frame),
         (remote_hello.peer_id, remote_frame),
@@ -956,8 +1805,55 @@ fn authentication_exporter_context(
                 .sum::<usize>(),
     );
     context.extend_from_slice(AUTHENTICATION_CONTEXT_DOMAIN);
-    context.extend_from_slice(&kvm_protocol::PROTOCOL_VERSION.to_be_bytes());
+    context.extend_from_slice(&selected_protocol_version.to_be_bytes());
     context.push(sender_role);
+    for (_, frame) in hellos {
+        let length = u32::try_from(frame.len()).map_err(|_| {
+            NetworkError::from(kvm_protocol::ProtocolError::PayloadTooLarge {
+                length: frame.len(),
+                maximum: kvm_protocol::MAX_FRAME_PAYLOAD,
+            })
+        })?;
+        context.extend_from_slice(&length.to_be_bytes());
+        context.extend_from_slice(&frame);
+    }
+    Ok(context)
+}
+
+fn session_exporter_context(
+    local_hello: &HelloV1,
+    remote_hello: &HelloV1,
+    selected_protocol_version: u16,
+) -> Result<Vec<u8>, SessionError> {
+    if local_hello.peer_id == remote_hello.peer_id {
+        return Err(SessionError::PeerIdentityCollision);
+    }
+    let local_frame = encode_frame_for_version(
+        &WireMessage::Hello(local_hello.clone()),
+        PROTOCOL_VERSION_V1,
+    )
+    .map_err(NetworkError::from)?;
+    let remote_frame = encode_frame_for_version(
+        &WireMessage::Hello(remote_hello.clone()),
+        PROTOCOL_VERSION_V1,
+    )
+    .map_err(NetworkError::from)?;
+    let mut hellos = [
+        (local_hello.peer_id, local_frame),
+        (remote_hello.peer_id, remote_frame),
+    ];
+    hellos.sort_unstable_by_key(|(peer_id, _)| peer_id.0);
+
+    let mut context = Vec::with_capacity(
+        SESSION_ID_CONTEXT_DOMAIN.len()
+            + 2
+            + hellos
+                .iter()
+                .map(|(_, frame)| 4 + frame.len())
+                .sum::<usize>(),
+    );
+    context.extend_from_slice(SESSION_ID_CONTEXT_DOMAIN);
+    context.extend_from_slice(&selected_protocol_version.to_be_bytes());
     for (_, frame) in hellos {
         let length = u32::try_from(frame.len()).map_err(|_| {
             NetworkError::from(kvm_protocol::ProtocolError::PayloadTooLarge {
@@ -1025,8 +1921,17 @@ fn validate_message_identity(
         }
         WireMessage::PointerLeave(value) => value.source_host == remote,
         WireMessage::PointerTransitionAck(value) => value.receiver_host == remote,
+        WireMessage::PointerTransitionCommit(value) => {
+            value.source_host == remote && value.destination_host == local
+        }
         WireMessage::Clipboard(value) => value.origin_host == remote,
         WireMessage::ReleaseInput(value) => value.source_host == remote,
+        WireMessage::ReleaseInputV2(value) => {
+            value.source_host == remote && value.applying_host == local
+        }
+        WireMessage::ReleaseAppliedAckV2(value) => {
+            value.source_host == local && value.applying_host == remote
+        }
         WireMessage::Hello(_)
         | WireMessage::Authenticate(_)
         | WireMessage::Ping(_)
@@ -1111,8 +2016,11 @@ fn disconnect_reason(error: &SessionError) -> DisconnectReason {
         SessionError::TransportIdentityMismatch
         | SessionError::LocalIdentityMismatch
         | SessionError::PeerIdentityCollision
+        | SessionError::NoncanonicalDirection
         | SessionError::MessageIdentityMismatch(_) => DisconnectReason::IdentityMismatch,
-        SessionError::PreAdmissionMessage(_) => DisconnectReason::ProtocolViolation,
+        SessionError::NoCompatibleProtocolVersion
+        | SessionError::InvalidSessionBinding
+        | SessionError::PreAdmissionMessage(_) => DisconnectReason::ProtocolViolation,
         SessionError::RepeatedHandshake(_) => DisconnectReason::RepeatedHandshake,
         SessionError::Heartbeat(_) => DisconnectReason::HeartbeatInvalid,
         SessionError::HeartbeatTimeout => DisconnectReason::HeartbeatTimeout,
@@ -1128,8 +2036,11 @@ const fn message_sequence(message: &WireMessage) -> Option<u64> {
         WireMessage::Input(value) => Some(value.sequence),
         WireMessage::PointerEnter(value) => Some(value.sequence),
         WireMessage::PointerLeave(value) => Some(value.sequence),
+        WireMessage::PointerTransitionCommit(value) => Some(value.sequence),
         WireMessage::Clipboard(value) => Some(value.sequence),
         WireMessage::ReleaseInput(value) => Some(value.sequence),
+        WireMessage::ReleaseInputV2(value) => Some(value.sequence),
+        WireMessage::ReleaseAppliedAckV2(value) => Some(value.sequence),
         _ => None,
     }
 }
@@ -1141,30 +2052,50 @@ fn send_event(events: &mpsc::Sender<PeerEvent>, event: PeerEvent) -> Result<(), 
     })
 }
 
-async fn write_or_shutdown<W: tokio::io::AsyncWrite + Unpin>(
-    writer: &mut FrameWriter<W>,
+async fn write_or_shutdown_for_version<W: tokio::io::AsyncWrite + Unpin>(
+    writer: &mut W,
     message: &WireMessage,
+    selected_protocol_version: u16,
     shutdown: &mut watch::Receiver<bool>,
 ) -> Result<bool, SessionError> {
+    let frame =
+        encode_frame_for_version(message, selected_protocol_version).map_err(NetworkError::from)?;
     tokio::select! {
         biased;
         () = wait_for_shutdown(shutdown) => Ok(false),
         result = async {
-            writer.write_message(message).await?;
+            writer.write_all(&frame).await?;
             writer.flush().await
-        } => result.map(|()| true).map_err(SessionError::from),
+        } => result.map(|()| true).map_err(NetworkError::from).map_err(SessionError::from),
     }
 }
 
-async fn read_or_shutdown<R: tokio::io::AsyncRead + Unpin>(
-    reader: &mut FrameReader<R>,
+async fn read_or_shutdown_for_version<R: tokio::io::AsyncRead + Unpin>(
+    reader: &mut R,
+    selected_protocol_version: u16,
     shutdown: &mut watch::Receiver<bool>,
 ) -> Result<Option<WireMessage>, SessionError> {
     tokio::select! {
         biased;
         () = wait_for_shutdown(shutdown) => Ok(None),
-        result = reader.read_message() => result.map(Some).map_err(SessionError::from),
+        result = read_message_for_version(reader, selected_protocol_version) => {
+            result.map(Some).map_err(SessionError::from)
+        },
     }
+}
+
+async fn read_message_for_version<R: tokio::io::AsyncRead + Unpin>(
+    reader: &mut R,
+    selected_protocol_version: u16,
+) -> Result<WireMessage, NetworkError> {
+    let mut header_bytes = [0_u8; FRAME_HEADER_LEN];
+    reader.read_exact(&mut header_bytes).await?;
+    let header = FrameHeader::decode_for_version(&header_bytes, selected_protocol_version)?;
+    let mut frame = Vec::with_capacity(FRAME_HEADER_LEN + header.payload_length as usize);
+    frame.extend_from_slice(&header_bytes);
+    frame.resize(FRAME_HEADER_LEN + header.payload_length as usize, 0);
+    reader.read_exact(&mut frame[FRAME_HEADER_LEN..]).await?;
+    decode_frame_for_version(&frame, selected_protocol_version).map_err(NetworkError::from)
 }
 
 fn shutdown_now(shutdown: &watch::Receiver<bool>) -> bool {
@@ -1182,18 +2113,19 @@ async fn wait_for_shutdown(shutdown: &mut watch::Receiver<bool>) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::TransportPeerIdentity;
+    use crate::{ConnectionDirection, TransportPeerIdentity};
     use kvm_protocol::{
-        ClipboardV1, InputEventV1, PointerEnterV1, PointerLeaveV1, ReleaseInputV1, ReleaseReasonV1,
+        ClipboardV1, InputEventV1, PointerEnterV1, PointerLeaveV1, PointerTransitionCommitV1,
+        ReleaseAppliedAckV2, ReleaseInputV1, ReleaseInputV2, ReleaseReasonV1, ReleaseReasonV2,
         WireClipboardId, WireDeviceId, WireDisplayId, WireEdge, WireHostId, WireInputPayloadV1,
-        WirePeerId, WirePlatform, PROTOCOL_VERSION,
+        WirePeerId, WirePlatform, PROTOCOL_VERSION_V2,
     };
     use sha2::{Digest, Sha256};
     use std::pin::Pin;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
     use std::task::{Context, Poll};
-    use tokio::io::{AsyncRead, AsyncWrite, DuplexStream, ReadBuf};
+    use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, DuplexStream, ReadBuf};
 
     #[derive(Debug)]
     struct TestSecureStream {
@@ -1236,6 +2168,10 @@ mod tests {
     }
 
     impl SecurePeerStream for TestSecureStream {
+        fn connection_direction(&self) -> ConnectionDirection {
+            ConnectionDirection::Outbound
+        }
+
         fn authenticated_peer_identity(&self) -> &TransportPeerIdentity {
             &self.identity
         }
@@ -1253,6 +2189,120 @@ mod tests {
     }
 
     impl crate::connector::sealed::SecureStream for TestSecureStream {}
+
+    #[derive(Debug)]
+    struct ZeroExporterSecureStream(TestSecureStream);
+
+    impl AsyncRead for ZeroExporterSecureStream {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            context: &mut Context<'_>,
+            buffer: &mut ReadBuf<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            Pin::new(&mut self.0).poll_read(context, buffer)
+        }
+    }
+
+    impl AsyncWrite for ZeroExporterSecureStream {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            context: &mut Context<'_>,
+            buffer: &[u8],
+        ) -> Poll<Result<usize, std::io::Error>> {
+            Pin::new(&mut self.0).poll_write(context, buffer)
+        }
+
+        fn poll_flush(
+            mut self: Pin<&mut Self>,
+            context: &mut Context<'_>,
+        ) -> Poll<Result<(), std::io::Error>> {
+            Pin::new(&mut self.0).poll_flush(context)
+        }
+
+        fn poll_shutdown(
+            mut self: Pin<&mut Self>,
+            context: &mut Context<'_>,
+        ) -> Poll<Result<(), std::io::Error>> {
+            Pin::new(&mut self.0).poll_shutdown(context)
+        }
+    }
+
+    impl SecurePeerStream for ZeroExporterSecureStream {
+        fn connection_direction(&self) -> ConnectionDirection {
+            self.0.connection_direction()
+        }
+
+        fn authenticated_peer_identity(&self) -> &TransportPeerIdentity {
+            self.0.authenticated_peer_identity()
+        }
+
+        fn export_keying_material(
+            &self,
+            _label: &[u8],
+            _context: &[u8],
+        ) -> std::io::Result<[u8; 32]> {
+            Ok([0; 32])
+        }
+    }
+
+    impl crate::connector::sealed::SecureStream for ZeroExporterSecureStream {}
+
+    #[derive(Debug)]
+    struct InboundTestSecureStream(TestSecureStream);
+
+    impl AsyncRead for InboundTestSecureStream {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            context: &mut Context<'_>,
+            buffer: &mut ReadBuf<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            Pin::new(&mut self.0).poll_read(context, buffer)
+        }
+    }
+
+    impl AsyncWrite for InboundTestSecureStream {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            context: &mut Context<'_>,
+            buffer: &[u8],
+        ) -> Poll<Result<usize, std::io::Error>> {
+            Pin::new(&mut self.0).poll_write(context, buffer)
+        }
+
+        fn poll_flush(
+            mut self: Pin<&mut Self>,
+            context: &mut Context<'_>,
+        ) -> Poll<Result<(), std::io::Error>> {
+            Pin::new(&mut self.0).poll_flush(context)
+        }
+
+        fn poll_shutdown(
+            mut self: Pin<&mut Self>,
+            context: &mut Context<'_>,
+        ) -> Poll<Result<(), std::io::Error>> {
+            Pin::new(&mut self.0).poll_shutdown(context)
+        }
+    }
+
+    impl SecurePeerStream for InboundTestSecureStream {
+        fn connection_direction(&self) -> ConnectionDirection {
+            ConnectionDirection::Inbound
+        }
+
+        fn authenticated_peer_identity(&self) -> &TransportPeerIdentity {
+            self.0.authenticated_peer_identity()
+        }
+
+        fn export_keying_material(
+            &self,
+            label: &[u8],
+            context: &[u8],
+        ) -> std::io::Result<[u8; 32]> {
+            self.0.export_keying_material(label, context)
+        }
+    }
+
+    impl crate::connector::sealed::SecureStream for InboundTestSecureStream {}
 
     /// Alternates a small successful write with `Pending`. This reproduces the
     /// exact pattern that makes cancellation and recreation of `write_all`
@@ -1309,6 +2359,10 @@ mod tests {
     }
 
     impl SecurePeerStream for PartialPendingSecureStream {
+        fn connection_direction(&self) -> ConnectionDirection {
+            ConnectionDirection::Outbound
+        }
+
         fn authenticated_peer_identity(&self) -> &TransportPeerIdentity {
             &self.inner.identity
         }
@@ -1381,6 +2435,10 @@ mod tests {
     }
 
     impl SecurePeerStream for PartialPendingReadSecureStream {
+        fn connection_direction(&self) -> ConnectionDirection {
+            ConnectionDirection::Outbound
+        }
+
         fn authenticated_peer_identity(&self) -> &TransportPeerIdentity {
             &self.inner.identity
         }
@@ -1493,13 +2551,17 @@ mod tests {
     }
 
     fn hello(value: u8) -> HelloV1 {
+        hello_with_versions(value, PROTOCOL_VERSION_V1, PROTOCOL_VERSION_V1)
+    }
+
+    fn hello_with_versions(value: u8, minimum: u16, maximum: u16) -> HelloV1 {
         HelloV1 {
             host_id: WireHostId([value; 16]),
             peer_id: WirePeerId([value.saturating_add(1); 16]),
             host_name: format!("host-{value}"),
             platform: WirePlatform::Linux,
-            minimum_protocol_version: PROTOCOL_VERSION,
-            maximum_protocol_version: PROTOCOL_VERSION,
+            minimum_protocol_version: minimum,
+            maximum_protocol_version: maximum,
             daemon_version: "test".to_owned(),
             nonce: [value.saturating_add(2); 32],
         }
@@ -1570,6 +2632,15 @@ mod tests {
                 edge: WireEdge::Right,
                 normalized_position: 0.5,
             }),
+            WireMessage::PointerTransitionCommit(PointerTransitionCommitV1 {
+                transition_id: 6,
+                workspace_epoch: 1,
+                sequence: 6,
+                source_host,
+                destination_host,
+                source_display: WireDisplayId([11; 16]),
+                destination_display: WireDisplayId([12; 16]),
+            }),
         ]
     }
 
@@ -1581,6 +2652,32 @@ mod tests {
         message
     }
 
+    fn release_v2(sequence: u64) -> WireMessage {
+        WireMessage::ReleaseInputV2(ReleaseInputV2 {
+            transaction_id: 1,
+            release_token: [4; 32],
+            old_session_id: [5; 32],
+            sequence,
+            covered_input_sequence: sequence - 1,
+            source_host: WireHostId([7; 16]),
+            applying_host: WireHostId([8; 16]),
+            source_device: Some(WireDeviceId([9; 16])),
+            reason: ReleaseReasonV2::RouteChanged,
+            keys: Vec::new(),
+            buttons: Vec::new(),
+        })
+    }
+
+    async fn write_test_message_for_version<W: AsyncWrite + Unpin>(
+        writer: &mut W,
+        message: &WireMessage,
+        version: u16,
+    ) {
+        let frame = encode_frame_for_version(message, version).unwrap();
+        writer.write_all(&frame).await.unwrap();
+        writer.flush().await.unwrap();
+    }
+
     #[test]
     fn payload_bearing_debug_output_is_redacted() {
         let remote = hello(20);
@@ -1588,11 +2685,13 @@ mod tests {
             transport_identity: identity(&remote),
             local_hello: hello(1),
             remote_hello: remote.clone(),
+            selected_protocol_version: PROTOCOL_VERSION_V1,
+            session_id: [0; 32],
         };
         let message = WireMessage::Clipboard(ClipboardV1 {
             update_id: WireClipboardId([1; 16]),
             origin_host: remote.host_id,
-            sequence: 8,
+            sequence: 987_654_321,
             text: "never-print-this-secret".to_owned(),
         });
         let event_debug = format!(
@@ -1603,11 +2702,60 @@ mod tests {
             }
         );
         let error_debug = format!("{:?}", OutboundSendError::Full(Box::new(message)));
+        let undelivered_debug = format!(
+            "{:?}",
+            UndeliveredTraffic {
+                messages: vec![UndeliveredMessage {
+                    message_type: MessageType::Input,
+                    traffic_class: TrafficClass::Input,
+                    sequence: Some(987_654_321),
+                    partially_sent: true,
+                }],
+                partial_inbound_bytes: 987_654_321,
+                requires_input_reconciliation: true,
+            }
+        );
 
         assert!(!event_debug.contains("never-print-this-secret"));
         assert!(!error_debug.contains("never-print-this-secret"));
+        assert!(!event_debug.contains("987654321"));
+        assert!(!error_debug.contains("987654321"));
+        assert!(!undelivered_debug.contains("987654321"));
         assert!(event_debug.contains("Clipboard"));
         assert!(error_debug.contains("Clipboard"));
+    }
+
+    #[test]
+    fn identity_and_peer_controlled_error_debug_output_is_redacted() {
+        let remote = hello(83);
+        let local = hello(71);
+        let transport_identity = identity(&remote);
+        let peer = AdmittedPeer {
+            transport_identity: transport_identity.clone(),
+            local_hello: local.clone(),
+            remote_hello: remote.clone(),
+            selected_protocol_version: PROTOCOL_VERSION_V1,
+            session_id: [0; 32],
+        };
+        let transcript = HandshakeTranscript {
+            local_hello: local,
+            remote_hello: remote,
+            transport_identity,
+            local_exporter_proof: [97; 32],
+            remote_exporter_proof: [101; 32],
+            selected_protocol_version: PROTOCOL_VERSION_V1,
+            session_id: [0; 32],
+        };
+        assert_eq!(format!("{peer:?}"), "AdmittedPeer([REDACTED])");
+        assert_eq!(format!("{transcript:?}"), "HandshakeTranscript([REDACTED])");
+        assert_eq!(
+            format!("{:?}", PeerEvent::Admitted(peer)),
+            "Admitted { peer: \"[REDACTED]\" }"
+        );
+
+        let heartbeat = SessionError::Heartbeat("peer-controlled-heartbeat-marker".to_owned());
+        assert_eq!(format!("{heartbeat:?}"), "SessionError::Heartbeat");
+        assert_eq!(heartbeat.to_string(), "heartbeat validation failed");
     }
 
     #[test]
@@ -1617,6 +2765,8 @@ mod tests {
             transport_identity: identity(&remote),
             local_hello: hello(1),
             remote_hello: remote,
+            selected_protocol_version: PROTOCOL_VERSION_V1,
+            session_id: [0; 32],
         };
         let spoofed_input = input(1);
         assert!(matches!(
@@ -1624,7 +2774,10 @@ mod tests {
             Err(SessionError::MessageIdentityMismatch(MessageType::Input))
         ));
 
-        let mut wrong_destination = privileged_messages()[3].clone();
+        let mut wrong_destination = privileged_messages()
+            .into_iter()
+            .find(|message| message.message_type() == MessageType::PointerEnter)
+            .unwrap();
         if let WireMessage::PointerEnter(pointer) = &mut wrong_destination {
             pointer.source_host = peer.transport_identity.host_id;
             pointer.destination_host = WireHostId([99; 16]);
@@ -1633,6 +2786,82 @@ mod tests {
             validate_message_identity(&wrong_destination, &peer),
             Err(SessionError::MessageIdentityMismatch(
                 MessageType::PointerEnter
+            ))
+        ));
+
+        let mut wrong_commit = privileged_messages()
+            .into_iter()
+            .find(|message| message.message_type() == MessageType::PointerTransitionCommit)
+            .unwrap();
+        if let WireMessage::PointerTransitionCommit(commit) = &mut wrong_commit {
+            commit.source_host = peer.transport_identity.host_id;
+            commit.destination_host = WireHostId([99; 16]);
+        }
+        assert!(matches!(
+            validate_message_identity(&wrong_commit, &peer),
+            Err(SessionError::MessageIdentityMismatch(
+                MessageType::PointerTransitionCommit
+            ))
+        ));
+
+        if let WireMessage::PointerTransitionCommit(commit) = &mut wrong_commit {
+            commit.source_host = WireHostId([98; 16]);
+            commit.destination_host = peer.local_hello.host_id;
+        }
+        assert!(matches!(
+            validate_message_identity(&wrong_commit, &peer),
+            Err(SessionError::MessageIdentityMismatch(
+                MessageType::PointerTransitionCommit
+            ))
+        ));
+    }
+
+    #[test]
+    fn v2_release_proof_is_bound_to_authenticated_source_and_applying_hosts() {
+        let remote = hello(20);
+        let peer = AdmittedPeer {
+            transport_identity: identity(&remote),
+            local_hello: hello(1),
+            remote_hello: remote,
+            selected_protocol_version: PROTOCOL_VERSION_V2,
+            session_id: [6; 32],
+        };
+        let WireMessage::ReleaseInputV2(mut release) = release_v2(2) else {
+            unreachable!()
+        };
+        release.source_host = peer.transport_identity.host_id;
+        release.applying_host = peer.local_hello.host_id;
+        assert!(
+            validate_message_identity(&WireMessage::ReleaseInputV2(release.clone()), &peer).is_ok()
+        );
+        release.applying_host = WireHostId([99; 16]);
+        assert!(matches!(
+            validate_message_identity(&WireMessage::ReleaseInputV2(release), &peer),
+            Err(SessionError::MessageIdentityMismatch(
+                MessageType::ReleaseInputV2
+            ))
+        ));
+
+        let mut acknowledgement = ReleaseAppliedAckV2 {
+            transaction_id: 1,
+            release_token: [4; 32],
+            old_session_id: [5; 32],
+            sequence: 3,
+            release_sequence: 2,
+            covered_input_sequence: 1,
+            source_host: peer.local_hello.host_id,
+            applying_host: peer.transport_identity.host_id,
+        };
+        assert!(validate_message_identity(
+            &WireMessage::ReleaseAppliedAckV2(acknowledgement),
+            &peer,
+        )
+        .is_ok());
+        acknowledgement.source_host = WireHostId([98; 16]);
+        assert!(matches!(
+            validate_message_identity(&WireMessage::ReleaseAppliedAckV2(acknowledgement), &peer,),
+            Err(SessionError::MessageIdentityMismatch(
+                MessageType::ReleaseAppliedAckV2
             ))
         ));
     }
@@ -1661,27 +2890,99 @@ mod tests {
     fn exporter_context_is_canonical_and_sender_direction_bound() {
         let lower = hello(1);
         let higher = hello(20);
-        let lower_sender = authentication_exporter_context(&lower, &higher, lower.peer_id).unwrap();
+        let lower_sender =
+            authentication_exporter_context(&lower, &higher, lower.peer_id, PROTOCOL_VERSION_V1)
+                .unwrap();
         let reversed_view =
-            authentication_exporter_context(&higher, &lower, lower.peer_id).unwrap();
+            authentication_exporter_context(&higher, &lower, lower.peer_id, PROTOCOL_VERSION_V1)
+                .unwrap();
         let higher_sender =
-            authentication_exporter_context(&lower, &higher, higher.peer_id).unwrap();
+            authentication_exporter_context(&lower, &higher, higher.peer_id, PROTOCOL_VERSION_V1)
+                .unwrap();
 
         assert_eq!(lower_sender, reversed_view);
         assert_ne!(lower_sender, higher_sender);
     }
 
     #[test]
+    fn negotiation_selects_highest_overlap_and_rejects_no_overlap() {
+        let v1 = hello_with_versions(1, PROTOCOL_VERSION_V1, PROTOCOL_VERSION_V1);
+        let v1_to_v2 = hello_with_versions(20, PROTOCOL_VERSION_V1, PROTOCOL_VERSION_V2);
+        let v2 = hello_with_versions(40, PROTOCOL_VERSION_V2, PROTOCOL_VERSION_V2);
+
+        assert_eq!(
+            negotiate_protocol_version(&v1, &v1).unwrap(),
+            PROTOCOL_VERSION_V1
+        );
+        assert_eq!(
+            negotiate_protocol_version(&v1_to_v2, &v1).unwrap(),
+            PROTOCOL_VERSION_V1
+        );
+        assert_eq!(
+            negotiate_protocol_version(&v1_to_v2, &v1_to_v2).unwrap(),
+            PROTOCOL_VERSION_V2
+        );
+        assert!(matches!(
+            negotiate_protocol_version(&v1, &v2),
+            Err(SessionError::NoCompatibleProtocolVersion)
+        ));
+    }
+
+    #[test]
+    fn selected_version_changes_authentication_and_session_binding_contexts() {
+        let local = hello_with_versions(1, PROTOCOL_VERSION_V1, PROTOCOL_VERSION_V2);
+        let remote = hello_with_versions(20, PROTOCOL_VERSION_V1, PROTOCOL_VERSION_V2);
+        let auth_v1 =
+            authentication_exporter_context(&local, &remote, local.peer_id, PROTOCOL_VERSION_V1)
+                .unwrap();
+        let auth_v2 =
+            authentication_exporter_context(&local, &remote, local.peer_id, PROTOCOL_VERSION_V2)
+                .unwrap();
+        let session_v1 = session_exporter_context(&local, &remote, PROTOCOL_VERSION_V1).unwrap();
+        let session_v2 = session_exporter_context(&local, &remote, PROTOCOL_VERSION_V2).unwrap();
+
+        assert_ne!(auth_v1, auth_v2);
+        assert_ne!(session_v1, session_v2);
+        assert_eq!(
+            session_v2,
+            session_exporter_context(&remote, &local, PROTOCOL_VERSION_V2).unwrap()
+        );
+    }
+
+    #[test]
+    fn v1_session_rejects_v2_only_release_before_any_write() {
+        let error = PendingFrame::encode(&release_v2(2), PROTOCOL_VERSION_V1).unwrap_err();
+
+        assert!(matches!(
+            error,
+            SessionError::Network(NetworkError::Protocol(
+                kvm_protocol::ProtocolError::MessageVersionMismatch {
+                    message_type: MessageType::ReleaseInputV2,
+                    version: PROTOCOL_VERSION_V1,
+                }
+            ))
+        ));
+    }
+
+    #[test]
     fn exporter_context_changes_with_the_complete_hello_transcript() {
         let local = hello(1);
         let remote = hello(20);
-        let original = authentication_exporter_context(&local, &remote, local.peer_id).unwrap();
+        let original =
+            authentication_exporter_context(&local, &remote, local.peer_id, PROTOCOL_VERSION_V1)
+                .unwrap();
         let mut modified = remote.clone();
         modified.nonce[0] ^= 1;
         let modified_context =
-            authentication_exporter_context(&local, &modified, local.peer_id).unwrap();
+            authentication_exporter_context(&local, &modified, local.peer_id, PROTOCOL_VERSION_V1)
+                .unwrap();
+        let original_session =
+            session_exporter_context(&local, &remote, PROTOCOL_VERSION_V1).unwrap();
+        let modified_session =
+            session_exporter_context(&local, &modified, PROTOCOL_VERSION_V1).unwrap();
 
         assert_ne!(original, modified_context);
+        assert_ne!(original_session, modified_session);
         let stream = TestSecureStream {
             stream: tokio::io::duplex(1).0,
             identity: identity(&remote),
@@ -1694,6 +2995,14 @@ mod tests {
                 .export_keying_material(AUTHENTICATION_EXPORTER_LABEL, &modified_context)
                 .unwrap()
         );
+        assert_ne!(
+            stream
+                .export_keying_material(SESSION_ID_EXPORTER_LABEL, &original_session)
+                .unwrap(),
+            stream
+                .export_keying_material(SESSION_ID_EXPORTER_LABEL, &modified_session)
+                .unwrap()
+        );
     }
 
     #[test]
@@ -1703,8 +3012,30 @@ mod tests {
         remote.peer_id = local.peer_id;
 
         assert!(matches!(
-            authentication_exporter_context(&local, &remote, local.peer_id),
+            authentication_exporter_context(&local, &remote, local.peer_id, PROTOCOL_VERSION_V1,),
             Err(SessionError::PeerIdentityCollision)
+        ));
+    }
+
+    #[test]
+    fn zero_exporter_session_binding_fails_closed() {
+        let local = hello_with_versions(1, PROTOCOL_VERSION_V1, PROTOCOL_VERSION_V2);
+        let remote = hello_with_versions(20, PROTOCOL_VERSION_V1, PROTOCOL_VERSION_V2);
+        let (stream, _peer) = tokio::io::duplex(64);
+        let secure = ZeroExporterSecureStream(TestSecureStream {
+            stream,
+            identity: identity(&remote),
+        });
+
+        assert!(matches!(
+            build_handshake_transcript(
+                &secure,
+                local,
+                remote.clone(),
+                identity(&remote),
+                PROTOCOL_VERSION_V2,
+            ),
+            Err(SessionError::InvalidSessionBinding)
         ));
     }
 
@@ -1732,17 +3063,8 @@ mod tests {
             &mut shutdown,
         );
         let peer = async move {
-            let (read, write) = tokio::io::split(peer_stream);
+            let (read, _write) = tokio::io::split(peer_stream);
             let mut reader = FrameReader::new_authenticated(read);
-            let mut writer = FrameWriter::new_authenticated(write);
-            assert!(matches!(
-                reader.read_message().await.unwrap(),
-                WireMessage::Hello(_)
-            ));
-            writer
-                .write_message(&WireMessage::Hello(remote_hello))
-                .await
-                .unwrap();
             assert!(reader.read_message().await.is_err());
         };
 
@@ -1867,6 +3189,426 @@ mod tests {
 
         let (result, ()) = tokio::join!(session, peer);
         assert_eq!(result.unwrap(), SessionEnd::Shutdown);
+    }
+
+    #[tokio::test]
+    async fn v2_peers_authenticate_and_exchange_only_v2_application_frames() {
+        let local_hello = hello_with_versions(1, PROTOCOL_VERSION_V1, PROTOCOL_VERSION_V2);
+        let remote_hello = hello_with_versions(20, PROTOCOL_VERSION_V1, PROTOCOL_VERSION_V2);
+        let (session_stream, mut peer_stream) = tokio::io::duplex(8_192);
+        let secure_stream = TestSecureStream {
+            stream: session_stream,
+            identity: identity(&remote_hello),
+        };
+        let admission = TestAdmission {
+            hello: local_hello.clone(),
+        };
+        let (_outbound_sender, mut outbound) = mpsc::channel(8);
+        let (events, mut event_receiver) = mpsc::channel(16);
+        let (shutdown_sender, mut shutdown) = watch::channel(false);
+
+        let session = run_session(
+            secure_stream,
+            &admission,
+            test_config(),
+            &mut outbound,
+            &events,
+            &mut shutdown,
+        );
+        let peer = async move {
+            let received_hello =
+                match read_message_for_version(&mut peer_stream, PROTOCOL_VERSION_V1)
+                    .await
+                    .unwrap()
+                {
+                    WireMessage::Hello(hello) => hello,
+                    other => panic!("expected hello, got {other:?}"),
+                };
+            assert_eq!(received_hello.minimum_protocol_version, PROTOCOL_VERSION_V1);
+            assert_eq!(received_hello.maximum_protocol_version, PROTOCOL_VERSION_V2);
+            write_test_message_for_version(
+                &mut peer_stream,
+                &WireMessage::Hello(remote_hello.clone()),
+                PROTOCOL_VERSION_V1,
+            )
+            .await;
+            assert!(matches!(
+                read_message_for_version(&mut peer_stream, PROTOCOL_VERSION_V2)
+                    .await
+                    .unwrap(),
+                WireMessage::Authenticate(_)
+            ));
+            write_test_message_for_version(
+                &mut peer_stream,
+                &WireMessage::Authenticate(AuthenticateV1 {
+                    peer_id: remote_hello.peer_id,
+                    scheme: "test-channel-binding-v1".to_owned(),
+                    proof: received_hello.nonce.to_vec(),
+                }),
+                PROTOCOL_VERSION_V2,
+            )
+            .await;
+            write_test_message_for_version(
+                &mut peer_stream,
+                &WireMessage::Ping(kvm_protocol::PingV1 {
+                    nonce: 91,
+                    sent_at_ns: 92,
+                }),
+                PROTOCOL_VERSION_V2,
+            )
+            .await;
+            assert!(matches!(
+                read_message_for_version(&mut peer_stream, PROTOCOL_VERSION_V2)
+                    .await
+                    .unwrap(),
+                WireMessage::Pong(_)
+            ));
+            shutdown_sender.send(true).unwrap();
+        };
+
+        let (result, ()) = tokio::join!(session, peer);
+        assert_eq!(result.unwrap(), SessionEnd::Shutdown);
+        let admitted = std::iter::from_fn(|| event_receiver.try_recv().ok()).find_map(|event| {
+            if let PeerEvent::Admitted(peer) = event {
+                Some(peer)
+            } else {
+                None
+            }
+        });
+        let admitted = admitted.expect("admission event");
+        assert_eq!(admitted.selected_protocol_version(), PROTOCOL_VERSION_V2);
+        assert!(admitted.supports_release_proof());
+        assert_ne!(admitted.session_id(), [0; 32]);
+        assert_eq!(format!("{admitted:?}"), "AdmittedPeer([REDACTED])");
+    }
+
+    #[tokio::test]
+    async fn mixed_v1_v2_peers_fall_back_to_v1() {
+        let local_hello = hello_with_versions(1, PROTOCOL_VERSION_V1, PROTOCOL_VERSION_V2);
+        let remote_hello = hello(20);
+        let (session_stream, mut peer_stream) = tokio::io::duplex(4_096);
+        let secure_stream = TestSecureStream {
+            stream: session_stream,
+            identity: identity(&remote_hello),
+        };
+        let admission = TestAdmission { hello: local_hello };
+        let (_outbound_sender, mut outbound) = mpsc::channel(8);
+        let (events, mut event_receiver) = mpsc::channel(16);
+        let (shutdown_sender, mut shutdown) = watch::channel(false);
+
+        let session = run_session(
+            secure_stream,
+            &admission,
+            test_config(),
+            &mut outbound,
+            &events,
+            &mut shutdown,
+        );
+        let peer = async move {
+            let local = match read_message_for_version(&mut peer_stream, PROTOCOL_VERSION_V1)
+                .await
+                .unwrap()
+            {
+                WireMessage::Hello(hello) => hello,
+                other => panic!("expected hello, got {other:?}"),
+            };
+            write_test_message_for_version(
+                &mut peer_stream,
+                &WireMessage::Hello(remote_hello.clone()),
+                PROTOCOL_VERSION_V1,
+            )
+            .await;
+            assert!(matches!(
+                read_message_for_version(&mut peer_stream, PROTOCOL_VERSION_V1)
+                    .await
+                    .unwrap(),
+                WireMessage::Authenticate(_)
+            ));
+            write_test_message_for_version(
+                &mut peer_stream,
+                &WireMessage::Authenticate(AuthenticateV1 {
+                    peer_id: remote_hello.peer_id,
+                    scheme: "test-channel-binding-v1".to_owned(),
+                    proof: local.nonce.to_vec(),
+                }),
+                PROTOCOL_VERSION_V1,
+            )
+            .await;
+            write_test_message_for_version(
+                &mut peer_stream,
+                &WireMessage::Ping(kvm_protocol::PingV1 {
+                    nonce: 81,
+                    sent_at_ns: 82,
+                }),
+                PROTOCOL_VERSION_V1,
+            )
+            .await;
+            assert!(matches!(
+                read_message_for_version(&mut peer_stream, PROTOCOL_VERSION_V1)
+                    .await
+                    .unwrap(),
+                WireMessage::Pong(_)
+            ));
+            shutdown_sender.send(true).unwrap();
+        };
+
+        let (result, ()) = tokio::join!(session, peer);
+        assert_eq!(result.unwrap(), SessionEnd::Shutdown);
+        assert!(
+            std::iter::from_fn(|| event_receiver.try_recv().ok()).any(|event| {
+                matches!(
+                    event,
+                    PeerEvent::Admitted(peer)
+                        if peer.selected_protocol_version() == PROTOCOL_VERSION_V1
+                            && !peer.supports_release_proof()
+                )
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn admission_rejects_non_overlapping_protocol_ranges() {
+        let local_hello = hello(1);
+        let remote_hello = hello_with_versions(20, PROTOCOL_VERSION_V2, PROTOCOL_VERSION_V2);
+        let (session_stream, mut peer_stream) = tokio::io::duplex(4_096);
+        let secure_stream = TestSecureStream {
+            stream: session_stream,
+            identity: identity(&remote_hello),
+        };
+        let admission = TestAdmission { hello: local_hello };
+        let (_outbound_sender, mut outbound) = mpsc::channel(8);
+        let (events, _event_receiver) = mpsc::channel(8);
+        let (_shutdown_sender, mut shutdown) = watch::channel(false);
+
+        let session = run_session(
+            secure_stream,
+            &admission,
+            test_config(),
+            &mut outbound,
+            &events,
+            &mut shutdown,
+        );
+        let peer = async move {
+            assert!(matches!(
+                read_message_for_version(&mut peer_stream, PROTOCOL_VERSION_V1)
+                    .await
+                    .unwrap(),
+                WireMessage::Hello(_)
+            ));
+            write_test_message_for_version(
+                &mut peer_stream,
+                &WireMessage::Hello(remote_hello),
+                PROTOCOL_VERSION_V1,
+            )
+            .await;
+        };
+
+        let (result, ()) = tokio::join!(session, peer);
+        assert!(matches!(
+            result,
+            Err(SessionFailure {
+                error: SessionError::NoCompatibleProtocolVersion,
+                ..
+            })
+        ));
+    }
+
+    #[tokio::test]
+    async fn bootstrap_rejects_header_only_wrong_version_or_v2_message() {
+        let headers = [
+            FrameHeader {
+                protocol_version: PROTOCOL_VERSION_V2,
+                message_type: MessageType::Hello,
+                payload_length: u32::try_from(kvm_protocol::MAX_FRAME_PAYLOAD).unwrap(),
+            },
+            FrameHeader {
+                protocol_version: PROTOCOL_VERSION_V1,
+                message_type: MessageType::ReleaseInputV2,
+                payload_length: u32::try_from(kvm_protocol::MAX_FRAME_PAYLOAD).unwrap(),
+            },
+        ];
+
+        for malicious_header in headers {
+            let local_hello = hello(1);
+            let remote_hello = hello(20);
+            let (session_stream, mut peer_stream) = tokio::io::duplex(4_096);
+            let secure_stream = TestSecureStream {
+                stream: session_stream,
+                identity: identity(&remote_hello),
+            };
+            let admission = TestAdmission { hello: local_hello };
+            let (_outbound_sender, mut outbound) = mpsc::channel(8);
+            let (events, _event_receiver) = mpsc::channel(8);
+            let (_shutdown_sender, mut shutdown) = watch::channel(false);
+
+            let session = run_session(
+                secure_stream,
+                &admission,
+                test_config(),
+                &mut outbound,
+                &events,
+                &mut shutdown,
+            );
+            let peer = async move {
+                assert!(matches!(
+                    read_message_for_version(&mut peer_stream, PROTOCOL_VERSION_V1)
+                        .await
+                        .unwrap(),
+                    WireMessage::Hello(_)
+                ));
+                peer_stream
+                    .write_all(&malicious_header.encode())
+                    .await
+                    .unwrap();
+                peer_stream.flush().await.unwrap();
+            };
+
+            let (result, ()) = tokio::join!(session, peer);
+            assert!(matches!(
+                result,
+                Err(SessionFailure {
+                    error: SessionError::Network(NetworkError::Protocol(_)),
+                    ..
+                })
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn selected_v2_rejects_v1_authenticate_frame() {
+        let local_hello = hello_with_versions(1, PROTOCOL_VERSION_V1, PROTOCOL_VERSION_V2);
+        let remote_hello = hello_with_versions(20, PROTOCOL_VERSION_V1, PROTOCOL_VERSION_V2);
+        let (session_stream, mut peer_stream) = tokio::io::duplex(4_096);
+        let secure_stream = TestSecureStream {
+            stream: session_stream,
+            identity: identity(&remote_hello),
+        };
+        let admission = TestAdmission { hello: local_hello };
+        let (_outbound_sender, mut outbound) = mpsc::channel(8);
+        let (events, _event_receiver) = mpsc::channel(8);
+        let (_shutdown_sender, mut shutdown) = watch::channel(false);
+
+        let session = run_session(
+            secure_stream,
+            &admission,
+            test_config(),
+            &mut outbound,
+            &events,
+            &mut shutdown,
+        );
+        let peer = async move {
+            let local = match read_message_for_version(&mut peer_stream, PROTOCOL_VERSION_V1)
+                .await
+                .unwrap()
+            {
+                WireMessage::Hello(hello) => hello,
+                other => panic!("expected hello, got {other:?}"),
+            };
+            write_test_message_for_version(
+                &mut peer_stream,
+                &WireMessage::Hello(remote_hello.clone()),
+                PROTOCOL_VERSION_V1,
+            )
+            .await;
+            assert!(matches!(
+                read_message_for_version(&mut peer_stream, PROTOCOL_VERSION_V2)
+                    .await
+                    .unwrap(),
+                WireMessage::Authenticate(_)
+            ));
+            write_test_message_for_version(
+                &mut peer_stream,
+                &WireMessage::Authenticate(AuthenticateV1 {
+                    peer_id: remote_hello.peer_id,
+                    scheme: "test-channel-binding-v1".to_owned(),
+                    proof: local.nonce.to_vec(),
+                }),
+                PROTOCOL_VERSION_V1,
+            )
+            .await;
+        };
+
+        let (result, ()) = tokio::join!(session, peer);
+        assert!(matches!(
+            result,
+            Err(SessionFailure {
+                error: SessionError::Network(NetworkError::Protocol(_)),
+                ..
+            })
+        ));
+    }
+
+    #[tokio::test]
+    async fn selected_v2_rejects_v1_application_frame() {
+        let local_hello = hello_with_versions(1, PROTOCOL_VERSION_V1, PROTOCOL_VERSION_V2);
+        let remote_hello = hello_with_versions(20, PROTOCOL_VERSION_V1, PROTOCOL_VERSION_V2);
+        let (session_stream, mut peer_stream) = tokio::io::duplex(4_096);
+        let secure_stream = TestSecureStream {
+            stream: session_stream,
+            identity: identity(&remote_hello),
+        };
+        let admission = TestAdmission { hello: local_hello };
+        let (_outbound_sender, mut outbound) = mpsc::channel(8);
+        let (events, _event_receiver) = mpsc::channel(8);
+        let (_shutdown_sender, mut shutdown) = watch::channel(false);
+
+        let session = run_session(
+            secure_stream,
+            &admission,
+            test_config(),
+            &mut outbound,
+            &events,
+            &mut shutdown,
+        );
+        let peer = async move {
+            let local = match read_message_for_version(&mut peer_stream, PROTOCOL_VERSION_V1)
+                .await
+                .unwrap()
+            {
+                WireMessage::Hello(hello) => hello,
+                other => panic!("expected hello, got {other:?}"),
+            };
+            write_test_message_for_version(
+                &mut peer_stream,
+                &WireMessage::Hello(remote_hello.clone()),
+                PROTOCOL_VERSION_V1,
+            )
+            .await;
+            assert!(matches!(
+                read_message_for_version(&mut peer_stream, PROTOCOL_VERSION_V2)
+                    .await
+                    .unwrap(),
+                WireMessage::Authenticate(_)
+            ));
+            write_test_message_for_version(
+                &mut peer_stream,
+                &WireMessage::Authenticate(AuthenticateV1 {
+                    peer_id: remote_hello.peer_id,
+                    scheme: "test-channel-binding-v1".to_owned(),
+                    proof: local.nonce.to_vec(),
+                }),
+                PROTOCOL_VERSION_V2,
+            )
+            .await;
+            write_test_message_for_version(
+                &mut peer_stream,
+                &WireMessage::Ping(kvm_protocol::PingV1 {
+                    nonce: 51,
+                    sent_at_ns: 52,
+                }),
+                PROTOCOL_VERSION_V1,
+            )
+            .await;
+        };
+
+        let (result, ()) = tokio::join!(session, peer);
+        assert!(matches!(
+            result,
+            Err(SessionFailure {
+                error: SessionError::Network(NetworkError::Protocol(_)),
+                ..
+            })
+        ));
     }
 
     #[tokio::test(start_paused = true)]
@@ -2072,6 +3814,338 @@ mod tests {
         )
         .await;
         assert_eq!(result.unwrap(), SessionEnd::Shutdown);
+    }
+
+    #[tokio::test]
+    async fn secure_peer_session_runs_the_listener_direction() {
+        let local_hello = hello(20);
+        let remote_hello = hello(1);
+        let (session_stream, peer_stream) = tokio::io::duplex(4_096);
+        let secure_stream = InboundTestSecureStream(TestSecureStream {
+            stream: session_stream,
+            identity: identity(&remote_hello),
+        });
+        let (session, _sender, mut events) =
+            SecurePeerSession::new(TestAdmission { hello: local_hello }, test_config()).unwrap();
+        let (shutdown_sender, shutdown) = watch::channel(false);
+        let mut peer_shutdown = shutdown.clone();
+
+        let runner = session.run(secure_stream, shutdown);
+        let peer = async move {
+            let (read, write) = tokio::io::split(peer_stream);
+            let mut reader = FrameReader::new_authenticated(read);
+            let mut writer = FrameWriter::new_authenticated(write);
+            let received_hello = match reader.read_message().await.unwrap() {
+                WireMessage::Hello(hello) => hello,
+                other => panic!("expected hello, got {other:?}"),
+            };
+            writer
+                .write_message(&WireMessage::Hello(remote_hello.clone()))
+                .await
+                .unwrap();
+            assert!(matches!(
+                reader.read_message().await.unwrap(),
+                WireMessage::Authenticate(_)
+            ));
+            writer
+                .write_message(&WireMessage::Authenticate(AuthenticateV1 {
+                    peer_id: remote_hello.peer_id,
+                    scheme: "test-channel-binding-v1".to_owned(),
+                    proof: received_hello.nonce.to_vec(),
+                }))
+                .await
+                .unwrap();
+            wait_for_shutdown(&mut peer_shutdown).await;
+        };
+        let observer = async move {
+            assert_eq!(
+                events.recv().await.unwrap(),
+                PeerEvent::StateChanged(ConnectionState::Authenticating)
+            );
+            assert!(matches!(
+                events.recv().await.unwrap(),
+                PeerEvent::Admitted(_)
+            ));
+            assert_eq!(
+                events.recv().await.unwrap(),
+                PeerEvent::StateChanged(ConnectionState::Connected)
+            );
+            shutdown_sender.send(true).unwrap();
+        };
+
+        let (result, (), ()) = tokio::join!(runner, peer, observer);
+        assert_eq!(result.unwrap(), SessionEnd::Shutdown);
+    }
+
+    #[tokio::test]
+    async fn secure_peer_session_rejects_noncanonical_direction_before_hello() {
+        let local_hello = hello(20);
+        let remote_hello = hello(1);
+        let (session_stream, mut peer_stream) = tokio::io::duplex(4_096);
+        let secure_stream = TestSecureStream {
+            stream: session_stream,
+            identity: identity(&remote_hello),
+        };
+        let (session, sender, mut events) =
+            SecurePeerSession::new(TestAdmission { hello: local_hello }, test_config()).unwrap();
+        sender.try_send(input(91)).unwrap();
+        let (_shutdown_sender, shutdown) = watch::channel(false);
+
+        assert!(matches!(
+            session.run(secure_stream, shutdown).await,
+            Err(SessionError::NoncanonicalDirection)
+        ));
+        assert_eq!(
+            events.recv().await.unwrap(),
+            PeerEvent::StateChanged(ConnectionState::Disconnected)
+        );
+        assert_eq!(
+            events.recv().await.unwrap(),
+            PeerEvent::Disconnected {
+                reason: DisconnectReason::IdentityMismatch,
+                undelivered: UndeliveredTraffic {
+                    messages: vec![UndeliveredMessage {
+                        message_type: MessageType::Input,
+                        traffic_class: TrafficClass::Input,
+                        sequence: Some(91),
+                        partially_sent: false,
+                    }],
+                    partial_inbound_bytes: 0,
+                    requires_input_reconciliation: true,
+                },
+            }
+        );
+        let mut byte = [0_u8; 1];
+        assert_eq!(peer_stream.read(&mut byte).await.unwrap(), 0);
+    }
+
+    #[test]
+    fn generation_bound_admission_activates_only_its_embedded_capability() {
+        let mut gate =
+            ConnectionGenerationGate::new(WirePeerId([1; 16]), WirePeerId([2; 16])).unwrap();
+        let pending = gate.begin_pending(ConnectionDirection::Outbound).unwrap();
+        let generation = pending.generation();
+        let local = hello(1);
+        let remote = hello(2);
+        let admitted = AdmittedPeer {
+            transport_identity: identity(&remote),
+            local_hello: local,
+            remote_hello: remote,
+            selected_protocol_version: PROTOCOL_VERSION_V1,
+            session_id: [0; 32],
+        };
+        let bound = GenerationBoundPeerEvent {
+            generation,
+            state: GenerationBoundPeerEventState::Admission(pending),
+            event: Some(PeerEvent::Admitted(admitted.clone())),
+        };
+
+        let applied = bound.apply(&mut gate).unwrap();
+        assert_eq!(
+            applied.classification(),
+            GenerationBoundEventClassification::Activated
+        );
+        let (active, event) = applied.into_activation().unwrap();
+        assert_eq!(active.generation(), generation);
+        assert_eq!(event, PeerEvent::Admitted(admitted));
+        assert!(gate.is_active(generation));
+    }
+
+    #[test]
+    fn active_bound_event_is_rejected_by_an_equivalent_new_gate() {
+        let mut first =
+            ConnectionGenerationGate::new(WirePeerId([1; 16]), WirePeerId([2; 16])).unwrap();
+        let first_pending = first.begin_pending(ConnectionDirection::Outbound).unwrap();
+        let stale_generation = first_pending.generation();
+        let _first_active = first.activate(first_pending).unwrap();
+
+        let mut replacement =
+            ConnectionGenerationGate::new(WirePeerId([1; 16]), WirePeerId([2; 16])).unwrap();
+        let replacement_pending = replacement
+            .begin_pending(ConnectionDirection::Outbound)
+            .unwrap();
+        let replacement_generation = replacement_pending.generation();
+        let _replacement_active = replacement.activate(replacement_pending).unwrap();
+        assert_eq!(stale_generation.get(), replacement_generation.get());
+        assert_ne!(stale_generation, replacement_generation);
+
+        let stale = GenerationBoundPeerEvent {
+            generation: stale_generation,
+            state: GenerationBoundPeerEventState::Active,
+            event: Some(PeerEvent::StateChanged(ConnectionState::Connected)),
+        };
+        assert!(matches!(
+            stale.apply(&mut replacement),
+            Err(ConnectionGenerationError::StaleActive)
+        ));
+    }
+
+    #[test]
+    fn pre_admission_cancellation_clears_only_the_exact_pending_gate() {
+        let mut gate =
+            ConnectionGenerationGate::new(WirePeerId([1; 16]), WirePeerId([2; 16])).unwrap();
+        let pending = gate.begin_pending(ConnectionDirection::Outbound).unwrap();
+        let generation = pending.generation();
+        let cancellation = GenerationBoundPeerEvent {
+            generation,
+            state: GenerationBoundPeerEventState::Cancelled(pending),
+            event: None,
+        };
+
+        let applied = cancellation.apply(&mut gate).unwrap();
+        assert_eq!(
+            applied.classification(),
+            GenerationBoundEventClassification::Cancelled
+        );
+        assert!(gate.begin_pending(ConnectionDirection::Outbound).is_ok());
+    }
+
+    #[test]
+    fn invalid_bound_session_config_returns_the_pending_capability() {
+        let mut gate =
+            ConnectionGenerationGate::new(WirePeerId([1; 16]), WirePeerId([2; 16])).unwrap();
+        let pending = gate.begin_pending(ConnectionDirection::Outbound).unwrap();
+        let mut config = test_config();
+        config.admission_timeout = Duration::ZERO;
+        let Err(error) =
+            GenerationBoundPeerSession::new(TestAdmission { hello: hello(1) }, config, pending)
+        else {
+            panic!("invalid config unexpectedly built a bound session");
+        };
+
+        assert!(matches!(error.error(), PeerConfigError::Invalid(_)));
+        let applied = error.into_cancellation().apply(&mut gate).unwrap();
+        assert_eq!(
+            applied.classification(),
+            GenerationBoundEventClassification::Cancelled
+        );
+        assert!(gate.begin_pending(ConnectionDirection::Outbound).is_ok());
+    }
+
+    #[tokio::test]
+    async fn closed_receiver_before_protocol_failure_returns_exact_cancellation() {
+        let local_hello = hello(1);
+        let remote_hello = hello(20);
+        let mut gate =
+            ConnectionGenerationGate::new(local_hello.peer_id, remote_hello.peer_id).unwrap();
+        let pending = gate.begin_pending(ConnectionDirection::Outbound).unwrap();
+        let (session_stream, attacker_stream) = tokio::io::duplex(4_096);
+        let secure_stream = TestSecureStream {
+            stream: session_stream,
+            identity: identity(&remote_hello),
+        };
+        let (session, _sender, bound_events) = GenerationBoundPeerSession::new(
+            TestAdmission { hello: local_hello },
+            test_config(),
+            pending,
+        )
+        .unwrap();
+        drop(bound_events);
+        let (_shutdown_sender, shutdown) = watch::channel(false);
+
+        let runner = session.run(secure_stream, shutdown);
+        let attacker = async move {
+            let (read, write) = tokio::io::split(attacker_stream);
+            let mut reader = FrameReader::new_authenticated(read);
+            let mut writer = FrameWriter::new_authenticated(write);
+            assert!(matches!(
+                reader.read_message().await.unwrap(),
+                WireMessage::Hello(_)
+            ));
+            writer.write_message(&input(44)).await.unwrap();
+        };
+        let (result, ()) = tokio::join!(runner, attacker);
+        let terminal = result
+            .unwrap_err()
+            .into_terminal_event()
+            .expect("pre-admission failure retains cancellation capability");
+        let applied = terminal.apply(&mut gate).unwrap();
+
+        assert_eq!(
+            applied.classification(),
+            GenerationBoundEventClassification::Cancelled
+        );
+        assert!(gate.begin_pending(ConnectionDirection::Outbound).is_ok());
+    }
+
+    #[tokio::test]
+    async fn capacity_one_preserves_an_active_terminal_after_admission_backpressure() {
+        let mut gate =
+            ConnectionGenerationGate::new(WirePeerId([1; 16]), WirePeerId([2; 16])).unwrap();
+        let pending = gate.begin_pending(ConnectionDirection::Outbound).unwrap();
+        let generation = pending.generation();
+        let remote = hello(2);
+        let admission = GenerationBoundPeerEvent {
+            generation,
+            state: GenerationBoundPeerEventState::Admission(pending),
+            event: Some(PeerEvent::Admitted(AdmittedPeer {
+                transport_identity: identity(&remote),
+                local_hello: hello(1),
+                remote_hello: remote,
+                selected_protocol_version: PROTOCOL_VERSION_V1,
+                session_id: [0; 32],
+            })),
+        };
+        let (sender, mut receiver) = mpsc::channel(1);
+        try_send_bound_event(&sender, admission).unwrap();
+        let rejected = try_send_bound_event(
+            &sender,
+            GenerationBoundPeerEvent {
+                generation,
+                state: GenerationBoundPeerEventState::Active,
+                event: Some(PeerEvent::StateChanged(ConnectionState::Connected)),
+            },
+        )
+        .unwrap_err();
+        let terminal = recover_terminal_event(rejected, generation, true).unwrap();
+
+        let applied = receiver.recv().await.unwrap().apply(&mut gate).unwrap();
+        let (_active, _) = applied.into_activation().unwrap();
+        assert!(matches!(
+            terminal.apply(&mut gate).unwrap().event(),
+            Some(PeerEvent::Disconnected { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn receiver_closed_after_admission_preserves_an_active_terminal() {
+        let mut gate =
+            ConnectionGenerationGate::new(WirePeerId([1; 16]), WirePeerId([2; 16])).unwrap();
+        let pending = gate.begin_pending(ConnectionDirection::Outbound).unwrap();
+        let generation = pending.generation();
+        let remote = hello(2);
+        let admission = GenerationBoundPeerEvent {
+            generation,
+            state: GenerationBoundPeerEventState::Admission(pending),
+            event: Some(PeerEvent::Admitted(AdmittedPeer {
+                transport_identity: identity(&remote),
+                local_hello: hello(1),
+                remote_hello: remote,
+                selected_protocol_version: PROTOCOL_VERSION_V1,
+                session_id: [0; 32],
+            })),
+        };
+        let (sender, mut receiver) = mpsc::channel(1);
+        try_send_bound_event(&sender, admission).unwrap();
+        let admission = receiver.recv().await.unwrap();
+        drop(receiver);
+        let rejected = try_send_bound_event(
+            &sender,
+            GenerationBoundPeerEvent {
+                generation,
+                state: GenerationBoundPeerEventState::Active,
+                event: Some(PeerEvent::StateChanged(ConnectionState::Connected)),
+            },
+        )
+        .unwrap_err();
+        let terminal = recover_terminal_event(rejected, generation, true).unwrap();
+
+        let applied = admission.apply(&mut gate).unwrap();
+        let (_active, _) = applied.into_activation().unwrap();
+        assert!(matches!(
+            terminal.apply(&mut gate).unwrap().event(),
+            Some(PeerEvent::Disconnected { .. })
+        ));
     }
 
     #[tokio::test(start_paused = true)]

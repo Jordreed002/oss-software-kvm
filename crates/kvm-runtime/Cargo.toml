@@ -1,0 +1,49 @@
+[package]
+name = "kvm-runtime"
+version.workspace = true
+edition.workspace = true
+repository.workspace = true
+description = "Fail-closed runtime composition boundary for Software KVM"
+
+[dependencies]
+kvm-config = { path = "../kvm-config" }
+kvm-daemon = { path = "../kvm-daemon" }
+kvm-network = { path = "../kvm-network" }
+kvm-protocol = { path = "../kvm-protocol" }
+kvm-security = { path = "../kvm-security" }
+kvm-topology = { path = "../kvm-topology" }
+kvm-types = { path = "../kvm-types" }
+serde = { version = "1", features = ["derive"] }
+sha2 = "0.11"
+toml = "1.1"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "sync", "time"] }
+zeroize = "1"
+
+[target.'cfg(unix)'.dependencies]
+rustix = { version = "1", features = ["fs", "process"] }
+
+[target.'cfg(windows)'.dependencies]
+kvm-windows = { path = "../kvm-windows" }
+windows = { version = "0.62.2", features = [
+    "Wdk_Foundation",
+    "Wdk_Storage_FileSystem",
+    "Wdk_System_SystemServices",
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_Storage_FileSystem",
+    "Win32_System_IO",
+    "Win32_System_Ioctl",
+    "Win32_System_Threading",
+] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+kvm-macos = { path = "../kvm-macos" }
+
+[dev-dependencies]
+kvm-input = { path = "../kvm-input" }
+rcgen = "0.14"
+tempfile = "3"
+
+[lints]
+workspace = true

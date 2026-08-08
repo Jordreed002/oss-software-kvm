@@ -5,6 +5,7 @@ use std::time::Duration;
 
 use kvm_daemon::{CapturedInput, EventClassification};
 use kvm_input::InputPayload;
+use kvm_types::HostId;
 
 pub const DEFAULT_OBSERVE_SECONDS: u64 = 15;
 pub const MAX_OBSERVE_SECONDS: u64 = 300;
@@ -12,10 +13,15 @@ pub const MAX_OBSERVE_SECONDS: u64 = 300;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Command {
     Probe,
-    Devices,
-    Displays,
+    Devices(InventoryOptions),
+    Displays(InventoryOptions),
     Observe(ObserveOptions),
     All(ObserveOptions),
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct InventoryOptions {
+    pub host_id: Option<HostId>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -79,8 +85,12 @@ where
 
     match command.as_str() {
         "probe" => parse_without_options(args, Command::Probe),
-        "devices" => parse_without_options(args, Command::Devices),
-        "displays" => parse_without_options(args, Command::Displays),
+        "devices" => {
+            parse_inventory(args).map(|options| ParseOutcome::Run(Command::Devices(options)))
+        }
+        "displays" => {
+            parse_inventory(args).map(|options| ParseOutcome::Run(Command::Displays(options)))
+        }
         "observe" => {
             parse_observe(args).map(|options| ParseOutcome::Run(Command::Observe(options)))
         }
@@ -89,6 +99,29 @@ where
             "unknown command `{command}`; expected probe, devices, displays, observe, or all"
         ))),
     }
+}
+
+fn parse_inventory<I>(mut args: I) -> Result<InventoryOptions, ParseError>
+where
+    I: Iterator<Item = String>,
+{
+    let Some(argument) = args.next() else {
+        return Ok(InventoryOptions::default());
+    };
+    if argument != "--host-id" {
+        return Err(ParseError("expected --host-id UUID".into()));
+    }
+    let value = args
+        .next()
+        .ok_or_else(|| ParseError("--host-id requires a UUID".into()))?;
+    ensure_empty(args)?;
+    let host_id = HostId::parse(&value).map_err(|_| ParseError("invalid host UUID".into()))?;
+    if host_id.into_bytes() == [0; 16] {
+        return Err(ParseError("host UUID must be non-nil".into()));
+    }
+    Ok(InventoryOptions {
+        host_id: Some(host_id),
+    })
 }
 
 fn parse_without_options<I>(args: I, command: Command) -> Result<ParseOutcome, ParseError>
@@ -188,7 +221,9 @@ pub fn format_observation(
         event.timestamp_ns
     );
     if show_payload {
-        format!("{base} payload={:?}", event.payload)
+        let payload =
+            serde_json::to_string(&event.payload).unwrap_or_else(|_| "\"unavailable\"".to_owned());
+        format!("{base} payload={payload}")
     } else {
         base
     }
@@ -200,8 +235,8 @@ pub const fn help_text() -> &'static str {
 \n\
 Usage:\n\
   kvm-diagnostics probe\n\
-  kvm-diagnostics devices\n\
-  kvm-diagnostics displays\n\
+  kvm-diagnostics devices [--host-id UUID]\n\
+  kvm-diagnostics displays [--host-id UUID]\n\
   kvm-diagnostics observe [--duration-seconds N] [--show-payload]\n\
   kvm-diagnostics all [--duration-seconds N] [--show-payload]\n\
 \n\
@@ -225,6 +260,26 @@ mod tests {
                 show_payload: true,
             })))
         );
+    }
+
+    #[test]
+    fn inventory_can_use_the_exact_configured_host_identity() {
+        let marker = "71717171-7171-4171-8171-717171717171";
+        let expected = HostId::parse(marker).unwrap();
+
+        assert_eq!(
+            parse_args(["displays", "--host-id", marker]),
+            Ok(ParseOutcome::Run(Command::Displays(InventoryOptions {
+                host_id: Some(expected),
+            })))
+        );
+        assert!(parse_args(["devices", "--host-id", "not-a-uuid"]).is_err());
+        assert!(parse_args([
+            "displays",
+            "--host-id",
+            "00000000-0000-0000-0000-000000000000"
+        ])
+        .is_err());
     }
 
     #[test]
@@ -271,7 +326,8 @@ mod tests {
     #[test]
     fn detailed_presentation_is_an_explicit_payload_view() {
         let output = format_observation(1, Duration::ZERO, key_observation(), true);
-        assert!(output.contains("payload=Key"));
-        assert!(output.contains("KeyA"));
+        assert!(output.contains("payload={\"key\""));
+        assert!(output.contains("\"key_a\""));
+        assert!(output.contains("\"pressed\""));
     }
 }

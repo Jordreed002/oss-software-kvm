@@ -1,21 +1,48 @@
 use kvm_daemon::{
-    CaptureCallback, DisplayBackend, InputCaptureBackend, OutputInjectionBackend, PlatformError,
+    CaptureCallback, CaptureLifecycleState, DisplayBackend, InputCaptureBackend,
+    OutputInjectionBackend, PlatformError,
 };
 use kvm_input::InputEvent;
 use kvm_types::{Display, HostId, InputDevice};
 
-use crate::{CaptureHealth, CaptureStatistics, MacBackendError, PermissionStatus};
+use crate::{
+    CaptureHealth, CaptureStatistics, MacBackendError, MacCaptureMode, PermissionStatus,
+    SuppressionScope,
+};
 
 /// Safe placeholder compiled on non-macOS hosts.
 #[derive(Debug)]
 pub struct MacInputBackend {
     host_id: HostId,
+    capture_mode: MacCaptureMode,
 }
 
 impl MacInputBackend {
     #[must_use]
     pub const fn new(host_id: HostId) -> Self {
-        Self { host_id }
+        Self {
+            host_id,
+            capture_mode: MacCaptureMode::IoHidObservation,
+        }
+    }
+
+    #[must_use]
+    pub const fn new_whole_host_alpha(host_id: HostId) -> Self {
+        Self {
+            host_id,
+            capture_mode: MacCaptureMode::WholeHostAlpha,
+        }
+    }
+
+    #[must_use]
+    pub const fn capture_mode(&self) -> MacCaptureMode {
+        self.capture_mode
+    }
+
+    #[must_use]
+    #[allow(clippy::unused_self)]
+    pub const fn suppression_scope(&self) -> SuppressionScope {
+        SuppressionScope::UnsupportedPlatform
     }
 
     #[must_use]
@@ -39,6 +66,10 @@ impl MacInputBackend {
             transition_discontinuities: 0,
             delivery_disconnects: 0,
             ignored_suppression_requests: 0,
+            suppressed_events: 0,
+            untranslated_events: 0,
+            callback_panics: 0,
+            tap_disables: 0,
             health: CaptureHealth::Idle,
         }
     }
@@ -55,6 +86,10 @@ impl InputCaptureBackend for MacInputBackend {
 
     fn stop_capture(&mut self) -> Result<(), PlatformError> {
         Err(MacBackendError::UnsupportedPlatform.into())
+    }
+
+    fn capture_lifecycle(&self) -> CaptureLifecycleState {
+        CaptureLifecycleState::Idle
     }
 }
 
@@ -121,6 +156,12 @@ mod tests {
         assert_eq!(input.host_id(), host);
         assert_eq!(display.host_id(), host);
         assert!(!MacInputBackend::selective_suppression_supported());
+        assert_eq!(input.capture_mode(), MacCaptureMode::IoHidObservation);
+        assert_eq!(
+            input.suppression_scope(),
+            SuppressionScope::UnsupportedPlatform
+        );
+        assert_eq!(input.capture_lifecycle(), CaptureLifecycleState::Idle);
         assert_eq!(input.capture_statistics(), CaptureStatistics::default());
         assert!(input.enumerate_devices().is_err());
         assert!(display.enumerate_displays().is_err());

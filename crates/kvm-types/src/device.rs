@@ -1,3 +1,5 @@
+use std::fmt;
+
 use serde::{Deserialize, Serialize};
 
 use crate::{DeviceId, HostId};
@@ -57,7 +59,7 @@ impl DeviceCapabilities {
 }
 
 /// A physical input source detected by a platform backend.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Eq, PartialEq, Serialize, Deserialize)]
 pub struct InputDevice {
     pub id: DeviceId,
     pub host_id: HostId,
@@ -66,6 +68,17 @@ pub struct InputDevice {
     pub product_id: Option<u16>,
     pub kind: DeviceKind,
     pub capabilities: DeviceCapabilities,
+}
+
+impl fmt::Debug for InputDevice {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("InputDevice")
+            .field("kind", &self.kind)
+            .field("identity", &"[REDACTED]")
+            .field("metadata", &"[REDACTED]")
+            .finish_non_exhaustive()
+    }
 }
 
 impl InputDevice {
@@ -90,12 +103,22 @@ impl InputDevice {
 }
 
 /// Configured destination policy for one physical device.
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Eq, Hash, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DeviceRoute {
     FollowActiveHost,
     Local,
     Host(HostId),
+}
+
+impl fmt::Debug for DeviceRoute {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::FollowActiveHost => "DeviceRoute::FollowActiveHost",
+            Self::Local => "DeviceRoute::Local",
+            Self::Host(_) => "DeviceRoute::Host([REDACTED])",
+        })
+    }
 }
 
 #[cfg(test)]
@@ -128,5 +151,32 @@ mod tests {
         assert_eq!(device.vendor_id, None);
         assert_eq!(device.product_id, None);
         assert_eq!(device.name, "Built-in Trackpad");
+    }
+
+    #[test]
+    fn device_and_route_diagnostics_hide_identity_and_metadata() {
+        let host = HostId::from_bytes([0x41; 16]);
+        let device_id = DeviceId::from_bytes([0x42; 16]);
+        let mut device = InputDevice::new(
+            device_id,
+            host,
+            "SECRET-DEVICE-NAME",
+            DeviceKind::Keyboard,
+            DeviceCapabilities::KEYBOARD,
+        );
+        device.vendor_id = Some(41_394);
+        device.product_id = Some(50_132);
+        let rendered = format!("{device:?} {:?}", DeviceRoute::Host(host));
+
+        assert!(rendered.contains("Keyboard"));
+        for secret in [
+            device_id.to_string(),
+            host.to_string(),
+            device.name.clone(),
+            "41394".to_owned(),
+            "50132".to_owned(),
+        ] {
+            assert!(!rendered.contains(&secret));
+        }
     }
 }

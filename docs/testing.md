@@ -5,8 +5,15 @@
 Platform-neutral crates use deterministic unit tests for identifiers, geometry, routing,
 normalized edge mapping, key/button state, protocol framing, sequencing, configuration migration,
 clipboard loop suppression, client-certificate-enforcing loopback TLS, exporter-bound mutual
-admission, and daemon peer reconciliation. Simulated native backends allow daemon and peer
-integration tests without capturing the developer's real keyboard or pointer.
+admission, deterministic connection roles/generations, stale-generation rejection, and daemon peer
+reconciliation. Hostile discovery records, deterministic cache expiry, latest-view mDNS delivery,
+listener rate/concurrency saturation, and automatic paired-peer scheduling are tested with bounded
+models and loopback/custom-port adapters. Logical-workspace tests cover prepare/ack/Commit pointer
+handoff, fresh display-inventory compilation, exact-generation retirement, and stale transition
+rejection. Follow Active Host tests cover FIFO-before-suppression, press/repeat/release latching,
+multi-keyboard failsafe state, bounded held ledgers, retryable partial cleanup, route-aware handoff,
+and queue/counter exhaustion. Simulated native backends allow daemon and peer integration tests
+without capturing the developer's real keyboard or pointer.
 
 Repository checks run on Linux, Windows, and macOS:
 
@@ -34,6 +41,11 @@ opt-in and should not be shared without review.
 The safety suite covers emergency release, cable loss, peer process termination, local daemon
 termination, permission revocation, held modifiers and buttons, route changes, and rapid boundary
 crossings. Every failure must restore local input without the control panel.
+
+Discovery release readiness additionally requires two physical hosts on the same private LAN to
+verify DNS-SD advertisement/removal, interface changes, sleep/wake, address churn, and multicast
+firewall behavior. Container custom-port tests validate lifecycle and parsing but do not prove that
+Bonjour, Windows firewall policy, or real multicast interfaces behave correctly.
 
 ## Performance
 

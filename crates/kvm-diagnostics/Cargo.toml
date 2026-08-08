@@ -8,6 +8,7 @@ description = "Read-only physical-host validation runner for Software KVM"
 kvm-daemon = { path = "../kvm-daemon" }
 kvm-input = { path = "../kvm-input" }
 kvm-types = { path = "../kvm-types" }
+serde_json = "1"
 
 [target.'cfg(windows)'.dependencies]
 kvm-windows = { path = "../kvm-windows" }

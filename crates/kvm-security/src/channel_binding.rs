@@ -51,12 +51,25 @@ pub trait PairingChannelBinding {
 }
 
 /// Failure to obtain authenticated channel-bound keying material.
-#[derive(Clone, Debug, Eq, Error, PartialEq)]
+#[derive(Clone, Eq, Error, PartialEq)]
 pub enum ChannelBindingError {
     /// No completed authenticated TLS channel exists.
     #[error("an authenticated TLS channel is required for pairing")]
     Unauthenticated,
     /// The TLS implementation rejected or failed the exporter operation.
-    #[error("TLS exporter failed: {0}")]
+    #[error("TLS exporter operation failed")]
     ExportFailed(String),
+}
+
+impl fmt::Debug for ChannelBindingError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let kind = match self {
+            Self::Unauthenticated => "Unauthenticated",
+            Self::ExportFailed(_) => "ExportFailed",
+        };
+        formatter
+            .debug_struct("ChannelBindingError")
+            .field("kind", &kind)
+            .finish_non_exhaustive()
+    }
 }

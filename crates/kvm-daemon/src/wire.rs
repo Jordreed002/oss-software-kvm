@@ -30,8 +30,8 @@ pub enum WireConversionError {
 /// Converts one validated v1 input DTO into the canonical domain event.
 ///
 /// Unknown HID usages remain explicit [`KeyCode::Unidentified`] values. A
-/// repeat remains an injected key-down while held-state tracking stays
-/// idempotent.
+/// Repeats remain explicit so session state can reject an unmatched repeat
+/// without confusing it with a first press.
 ///
 /// # Errors
 ///
@@ -114,7 +114,8 @@ fn payload_from_wire(payload: &WireInputPayloadV1) -> InputPayload {
         WireInputPayloadV1::Key { code, state } => InputPayload::Key {
             code: key_code_from_wire(code),
             state: match state {
-                WireKeyState::Down | WireKeyState::Repeat => KeyState::Pressed,
+                WireKeyState::Down => KeyState::Pressed,
+                WireKeyState::Repeat => KeyState::Repeated,
                 WireKeyState::Up => KeyState::Released,
             },
         },
@@ -142,6 +143,7 @@ fn payload_to_wire(payload: InputPayload) -> Result<WireInputPayloadV1, WireConv
             code: key_to_wire(code)?,
             state: match state {
                 KeyState::Pressed => WireKeyState::Down,
+                KeyState::Repeated => WireKeyState::Repeat,
                 KeyState::Released => WireKeyState::Up,
             },
         },
@@ -562,7 +564,7 @@ mod tests {
     }
 
     #[test]
-    fn wire_repeat_is_an_idempotently_trackable_press() {
+    fn wire_repeat_is_bijectively_preserved() {
         let wire = InputEventV1 {
             sequence: 1,
             timestamp_ns: 2,
@@ -580,7 +582,24 @@ mod tests {
             input_from_wire(&wire).unwrap().payload,
             InputPayload::Key {
                 code: KeyCode::KeyA,
-                state: KeyState::Pressed
+                state: KeyState::Repeated
+            }
+        ));
+        let domain = InputEvent::new(
+            3,
+            4,
+            HOST,
+            DEVICE,
+            InputPayload::Key {
+                code: KeyCode::KeyA,
+                state: KeyState::Repeated,
+            },
+        );
+        assert!(matches!(
+            input_to_wire(&domain).unwrap().payload,
+            WireInputPayloadV1::Key {
+                state: WireKeyState::Repeat,
+                ..
             }
         ));
     }

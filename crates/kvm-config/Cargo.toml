@@ -5,9 +5,9 @@ edition = "2021"
 description = "Versioned persistent configuration for Software KVM"
 
 [dependencies]
+kvm-router = { path = "../kvm-router" }
 kvm-types = { path = "../kvm-types" }
 serde = { version = "1", features = ["derive"] }
-thiserror = "2"
 toml = "1.1"
 
 [lints]

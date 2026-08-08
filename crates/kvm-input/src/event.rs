@@ -1,26 +1,41 @@
+use std::fmt;
+
 use kvm_types::{DeviceId, HostId};
 use serde::{Deserialize, Serialize};
 
 use crate::KeyCode;
 
 /// State transition for a keyboard key.
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Eq, Hash, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum KeyState {
     Pressed,
+    Repeated,
     Released,
 }
 
+impl fmt::Debug for KeyState {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("KeyState([REDACTED])")
+    }
+}
+
 /// State transition for a pointer button.
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Eq, Hash, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ButtonState {
     Pressed,
     Released,
 }
 
+impl fmt::Debug for ButtonState {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("ButtonState([REDACTED])")
+    }
+}
+
 /// A conventional pointer button or an additional numbered button.
-#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+#[derive(Clone, Copy, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PointerButton {
     Left,
@@ -31,8 +46,14 @@ pub enum PointerButton {
     Other(u16),
 }
 
+impl fmt::Debug for PointerButton {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("PointerButton([REDACTED])")
+    }
+}
+
 /// A canonical input action. Pointer deltas and scroll amounts remain relative.
-#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Copy, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum InputPayload {
     Key {
@@ -53,6 +74,21 @@ pub enum InputPayload {
     },
 }
 
+impl fmt::Debug for InputPayload {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let kind = match self {
+            Self::Key { .. } => "Key",
+            Self::PointerMove { .. } => "PointerMove",
+            Self::PointerButton { .. } => "PointerButton",
+            Self::Scroll { .. } => "Scroll",
+        };
+        formatter
+            .debug_struct("InputPayload")
+            .field("kind", &kind)
+            .finish_non_exhaustive()
+    }
+}
+
 impl InputPayload {
     /// Whether all numeric values in the event are finite.
     #[must_use]
@@ -69,7 +105,7 @@ impl InputPayload {
 }
 
 /// A sequenced input event from one physical source.
-#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct InputEvent {
     pub sequence: u64,
     /// Monotonic source timestamp in nanoseconds; not wall-clock time.
@@ -77,6 +113,16 @@ pub struct InputEvent {
     pub source_host: HostId,
     pub source_device: DeviceId,
     pub payload: InputPayload,
+}
+
+impl fmt::Debug for InputEvent {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("InputEvent")
+            .field("payload", &self.payload)
+            .field("source", &"[REDACTED]")
+            .finish_non_exhaustive()
+    }
 }
 
 impl InputEvent {
@@ -154,5 +200,49 @@ mod tests {
         let json = serde_json::to_string(&event).unwrap();
         let decoded: InputEvent = serde_json::from_str(&json).unwrap();
         assert_eq!(decoded, event);
+    }
+
+    #[test]
+    fn input_diagnostics_hide_payload_identity_and_ordering_details() {
+        let host = HostId::from_bytes([0x41; 16]);
+        let device = DeviceId::from_bytes([0x42; 16]);
+        let event = InputEvent::new(
+            987_654_321,
+            123_456_789,
+            host,
+            device,
+            InputPayload::Scroll {
+                horizontal: 12_345.678_9,
+                vertical: -98_765.432_1,
+            },
+        );
+        let rendered = format!("{event:?} {:?}", event.payload);
+
+        assert!(rendered.contains("Scroll"));
+        for secret in [
+            host.to_string(),
+            device.to_string(),
+            event.sequence.to_string(),
+            event.timestamp_ns.to_string(),
+            "12345.6789".to_owned(),
+            "-98765.4321".to_owned(),
+        ] {
+            assert!(!rendered.contains(&secret));
+        }
+    }
+
+    #[test]
+    fn state_and_button_diagnostics_hide_exact_controls() {
+        let rendered = format!(
+            "{:?} {:?} {:?} {:?} {:?}",
+            KeyState::Pressed,
+            KeyState::Repeated,
+            KeyState::Released,
+            ButtonState::Pressed,
+            PointerButton::Other(54_321)
+        );
+        for secret in ["Pressed", "Repeated", "Released", "Other", "54321"] {
+            assert!(!rendered.contains(secret));
+        }
     }
 }

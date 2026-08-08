@@ -1,9 +1,11 @@
+use core::fmt;
+
 use serde::{Deserialize, Serialize};
 
 use crate::{DisplayId, HostId, Rect, Size};
 
 /// A display reported by a platform backend.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
 pub struct Display {
     pub id: DisplayId,
     pub host_id: HostId,
@@ -18,6 +20,12 @@ pub struct Display {
     /// Display bounds in the owning host's native logical coordinate system.
     pub native_bounds: Rect,
     pub primary: bool,
+}
+
+impl fmt::Debug for Display {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("Display([REDACTED])")
+    }
 }
 
 impl Display {
@@ -68,5 +76,16 @@ mod tests {
         value.scale_factor = 2.0;
         value.refresh_rate = Some(f64::NAN);
         assert!(!value.is_valid());
+    }
+
+    #[test]
+    fn debug_omits_name_identity_and_geometry() {
+        let mut value = display();
+        value.name = "peer-controlled-display-marker".into();
+
+        let rendered = format!("{value:?}");
+        assert_eq!(rendered, "Display([REDACTED])");
+        assert!(!rendered.contains("peer-controlled-display-marker"));
+        assert!(!rendered.contains("1512"));
     }
 }

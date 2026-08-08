@@ -1,10 +1,11 @@
 use crate::{
-    connector::sealed, AuthenticatedConnector, DevelopmentAddress, SecurePeerStream,
-    TransportPeerIdentity,
+    connector::sealed, AuthenticatedConnector, AuthenticatedLanConnector, ConnectionDirection,
+    DevelopmentAddress, LanPeerAddress, SecurePeerStream, TransportPeerIdentity,
 };
 use sha2::{Digest, Sha256};
 use std::future::Future;
 use std::io;
+use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
@@ -24,6 +25,15 @@ use tokio_rustls::TlsConnector;
 use zeroize::Zeroizing;
 
 const KVM_ALPN: &[u8] = b"software-kvm/1";
+const MAX_CERTIFICATE_CHAIN_LENGTH: usize = 8;
+const MAX_CERTIFICATE_DER_BYTES: usize = 64 * 1024;
+const MAX_CERTIFICATE_CHAIN_DER_BYTES: usize = 256 * 1024;
+const MAX_PRIVATE_KEY_DER_BYTES: usize = 16 * 1024;
+const MAX_TRUST_ROOTS: usize = 64;
+const MAX_TRUST_ROOT_DER_BYTES: usize = 64 * 1024;
+const MAX_TRUST_ROOTS_DER_BYTES: usize = 1024 * 1024;
+const MAX_CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
+const MAX_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Public certificate chain and PKCS#8 private key presented for TLS client
 /// authentication when requested by the server. Debug output is fully redacted.
@@ -85,7 +95,7 @@ impl Default for RustlsConnectorConfig {
 
 #[derive(Clone, Copy, Debug, Error, Eq, PartialEq)]
 pub enum RustlsConnectorConfigError {
-    #[error("TCP connect and TLS handshake timeouts must be positive")]
+    #[error("TCP connect or TLS handshake timeout is outside the permitted range")]
     InvalidTimeout,
     #[error("a client certificate chain is required")]
     MissingClientCertificate,
@@ -93,6 +103,10 @@ pub enum RustlsConnectorConfigError {
     MissingClientPrivateKey,
     #[error("at least one server trust root is required")]
     MissingServerTrustRoot,
+    #[error("client credential input exceeds its permitted bound")]
+    ClientCredentialsTooLarge,
+    #[error("server trust input exceeds its permitted bound")]
+    ServerTrustTooLarge,
     #[error("server name is invalid")]
     InvalidServerName,
     #[error("server trust root is malformed")]
@@ -136,18 +150,7 @@ impl RustlsTcpConnector {
         expected_peer: TransportPeerIdentity,
         config: RustlsConnectorConfig,
     ) -> Result<Self, RustlsConnectorConfigError> {
-        if config.connect_timeout == Duration::ZERO || config.handshake_timeout == Duration::ZERO {
-            return Err(RustlsConnectorConfigError::InvalidTimeout);
-        }
-        if credentials.certificate_chain_der.is_empty() {
-            return Err(RustlsConnectorConfigError::MissingClientCertificate);
-        }
-        if credentials.private_key_pkcs8_der.is_empty() {
-            return Err(RustlsConnectorConfigError::MissingClientPrivateKey);
-        }
-        if server_trust.root_certificates_der.is_empty() {
-            return Err(RustlsConnectorConfigError::MissingServerTrustRoot);
-        }
+        validate_inputs(&credentials, &server_trust, config)?;
 
         let server_name = ServerName::try_from(server_name)
             .map_err(|_| RustlsConnectorConfigError::InvalidServerName)?;
@@ -189,16 +192,53 @@ impl RustlsTcpConnector {
             config,
         })
     }
+
+    async fn connect_socket(&self, address: SocketAddr) -> io::Result<RustlsPeerStream> {
+        let tcp = timeout_io(
+            self.config.connect_timeout,
+            TcpStream::connect(address),
+            "TCP connection timed out",
+        )
+        .await?;
+        tcp.set_nodelay(true)?;
+
+        let connector = TlsConnector::from(Arc::clone(&self.client_config));
+        let tls = timeout_io(
+            self.config.handshake_timeout,
+            async {
+                connector
+                    .connect(self.server_name.clone(), tcp)
+                    .await
+                    .map_err(|_| authentication_failed())
+            },
+            "TLS handshake timed out",
+        )
+        .await?;
+
+        let connection = tls.get_ref().1;
+        if connection.alpn_protocol() != Some(KVM_ALPN) {
+            return Err(authentication_failed());
+        }
+        let certificates = connection
+            .peer_certificates()
+            .ok_or_else(authentication_failed)?;
+        validate_authenticated_chain_bounds(certificates)?;
+        let leaf = certificates.first().ok_or_else(authentication_failed)?;
+        let fingerprint: [u8; 32] = Sha256::digest(leaf.as_ref()).into();
+        if !bool::from(fingerprint.ct_eq(&self.expected_peer.credential_fingerprint)) {
+            return Err(authentication_failed());
+        }
+
+        Ok(RustlsPeerStream {
+            inner: tls,
+            identity: self.expected_peer.clone(),
+        })
+    }
 }
 
 impl std::fmt::Debug for RustlsTcpConnector {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter
-            .debug_struct("RustlsTcpConnector")
-            .field("server_name", &self.server_name)
-            .field("expected_peer", &self.expected_peer)
-            .field("config", &self.config)
-            .finish_non_exhaustive()
+        formatter.write_str("RustlsTcpConnector([REDACTED])")
     }
 }
 
@@ -211,46 +251,18 @@ impl AuthenticatedConnector for RustlsTcpConnector {
         &'a mut self,
         address: DevelopmentAddress,
     ) -> Pin<Box<dyn Future<Output = io::Result<Self::Stream>> + Send + 'a>> {
-        Box::pin(async move {
-            let tcp = timeout_io(
-                self.config.connect_timeout,
-                TcpStream::connect(address.socket_addr()),
-                "TCP connection timed out",
-            )
-            .await?;
-            tcp.set_nodelay(true)?;
+        Box::pin(self.connect_socket(address.socket_addr()))
+    }
+}
 
-            let connector = TlsConnector::from(Arc::clone(&self.client_config));
-            let tls = timeout_io(
-                self.config.handshake_timeout,
-                async {
-                    connector
-                        .connect(self.server_name.clone(), tcp)
-                        .await
-                        .map_err(|_| authentication_failed())
-                },
-                "TLS handshake timed out",
-            )
-            .await?;
+impl AuthenticatedLanConnector for RustlsTcpConnector {
+    type Stream = RustlsPeerStream;
 
-            let connection = tls.get_ref().1;
-            if connection.alpn_protocol() != Some(KVM_ALPN) {
-                return Err(authentication_failed());
-            }
-            let leaf = connection
-                .peer_certificates()
-                .and_then(|certificates| certificates.first())
-                .ok_or_else(authentication_failed)?;
-            let fingerprint: [u8; 32] = Sha256::digest(leaf.as_ref()).into();
-            if !bool::from(fingerprint.ct_eq(&self.expected_peer.credential_fingerprint)) {
-                return Err(authentication_failed());
-            }
-
-            Ok(RustlsPeerStream {
-                inner: tls,
-                identity: self.expected_peer.clone(),
-            })
-        })
+    fn connect_lan(
+        &mut self,
+        address: LanPeerAddress,
+    ) -> Pin<Box<dyn Future<Output = io::Result<Self::Stream>> + Send + '_>> {
+        Box::pin(self.connect_socket(address.socket_addr()))
     }
 }
 
@@ -267,11 +279,84 @@ pub struct RustlsPeerStream {
 
 impl std::fmt::Debug for RustlsPeerStream {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter
-            .debug_struct("RustlsPeerStream")
-            .field("identity", &self.identity)
-            .finish_non_exhaustive()
+        formatter.write_str("RustlsPeerStream([REDACTED])")
     }
+}
+
+fn validate_inputs(
+    credentials: &RustlsClientCredentials,
+    server_trust: &RustlsServerTrust,
+    config: RustlsConnectorConfig,
+) -> Result<(), RustlsConnectorConfigError> {
+    if config.connect_timeout == Duration::ZERO
+        || config.connect_timeout > MAX_CONNECT_TIMEOUT
+        || config.handshake_timeout == Duration::ZERO
+        || config.handshake_timeout > MAX_HANDSHAKE_TIMEOUT
+    {
+        return Err(RustlsConnectorConfigError::InvalidTimeout);
+    }
+    if credentials.certificate_chain_der.is_empty() {
+        return Err(RustlsConnectorConfigError::MissingClientCertificate);
+    }
+    if credentials.private_key_pkcs8_der.is_empty() {
+        return Err(RustlsConnectorConfigError::MissingClientPrivateKey);
+    }
+    if server_trust.root_certificates_der.is_empty() {
+        return Err(RustlsConnectorConfigError::MissingServerTrustRoot);
+    }
+    if credentials.certificate_chain_der.len() > MAX_CERTIFICATE_CHAIN_LENGTH
+        || credentials.private_key_pkcs8_der.len() > MAX_PRIVATE_KEY_DER_BYTES
+        || !bounded_der_input(
+            &credentials.certificate_chain_der,
+            MAX_CERTIFICATE_DER_BYTES,
+            MAX_CERTIFICATE_CHAIN_DER_BYTES,
+        )
+    {
+        return Err(RustlsConnectorConfigError::ClientCredentialsTooLarge);
+    }
+    if server_trust.root_certificates_der.len() > MAX_TRUST_ROOTS
+        || !bounded_der_input(
+            &server_trust.root_certificates_der,
+            MAX_TRUST_ROOT_DER_BYTES,
+            MAX_TRUST_ROOTS_DER_BYTES,
+        )
+    {
+        return Err(RustlsConnectorConfigError::ServerTrustTooLarge);
+    }
+    Ok(())
+}
+
+fn bounded_der_input(items: &[Vec<u8>], maximum_item: usize, maximum_total: usize) -> bool {
+    let mut total = 0_usize;
+    for item in items {
+        if item.is_empty() || item.len() > maximum_item {
+            return false;
+        }
+        let Some(next) = total.checked_add(item.len()) else {
+            return false;
+        };
+        total = next;
+    }
+    total <= maximum_total
+}
+
+fn validate_authenticated_chain_bounds(certificates: &[CertificateDer<'_>]) -> io::Result<()> {
+    if certificates.is_empty() || certificates.len() > MAX_CERTIFICATE_CHAIN_LENGTH {
+        return Err(authentication_failed());
+    }
+    let mut total = 0_usize;
+    for certificate in certificates {
+        if certificate.is_empty() || certificate.len() > MAX_CERTIFICATE_DER_BYTES {
+            return Err(authentication_failed());
+        }
+        total = total
+            .checked_add(certificate.len())
+            .ok_or_else(authentication_failed)?;
+    }
+    if total > MAX_CERTIFICATE_CHAIN_DER_BYTES {
+        return Err(authentication_failed());
+    }
+    Ok(())
 }
 
 impl sealed::SecureStream for RustlsPeerStream {}
@@ -279,6 +364,10 @@ impl sealed::SecureStream for RustlsPeerStream {}
 impl SecurePeerStream for RustlsPeerStream {
     fn authenticated_peer_identity(&self) -> &TransportPeerIdentity {
         &self.identity
+    }
+
+    fn connection_direction(&self) -> ConnectionDirection {
+        ConnectionDirection::Outbound
     }
 
     fn export_keying_material(&self, label: &[u8], context: &[u8]) -> io::Result<[u8; 32]> {
@@ -471,6 +560,20 @@ mod tests {
         assert!(!trust_debug.contains("certificate-marker"));
         assert!(credential_debug.contains("REDACTED"));
         assert!(trust_debug.contains("REDACTED"));
+
+        let pki = TestPki::generate();
+        let connector = RustlsTcpConnector::new(
+            RustlsClientCredentials::new(
+                vec![pki.client_certificate.clone()],
+                pki.client_private_key.clone(),
+            ),
+            RustlsServerTrust::new(vec![pki.root.clone()]),
+            "stable-server-name-marker.test".to_owned(),
+            pki.identity(),
+            RustlsConnectorConfig::default(),
+        )
+        .unwrap();
+        assert_eq!(format!("{connector:?}"), "RustlsTcpConnector([REDACTED])");
     }
 
     #[test]
@@ -540,7 +643,7 @@ mod tests {
                 valid_credentials(),
                 valid_trust(),
                 "kvm.test".into(),
-                identity,
+                identity.clone(),
                 RustlsConnectorConfig {
                     connect_timeout: Duration::ZERO,
                     ..RustlsConnectorConfig::default()
@@ -548,6 +651,101 @@ mod tests {
             ),
             Err(RustlsConnectorConfigError::InvalidTimeout)
         ));
+    }
+
+    #[test]
+    fn constructor_rejects_every_timeout_above_or_below_its_hard_bound() {
+        let pki = TestPki::generate();
+        for config in [
+            RustlsConnectorConfig {
+                connect_timeout: Duration::ZERO,
+                ..RustlsConnectorConfig::default()
+            },
+            RustlsConnectorConfig {
+                handshake_timeout: Duration::ZERO,
+                ..RustlsConnectorConfig::default()
+            },
+            RustlsConnectorConfig {
+                connect_timeout: MAX_CONNECT_TIMEOUT + Duration::from_nanos(1),
+                ..RustlsConnectorConfig::default()
+            },
+            RustlsConnectorConfig {
+                handshake_timeout: MAX_HANDSHAKE_TIMEOUT + Duration::from_nanos(1),
+                ..RustlsConnectorConfig::default()
+            },
+        ] {
+            assert!(matches!(
+                RustlsTcpConnector::new(
+                    RustlsClientCredentials::new(
+                        vec![pki.client_certificate.clone()],
+                        pki.client_private_key.clone(),
+                    ),
+                    RustlsServerTrust::new(vec![pki.root.clone()]),
+                    "kvm.test".into(),
+                    pki.identity(),
+                    config,
+                ),
+                Err(RustlsConnectorConfigError::InvalidTimeout)
+            ));
+        }
+    }
+
+    #[test]
+    fn constructor_rejects_every_credential_and_trust_size_bound() {
+        let pki = TestPki::generate();
+        let identity = pki.identity();
+        let valid_credentials = || {
+            RustlsClientCredentials::new(
+                vec![pki.client_certificate.clone()],
+                pki.client_private_key.clone(),
+            )
+        };
+        let valid_trust = || RustlsServerTrust::new(vec![pki.root.clone()]);
+        for credentials in [
+            RustlsClientCredentials::new(
+                vec![vec![1]; MAX_CERTIFICATE_CHAIN_LENGTH + 1],
+                pki.client_private_key.clone(),
+            ),
+            RustlsClientCredentials::new(
+                vec![vec![1; MAX_CERTIFICATE_DER_BYTES + 1]],
+                pki.client_private_key.clone(),
+            ),
+            RustlsClientCredentials::new(
+                vec![vec![1; MAX_CERTIFICATE_CHAIN_DER_BYTES / 5 + 1]; 5],
+                pki.client_private_key.clone(),
+            ),
+            RustlsClientCredentials::new(
+                vec![pki.client_certificate.clone()],
+                vec![1; MAX_PRIVATE_KEY_DER_BYTES + 1],
+            ),
+        ] {
+            assert!(matches!(
+                RustlsTcpConnector::new(
+                    credentials,
+                    valid_trust(),
+                    "kvm.test".into(),
+                    identity.clone(),
+                    RustlsConnectorConfig::default(),
+                ),
+                Err(RustlsConnectorConfigError::ClientCredentialsTooLarge)
+            ));
+        }
+        for trust in [
+            RustlsServerTrust::new(vec![vec![1]; MAX_TRUST_ROOTS + 1]),
+            RustlsServerTrust::new(vec![vec![1; MAX_TRUST_ROOT_DER_BYTES + 1]]),
+            RustlsServerTrust::new(vec![vec![1; MAX_TRUST_ROOTS_DER_BYTES / 17 + 1]; 18]),
+        ] {
+            assert!(matches!(
+                RustlsTcpConnector::new(
+                    valid_credentials(),
+                    trust,
+                    "kvm.test".into(),
+                    identity.clone(),
+                    RustlsConnectorConfig::default(),
+                ),
+                Err(RustlsConnectorConfigError::ServerTrustTooLarge)
+            ));
+        }
     }
 
     #[tokio::test]
@@ -558,6 +756,7 @@ mod tests {
         let mut connector = pki.connector(expected.clone(), RustlsConnectorConfig::default());
         let mut client = connector.connect(address).await.unwrap();
         assert_eq!(client.authenticated_peer_identity(), &expected);
+        assert_eq!(format!("{client:?}"), "RustlsPeerStream([REDACTED])");
         assert!(client.inner.get_ref().0.nodelay().unwrap());
 
         let context = b"exporter-test-context";

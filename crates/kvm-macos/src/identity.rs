@@ -33,6 +33,41 @@ pub enum IdentityStability {
     AmbiguousFingerprint,
 }
 
+/// Aggregate source used by the explicit Quartz whole-host alpha mode.
+///
+/// Quartz can suppress an event synchronously but cannot bind it to the IOHID
+/// collection that produced it. Keeping these roles separate still lets the
+/// daemon route the host keyboard and pointer independently without implying
+/// per-device attribution.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+pub(crate) enum WholeHostDeviceKind {
+    Keyboard,
+    Pointer,
+}
+
+/// Derives the exact IDs advertised and emitted by whole-host alpha capture.
+#[must_use]
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+pub(crate) fn derive_whole_host_device_id(host_id: HostId, kind: WholeHostDeviceKind) -> DeviceId {
+    let mut hasher = Sha256::new();
+    hasher.update(b"software-kvm/macos-whole-host-alpha/v1\0");
+    hasher.update(host_id.into_bytes());
+    hasher.update([match kind {
+        WholeHostDeviceKind::Keyboard => 1,
+        WholeHostDeviceKind::Pointer => 2,
+    }]);
+    let digest = hasher.finalize();
+    let mut bytes = [0_u8; 16];
+    bytes.copy_from_slice(&digest[..16]);
+    if bytes == [0; 16] {
+        // `DeviceId::nil` is reserved. SHA-256 producing this prefix is
+        // cryptographically negligible, but the invariant is deterministic.
+        bytes[0] = 1;
+    }
+    DeviceId::from_bytes(bytes)
+}
+
 /// Derives a host-scoped identifier and reports its persistence guarantee.
 #[must_use]
 pub fn derive_device_id(
@@ -193,5 +228,25 @@ mod tests {
 
         assert_eq!(first, derive_device_id(host, &value));
         assert_eq!(first.1, IdentityStability::Location);
+    }
+
+    #[test]
+    fn whole_host_ids_are_host_scoped_role_distinct_and_non_nil() {
+        let first = HostId::from_bytes([0x31; 16]);
+        let second = HostId::from_bytes([0x32; 16]);
+        let keyboard = derive_whole_host_device_id(first, WholeHostDeviceKind::Keyboard);
+        let pointer = derive_whole_host_device_id(first, WholeHostDeviceKind::Pointer);
+
+        assert_eq!(
+            keyboard,
+            derive_whole_host_device_id(first, WholeHostDeviceKind::Keyboard)
+        );
+        assert_ne!(keyboard, pointer);
+        assert_ne!(keyboard.into_bytes(), [0; 16]);
+        assert_ne!(pointer.into_bytes(), [0; 16]);
+        assert_ne!(
+            keyboard,
+            derive_whole_host_device_id(second, WholeHostDeviceKind::Keyboard)
+        );
     }
 }

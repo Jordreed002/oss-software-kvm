@@ -6,11 +6,11 @@ use std::fmt;
 /// Conceptual transport lane. Ordering is FIFO within each lane.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum TrafficClass {
-    /// Latency-sensitive input, releases, and pointer handoffs.
+    /// Ordered input, releases, pointer handoffs, and device inventory.
     Input,
     /// Connection setup and liveness traffic.
     Control,
-    /// Clipboard and topology/device state transfer.
+    /// Clipboard and display-topology state transfer.
     Background,
 }
 
@@ -18,20 +18,23 @@ impl TrafficClass {
     pub const fn for_message(message: &WireMessage) -> Self {
         match message.message_type() {
             MessageType::Input
+            | MessageType::DeviceSnapshot
+            | MessageType::DeviceAdded
+            | MessageType::DeviceRemoved
             | MessageType::PointerEnter
             | MessageType::PointerLeave
             | MessageType::PointerTransitionAck
-            | MessageType::ReleaseInput => Self::Input,
+            | MessageType::PointerTransitionCommit
+            | MessageType::ReleaseInput
+            | MessageType::ReleaseInputV2
+            | MessageType::ReleaseAppliedAckV2 => Self::Input,
             MessageType::Hello
             | MessageType::Authenticate
             | MessageType::Ping
             | MessageType::Pong => Self::Control,
-            MessageType::DeviceSnapshot
-            | MessageType::DeviceAdded
-            | MessageType::DeviceRemoved
-            | MessageType::DisplaySnapshot
-            | MessageType::DisplayUpdated
-            | MessageType::Clipboard => Self::Background,
+            MessageType::DisplaySnapshot | MessageType::DisplayUpdated | MessageType::Clipboard => {
+                Self::Background
+            }
         }
     }
 }
@@ -259,8 +262,10 @@ impl Default for OutboundQueue {
 mod tests {
     use super::*;
     use kvm_protocol::{
-        ClipboardV1, InputEventV1, PingV1, WireClipboardId, WireDeviceId, WireHostId,
-        WireInputPayloadV1,
+        ClipboardV1, DeviceAddedV1, DeviceRemovedV1, DeviceSnapshotV1, InputEventV1, PingV1,
+        PointerTransitionCommitV1, ReleaseAppliedAckV2, ReleaseInputV1, ReleaseInputV2,
+        ReleaseReasonV1, ReleaseReasonV2, WireClipboardId, WireDeviceCapabilities, WireDeviceId,
+        WireDeviceKind, WireDisplayId, WireHostId, WireInputDeviceV1, WireInputPayloadV1,
     };
 
     fn clipboard(sequence: u64) -> WireMessage {
@@ -279,6 +284,81 @@ mod tests {
             source_host: WireHostId([1; 16]),
             source_device: WireDeviceId([2; 16]),
             payload: WireInputPayloadV1::PointerMove { dx: 1.0, dy: 0.0 },
+        })
+    }
+
+    fn release(sequence: u64) -> WireMessage {
+        WireMessage::ReleaseInput(ReleaseInputV1 {
+            sequence,
+            source_host: WireHostId([1; 16]),
+            source_device: Some(WireDeviceId([2; 16])),
+            reason: ReleaseReasonV1::RouteChanged,
+            keys: Vec::new(),
+            buttons: Vec::new(),
+        })
+    }
+
+    fn release_v2(sequence: u64) -> WireMessage {
+        WireMessage::ReleaseInputV2(ReleaseInputV2 {
+            transaction_id: sequence,
+            release_token: [4; 32],
+            old_session_id: [5; 32],
+            sequence,
+            covered_input_sequence: sequence.saturating_sub(1),
+            source_host: WireHostId([1; 16]),
+            applying_host: WireHostId([2; 16]),
+            source_device: Some(WireDeviceId([3; 16])),
+            reason: ReleaseReasonV2::RouteChanged,
+            keys: Vec::new(),
+            buttons: Vec::new(),
+        })
+    }
+
+    fn release_ack_v2(sequence: u64) -> WireMessage {
+        WireMessage::ReleaseAppliedAckV2(ReleaseAppliedAckV2 {
+            transaction_id: sequence,
+            release_token: [4; 32],
+            old_session_id: [5; 32],
+            sequence,
+            release_sequence: sequence.saturating_sub(1),
+            covered_input_sequence: sequence.saturating_sub(2),
+            source_host: WireHostId([1; 16]),
+            applying_host: WireHostId([2; 16]),
+        })
+    }
+
+    fn wire_device(id: u8) -> WireInputDeviceV1 {
+        WireInputDeviceV1 {
+            id: WireDeviceId([id; 16]),
+            host_id: WireHostId([1; 16]),
+            name: "test keyboard".to_owned(),
+            vendor_id: None,
+            product_id: None,
+            kind: WireDeviceKind::Keyboard,
+            capabilities: WireDeviceCapabilities {
+                keyboard: true,
+                ..WireDeviceCapabilities::default()
+            },
+        }
+    }
+
+    fn device_snapshot(revision: u64) -> WireMessage {
+        WireMessage::DeviceSnapshot(DeviceSnapshotV1 {
+            revision,
+            host_id: WireHostId([1; 16]),
+            devices: vec![wire_device(2)],
+        })
+    }
+
+    fn commit(sequence: u64) -> WireMessage {
+        WireMessage::PointerTransitionCommit(PointerTransitionCommitV1 {
+            transition_id: sequence,
+            workspace_epoch: 1,
+            sequence,
+            source_host: WireHostId([1; 16]),
+            destination_host: WireHostId([2; 16]),
+            source_display: WireDisplayId([3; 16]),
+            destination_display: WireDisplayId([4; 16]),
         })
     }
 
@@ -339,6 +419,64 @@ mod tests {
         assert_eq!(queue.pop_next(), Some(input(2)));
         assert!(matches!(queue.pop_next(), Some(WireMessage::Ping(_))));
         assert_eq!(queue.pop_next(), Some(input(3)));
+    }
+
+    #[test]
+    fn transition_commit_stays_ahead_of_later_input_in_the_same_fifo_lane() {
+        let mut queue = OutboundQueue::default();
+        queue.try_push(commit(7)).unwrap();
+        queue.try_push(input(8)).unwrap();
+
+        assert_eq!(queue.pop_next(), Some(commit(7)));
+        assert_eq!(queue.pop_next(), Some(input(8)));
+    }
+
+    #[test]
+    fn device_inventory_uses_the_ordered_input_lane() {
+        let messages = [
+            device_snapshot(1),
+            WireMessage::DeviceAdded(DeviceAddedV1 {
+                revision: 2,
+                device: wire_device(3),
+            }),
+            WireMessage::DeviceRemoved(DeviceRemovedV1 {
+                revision: 3,
+                host_id: WireHostId([1; 16]),
+                device_id: WireDeviceId([3; 16]),
+            }),
+        ];
+
+        for message in messages {
+            assert_eq!(TrafficClass::for_message(&message), TrafficClass::Input);
+        }
+    }
+
+    #[test]
+    fn release_inventory_and_later_input_preserve_exact_fifo_order() {
+        let mut queue = OutboundQueue::default();
+        queue.try_push(release(10)).unwrap();
+        queue.try_push(device_snapshot(11)).unwrap();
+        queue.try_push(input(12)).unwrap();
+
+        assert_eq!(queue.len_for(TrafficClass::Input), 3);
+        assert_eq!(queue.pop_next(), Some(release(10)));
+        assert_eq!(queue.pop_next(), Some(device_snapshot(11)));
+        assert_eq!(queue.pop_next(), Some(input(12)));
+        assert!(queue.is_empty());
+    }
+
+    #[test]
+    fn v2_release_and_ack_share_exact_order_with_input() {
+        let mut queue = OutboundQueue::default();
+        queue.try_push(input(8)).unwrap();
+        queue.try_push(release_v2(9)).unwrap();
+        queue.try_push(release_ack_v2(10)).unwrap();
+        queue.try_push(input(11)).unwrap();
+
+        assert_eq!(queue.pop_next(), Some(input(8)));
+        assert_eq!(queue.pop_next(), Some(release_v2(9)));
+        assert_eq!(queue.pop_next(), Some(release_ack_v2(10)));
+        assert_eq!(queue.pop_next(), Some(input(11)));
     }
 
     #[test]

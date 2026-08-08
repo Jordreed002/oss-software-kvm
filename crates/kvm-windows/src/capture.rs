@@ -1,11 +1,17 @@
-use kvm_daemon::EventClassification;
+use kvm_daemon::{CaptureDisposition, EventClassification};
 use kvm_input::{ButtonState, InputPayload, KeyCode, KeyState, PointerButton};
+use kvm_types::{DeviceId, HostId};
 
-use crate::KVM_INJECTION_TAG;
+use crate::{derive_device_id, KVM_INJECTION_TAG};
 
 pub(crate) const RAW_KEY_BREAK: u16 = 0x01;
 pub(crate) const RAW_KEY_E0: u16 = 0x02;
 pub(crate) const RAW_KEY_E1: u16 = 0x04;
+
+pub(crate) const LOW_LEVEL_KEY_EXTENDED: u32 = 0x01;
+pub(crate) const LOW_LEVEL_KEY_INJECTED: u32 = 0x12;
+pub(crate) const LOW_LEVEL_KEY_UP: u32 = 0x80;
+pub(crate) const LOW_LEVEL_MOUSE_INJECTED: u32 = 0x03;
 
 pub(crate) const RAW_MOUSE_MOVE_ABSOLUTE: u16 = 0x01;
 pub(crate) const RAW_MOUSE_LEFT_DOWN: u16 = 0x0001;
@@ -22,6 +28,33 @@ pub(crate) const RAW_MOUSE_WHEEL: u16 = 0x0400;
 pub(crate) const RAW_MOUSE_HWHEEL: u16 = 0x0800;
 
 const WINDOWS_WHEEL_DELTA: f64 = 120.0;
+
+pub(crate) fn whole_host_keyboard_device_id(host_id: HostId) -> DeviceId {
+    derive_device_id(&format!(
+        "software-kvm:windows:whole-host-alpha:keyboard:v1:{host_id}"
+    ))
+}
+
+pub(crate) fn whole_host_pointer_device_id(host_id: HostId) -> DeviceId {
+    derive_device_id(&format!(
+        "software-kvm:windows:whole-host-alpha:pointer:v1:{host_id}"
+    ))
+}
+
+pub(crate) const fn whole_host_should_suppress(
+    classification: EventClassification,
+    disposition: CaptureDisposition,
+) -> bool {
+    matches!(classification, EventClassification::Physical)
+        && matches!(disposition, CaptureDisposition::SuppressLocal)
+}
+
+pub(crate) const fn hooks_can_release_callback_state(
+    keyboard_removed: bool,
+    pointer_removed: bool,
+) -> bool {
+    keyboard_removed && pointer_removed
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum MessageOrigin {
@@ -60,6 +93,59 @@ pub(crate) fn classify_raw_input(
     // origin. Until a stronger correlation mechanism is validated, all
     // untagged Raw Input fails closed.
     EventClassification::Unknown
+}
+
+pub(crate) const fn classify_low_level(
+    extra_information: usize,
+    flags: u32,
+    injected_flag: u32,
+) -> EventClassification {
+    if extra_information == KVM_INJECTION_TAG as usize {
+        EventClassification::InjectedByKvm
+    } else if flags & injected_flag != 0 {
+        // An injected flag proves only that some process synthesized the input;
+        // it is not authority to attribute the event to this KVM process.
+        EventClassification::Unknown
+    } else {
+        EventClassification::Physical
+    }
+}
+
+pub(crate) fn translate_low_level_keyboard(
+    scan_code: u32,
+    virtual_key: u32,
+    flags: u32,
+    repeated: bool,
+) -> Option<InputPayload> {
+    let scan_code = u16::try_from(scan_code).ok()?;
+    let virtual_key = u16::try_from(virtual_key).ok()?;
+    let mut raw_flags = 0;
+    if flags & LOW_LEVEL_KEY_EXTENDED != 0 {
+        raw_flags |= RAW_KEY_E0;
+    }
+    // Low-level hooks omit Raw Input's E1 bit. VK_PAUSE is the only E1 key in
+    // the supported canonical mapping.
+    if virtual_key == 0x13 {
+        raw_flags |= RAW_KEY_E1;
+    }
+    if flags & LOW_LEVEL_KEY_UP != 0 {
+        raw_flags |= RAW_KEY_BREAK;
+    }
+    let payload = translate_keyboard(RawKeyboardPacket {
+        scan_code,
+        flags: raw_flags,
+        virtual_key,
+    })?;
+    match payload {
+        InputPayload::Key {
+            code,
+            state: KeyState::Pressed,
+        } if repeated => Some(InputPayload::Key {
+            code,
+            state: KeyState::Repeated,
+        }),
+        _ => Some(payload),
+    }
 }
 
 pub(crate) fn translate_keyboard(packet: RawKeyboardPacket) -> Option<InputPayload> {
@@ -463,6 +549,51 @@ mod tests {
     }
 
     #[test]
+    fn low_level_origin_requires_an_exact_kvm_tag() {
+        assert_eq!(
+            classify_low_level(KVM_INJECTION_TAG as usize, 0, LOW_LEVEL_KEY_INJECTED),
+            EventClassification::InjectedByKvm
+        );
+        assert_eq!(
+            classify_low_level(0, 0x10, LOW_LEVEL_KEY_INJECTED),
+            EventClassification::Unknown
+        );
+        assert_eq!(
+            classify_low_level(0, 0x02, LOW_LEVEL_KEY_INJECTED),
+            EventClassification::Unknown
+        );
+        assert_eq!(
+            classify_low_level(0, 0, LOW_LEVEL_MOUSE_INJECTED),
+            EventClassification::Physical
+        );
+    }
+
+    #[test]
+    fn low_level_keyboard_tracks_repeat_and_pause() {
+        assert_eq!(
+            translate_low_level_keyboard(0x1e, 0x41, 0, true),
+            Some(InputPayload::Key {
+                code: KeyCode::KeyA,
+                state: KeyState::Repeated,
+            })
+        );
+        assert_eq!(
+            translate_low_level_keyboard(0x45, 0x13, 0, false),
+            Some(InputPayload::Key {
+                code: KeyCode::Pause,
+                state: KeyState::Pressed,
+            })
+        );
+        assert_eq!(
+            translate_low_level_keyboard(0x1e, 0x41, LOW_LEVEL_KEY_UP, true),
+            Some(InputPayload::Key {
+                code: KeyCode::KeyA,
+                state: KeyState::Released,
+            })
+        );
+    }
+
+    #[test]
     fn ignores_windows_synthetic_prefix_keyboard_records() {
         assert_eq!(
             translate_keyboard(RawKeyboardPacket {
@@ -492,5 +623,55 @@ mod tests {
             horizontal: 0.0,
             vertical: 1.0,
         }));
+    }
+
+    #[test]
+    fn aggregate_device_ids_are_stable_distinct_and_host_scoped() {
+        let first_host = HostId::from_bytes([0x41; 16]);
+        let second_host = HostId::from_bytes([0x42; 16]);
+        assert_eq!(
+            whole_host_keyboard_device_id(first_host),
+            whole_host_keyboard_device_id(first_host)
+        );
+        assert_ne!(
+            whole_host_keyboard_device_id(first_host),
+            whole_host_pointer_device_id(first_host)
+        );
+        assert_ne!(
+            whole_host_keyboard_device_id(first_host),
+            whole_host_keyboard_device_id(second_host)
+        );
+        assert_ne!(
+            whole_host_keyboard_device_id(first_host),
+            DeviceId::from_bytes([0; 16])
+        );
+    }
+
+    #[test]
+    fn only_physical_callback_suppression_is_honored() {
+        assert!(whole_host_should_suppress(
+            EventClassification::Physical,
+            CaptureDisposition::SuppressLocal
+        ));
+        assert!(!whole_host_should_suppress(
+            EventClassification::InjectedByKvm,
+            CaptureDisposition::SuppressLocal
+        ));
+        assert!(!whole_host_should_suppress(
+            EventClassification::Unknown,
+            CaptureDisposition::SuppressLocal
+        ));
+        assert!(!whole_host_should_suppress(
+            EventClassification::Physical,
+            CaptureDisposition::AllowLocal
+        ));
+    }
+
+    #[test]
+    fn callback_state_survives_every_partial_unhook_outcome() {
+        assert!(hooks_can_release_callback_state(true, true));
+        assert!(!hooks_can_release_callback_state(true, false));
+        assert!(!hooks_can_release_callback_state(false, true));
+        assert!(!hooks_can_release_callback_state(false, false));
     }
 }

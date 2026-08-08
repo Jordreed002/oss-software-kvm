@@ -9,6 +9,7 @@
 mod admission;
 mod allowlist;
 mod channel_binding;
+mod client_resolver;
 mod credential;
 mod identity;
 mod pairing;
@@ -20,6 +21,10 @@ pub use allowlist::{
     TransportAuthenticationError,
 };
 pub use channel_binding::{ChannelBindingError, PairingChannelBinding, PairingContext};
+pub use client_resolver::{
+    PairedClientResolverSnapshot, PairedClientResolverSnapshotError,
+    MAX_PAIRED_CLIENT_RESOLVER_ENTRIES,
+};
 pub use credential::{
     CredentialKey, CredentialPurpose, CredentialStore, CredentialStoreError, MemoryCredentialStore,
     SecretBytes, SecretError,

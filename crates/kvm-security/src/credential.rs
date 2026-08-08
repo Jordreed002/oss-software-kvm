@@ -6,7 +6,7 @@ use thiserror::Error;
 use zeroize::Zeroize;
 
 /// Purpose-specific key for private credential material.
-#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+#[derive(Clone, Copy, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub enum CredentialKey {
     /// Private key for this daemon's long-term public identity.
     LocalIdentityPrivateKey,
@@ -15,6 +15,19 @@ pub enum CredentialKey {
         peer_id: PeerId,
         purpose: CredentialPurpose,
     },
+}
+
+impl fmt::Debug for CredentialKey {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::LocalIdentityPrivateKey => formatter.write_str("LocalIdentityPrivateKey"),
+            Self::Peer { purpose, .. } => formatter
+                .debug_struct("PeerCredential")
+                .field("peer_id", &"[REDACTED]")
+                .field("purpose", purpose)
+                .finish(),
+        }
+    }
 }
 
 /// Prevents one peer secret from being reused for another protocol purpose.
@@ -107,9 +120,18 @@ pub trait CredentialStore {
 /// Volatile credential store for tests and short-lived development tools.
 ///
 /// It is not a production substitute for operating-system protected storage.
-#[derive(Debug, Default)]
+#[derive(Default)]
 pub struct MemoryCredentialStore {
     credentials: BTreeMap<CredentialKey, SecretBytes>,
+}
+
+impl fmt::Debug for MemoryCredentialStore {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("MemoryCredentialStore")
+            .field("credential_count", &self.credentials.len())
+            .finish_non_exhaustive()
+    }
 }
 
 impl CredentialStore for MemoryCredentialStore {
@@ -130,7 +152,7 @@ impl CredentialStore for MemoryCredentialStore {
 
 /// Private credential-store failure. Error values must never contain secret
 /// bytes, passwords, bearer tokens, or private-key serialization.
-#[derive(Clone, Debug, Eq, Error, PartialEq)]
+#[derive(Clone, Eq, Error, PartialEq)]
 pub enum CredentialStoreError {
     /// The operating-system credential service is unavailable.
     #[error("credential store is unavailable")]
@@ -142,8 +164,23 @@ pub enum CredentialStoreError {
     #[error("stored credential is corrupt")]
     Corrupt,
     /// Backend-specific error description that contains no credential material.
-    #[error("credential store failed: {0}")]
+    #[error("credential store backend failed")]
     Backend(String),
+}
+
+impl fmt::Debug for CredentialStoreError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let kind = match self {
+            Self::Unavailable => "Unavailable",
+            Self::AccessDenied => "AccessDenied",
+            Self::Corrupt => "Corrupt",
+            Self::Backend(_) => "Backend",
+        };
+        formatter
+            .debug_struct("CredentialStoreError")
+            .field("kind", &kind)
+            .finish_non_exhaustive()
+    }
 }
 
 #[cfg(test)]
@@ -216,5 +253,19 @@ mod tests {
             SecretBytes::new(Vec::new()),
             Err(SecretError::Empty)
         ));
+    }
+
+    #[test]
+    fn credential_diagnostics_redact_peer_and_backend_metadata() {
+        let peer_id = PeerId::from_bytes([0x44; 16]);
+        let key = CredentialKey::Peer {
+            peer_id,
+            purpose: CredentialPurpose::TlsResumption,
+        };
+        let error = CredentialStoreError::Backend("SECRET-BACKEND-MARKER".to_owned());
+        let rendered = format!("{key:?} {error:?} {error}");
+
+        assert!(!rendered.contains(&peer_id.to_string()));
+        assert!(!rendered.contains("SECRET-BACKEND-MARKER"));
     }
 }

@@ -1,10 +1,18 @@
+use core::fmt;
+
 use serde::{Deserialize, Serialize};
 
 /// A point in a two-dimensional logical coordinate space.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
 pub struct Point {
     pub x: f64,
     pub y: f64,
+}
+
+impl fmt::Debug for Point {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("Point([REDACTED])")
+    }
 }
 
 impl Point {
@@ -15,10 +23,16 @@ impl Point {
 }
 
 /// A two-dimensional logical extent.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
 pub struct Size {
     pub width: f64,
     pub height: f64,
+}
+
+impl fmt::Debug for Size {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("Size([REDACTED])")
+    }
 }
 
 impl Size {
@@ -34,12 +48,18 @@ impl Size {
 }
 
 /// An axis-aligned rectangle using half-open maximum edges.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
 pub struct Rect {
     pub x: f64,
     pub y: f64,
     pub width: f64,
     pub height: f64,
+}
+
+impl fmt::Debug for Rect {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("Rect([REDACTED])")
+    }
 }
 
 impl Rect {
@@ -174,5 +194,21 @@ mod tests {
         for edge in [Edge::Left, Edge::Right, Edge::Top, Edge::Bottom] {
             assert_eq!(edge.opposite().opposite(), edge);
         }
+    }
+
+    #[test]
+    fn geometry_debug_omits_coordinates_and_extents() {
+        assert_eq!(
+            format!("{:?}", Point::new(7171.25, 8383.5)),
+            "Point([REDACTED])"
+        );
+        assert_eq!(
+            format!("{:?}", Size::new(9191.25, 7373.5)),
+            "Size([REDACTED])"
+        );
+        assert_eq!(
+            format!("{:?}", Rect::new(7171.25, 8383.5, 9191.25, 7373.5)),
+            "Rect([REDACTED])"
+        );
     }
 }

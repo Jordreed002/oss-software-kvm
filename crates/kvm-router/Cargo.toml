@@ -9,5 +9,8 @@ kvm-input = { path = "../kvm-input" }
 kvm-types = { path = "../kvm-types" }
 serde = { version = "1", features = ["derive"] }
 
+[dev-dependencies]
+serde_json = "1"
+
 [lints]
 workspace = true
