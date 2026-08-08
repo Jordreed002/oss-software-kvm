@@ -1011,11 +1011,6 @@ fn prepare_workspace(
             RuntimeCompositionErrorKind::Topology,
         ));
     }
-    let primary_origin = placements
-        .iter()
-        .find(|placement| placement.display_id() == primary.id)
-        .map(|placement| placement.origin())
-        .ok_or_else(|| RuntimeCompositionError::new(RuntimeCompositionErrorKind::Topology))?;
     let links = config
         .topology
         .links
@@ -1031,8 +1026,8 @@ fn prepare_workspace(
         .collect();
     let pointer = LogicalPointer::new(
         primary.id,
-        primary_origin.x + primary.logical_size.width / 2.0,
-        primary_origin.y + primary.logical_size.height / 2.0,
+        primary.logical_size.width / 2.0,
+        primary.logical_size.height / 2.0,
     );
     let initial_state = WorkspaceState::new(local_host, local_host, pointer);
     let mut inventory = DisplayInventory::new(local_host, DisplayInventoryConfig::default())
@@ -1114,7 +1109,7 @@ mod tests {
     }
 
     #[test]
-    fn current_local_inventory_seeds_local_pointer_authority() {
+    fn current_local_inventory_seeds_pointer_in_display_local_coordinates() {
         let prepared = prepare_workspace(
             &config_with_local_placement(),
             LOCAL_HOST,
@@ -1125,8 +1120,8 @@ mod tests {
         assert_eq!(prepared.initial_state.local_host, LOCAL_HOST);
         assert_eq!(prepared.initial_state.active_host, LOCAL_HOST);
         assert_eq!(prepared.pointer.display_id, DISPLAY);
-        assert!((prepared.pointer.x - 140.0).abs() < f64::EPSILON);
-        assert!((prepared.pointer.y - 70.0).abs() < f64::EPSILON);
+        assert!((prepared.pointer.x - 100.0).abs() < f64::EPSILON);
+        assert!((prepared.pointer.y - 50.0).abs() < f64::EPSILON);
         assert_eq!(prepared.inventory.snapshot().display_count(), 1);
     }
 
