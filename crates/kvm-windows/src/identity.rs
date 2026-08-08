@@ -31,6 +31,34 @@ pub(crate) fn usb_ids_from_device_path(path: &str) -> (Option<u16>, Option<u16>)
     )
 }
 
+/// Removes only the boot-volatile device-instance component from a Raw Input
+/// interface path. This key is safe only when scoped by a Windows Container ID,
+/// which distinguishes separate physical devices of the same model.
+#[cfg(any(windows, test))]
+pub(crate) fn raw_input_collection_key(path: &str) -> Option<String> {
+    let components = path.split('#').collect::<Vec<_>>();
+    if components.len() < 4 || components[1].is_empty() || components.last()?.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "{}#{}#{}",
+        components[0].to_ascii_lowercase(),
+        components[1].to_ascii_lowercase(),
+        components.last()?.to_ascii_lowercase()
+    ))
+}
+
+#[cfg(any(windows, test))]
+pub(crate) fn container_scoped_raw_input_identity(
+    container_id: u128,
+    path: &str,
+) -> Option<String> {
+    let collection = raw_input_collection_key(path)?;
+    Some(format!(
+        "container:{container_id:032x}:collection:{collection}"
+    ))
+}
+
 #[cfg(any(windows, test))]
 fn parse_hex_component(value: &str, marker: &str) -> Option<u16> {
     let start = value.find(marker)? + marker.len();
@@ -72,6 +100,43 @@ mod tests {
         assert_eq!(
             usb_ids_from_device_path(r"\??\Root#RDP_MOU#0000"),
             (None, None)
+        );
+    }
+
+    #[test]
+    fn collection_key_ignores_only_the_boot_volatile_instance() {
+        let before = r"\\?\HID#VID_046D&PID_C547&MI_00#7&10b65791&0&0000#{mouse-guid}";
+        let after = r"\\?\HID#VID_046D&PID_C547&MI_00#7&2ee471cf&0&0000#{mouse-guid}";
+        let keyboard = r"\\?\HID#VID_046D&PID_C547&MI_01&Col01#7&679c406&0&0000#{keyboard-guid}";
+
+        assert_eq!(
+            raw_input_collection_key(before),
+            raw_input_collection_key(after)
+        );
+        assert_ne!(
+            raw_input_collection_key(before),
+            raw_input_collection_key(keyboard)
+        );
+        assert_eq!(raw_input_collection_key("not-an-interface-path"), None);
+    }
+
+    #[test]
+    fn container_scoped_identity_survives_reboot_but_separates_collections() {
+        let before = r"\\?\HID#VID_046D&PID_C547&MI_00#7&10b65791&0&0000#{mouse-guid}";
+        let after = r"\\?\HID#VID_046D&PID_C547&MI_00#7&2ee471cf&0&0000#{mouse-guid}";
+        let keyboard = r"\\?\HID#VID_046D&PID_C547&MI_01&Col01#7&679c406&0&0000#{keyboard-guid}";
+
+        assert_eq!(
+            container_scoped_raw_input_identity(1, before),
+            container_scoped_raw_input_identity(1, after)
+        );
+        assert_ne!(
+            container_scoped_raw_input_identity(1, before),
+            container_scoped_raw_input_identity(1, keyboard)
+        );
+        assert_ne!(
+            container_scoped_raw_input_identity(1, before),
+            container_scoped_raw_input_identity(2, before)
         );
     }
 }

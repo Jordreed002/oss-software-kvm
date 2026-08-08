@@ -94,6 +94,16 @@ fn observe_windows(
     println!("native_captured={}", statistics.captured_events);
     println!("native_dropped={}", statistics.dropped_events);
     println!("native_untranslated={}", statistics.untranslated_packets);
+    println!("native_keyboard_packets={}", statistics.keyboard_packets);
+    println!("native_mouse_packets={}", statistics.mouse_packets);
+    println!(
+        "native_untranslated_keyboard_packets={}",
+        statistics.untranslated_keyboard_packets
+    );
+    println!(
+        "native_untranslated_mouse_packets={}",
+        statistics.untranslated_mouse_packets
+    );
     println!("native_callback_panics={}", statistics.callback_panics);
     println!(
         "native_suppression_requests_ignored={}",
@@ -289,7 +299,7 @@ fn print_displays(displays: Vec<Display>) {
     println!("display_count={}", displays.len());
     for display in displays {
         println!(
-            "display id={} name={:?} logical={}x{} physical={:?} scale={} refresh_hz={:?} origin={},{} primary={}",
+            "display id={} name={:?} logical={}x{} physical={:?} scale={} refresh_hz={:?} native_bounds={},{} {}x{} primary={}",
             display.id,
             display.name,
             display.logical_size.width,
@@ -299,6 +309,8 @@ fn print_displays(displays: Vec<Display>) {
             display.refresh_rate,
             display.native_bounds.x,
             display.native_bounds.y,
+            display.native_bounds.width,
+            display.native_bounds.height,
             display.primary
         );
     }
