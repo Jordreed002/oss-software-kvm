@@ -20,6 +20,7 @@ const mock: SetupSnapshot = {
   runtimeLogPath: null,
   discoveryAvailable: true,
   nearbyMachines: [],
+  nearbyPairing: null,
   setupDirectory: null,
   profilePath: null,
 };
@@ -51,6 +52,37 @@ const invokeOrPreview = async <T>(command: string, args?: Record<string, unknown
     };
     return structuredClone(previewState) as T;
   }
+  if (command === "request_nearby_pairing") {
+    const machine = previewState.nearbyMachines.find((item) => item.peerId === args?.peerId);
+    if (machine) {
+      previewState.nearbyPairing = {
+        requestId: crypto.randomUUID(), peerId: machine.peerId, name: machine.name,
+        platform: machine.platform, address: machine.address,
+        status: "waiting_for_acceptance", verificationCode: null,
+      };
+    }
+    return structuredClone(previewState) as T;
+  }
+  if (command === "accept_nearby_pairing" && previewState.nearbyPairing) {
+    previewState.nearbyPairing.status = "waiting_for_confirmation";
+    previewState.nearbyPairing.verificationCode = "418 205";
+    return structuredClone(previewState) as T;
+  }
+  if (command === "confirm_nearby_pairing" && previewState.nearbyPairing) {
+    previewState.peer = {
+      hostId: crypto.randomUUID(), peerId: previewState.nearbyPairing.peerId,
+      displayName: previewState.nearbyPairing.name, platform: previewState.nearbyPairing.platform,
+      serverName: "nearby-peer.kvm.test", certificateFingerprint: "3a".repeat(32),
+      address: previewState.nearbyPairing.address,
+      displays: [{ id: "preview-peer-display", name: "Studio monitor", width: 2560, height: 1440, scaleFactor: 1, primary: true }],
+    };
+    previewState.nearbyPairing = null;
+    return structuredClone(previewState) as T;
+  }
+  if (command === "decline_nearby_pairing") {
+    previewState.nearbyPairing = null;
+    return structuredClone(previewState) as T;
+  }
   if (command === "finalize_setup") {
     previewState.configured = true;
     previewState.placement = args?.placement as Placement;
@@ -78,6 +110,10 @@ export const api = {
   createIdentity: (displayName: string, address: string) =>
     invokeOrPreview<SetupSnapshot>("create_local_identity", { displayName, address }),
   importPeer: (bundle: string) => invokeOrPreview<SetupSnapshot>("import_peer_bundle", { bundle }),
+  requestNearbyPairing: (peerId: string) => invokeOrPreview<SetupSnapshot>("request_nearby_pairing", { peerId }),
+  acceptNearbyPairing: (requestId: string) => invokeOrPreview<SetupSnapshot>("accept_nearby_pairing", { requestId }),
+  confirmNearbyPairing: (requestId: string) => invokeOrPreview<SetupSnapshot>("confirm_nearby_pairing", { requestId }),
+  declineNearbyPairing: (requestId: string) => invokeOrPreview<SetupSnapshot>("decline_nearby_pairing", { requestId }),
   finalize: (placement: Placement) => invokeOrPreview<SetupSnapshot>("finalize_setup", { placement }),
   validate: () => invokeOrPreview<SetupSnapshot>("validate_setup"),
   start: () => invokeOrPreview<SetupSnapshot>("start_runtime"),

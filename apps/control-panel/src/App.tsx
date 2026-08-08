@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useState } from "react";
 import {
   ArrowLeftRight, Check, ChevronRight, CircleAlert, Copy, KeyRound,
-  Laptop, Link2, LoaderCircle, Monitor, Play, Radio, ShieldCheck, Square,
+  Handshake, Laptop, Link2, LoaderCircle, Monitor, Play, Radio, ShieldCheck, Square, X,
 } from "lucide-react";
 import { api } from "./bridge";
 import type { Placement, SetupSnapshot } from "./types";
@@ -44,6 +44,10 @@ function App() {
     }, 1200);
     return () => window.clearInterval(timer);
   }, [step, busy]);
+
+  useEffect(() => {
+    if (step === 1 && snapshot?.peer) setStep(2);
+  }, [snapshot?.peer, step]);
 
   const perform = async (label: string, operation: () => Promise<SetupSnapshot>, next?: number) => {
     setBusy(label); setError(null);
@@ -98,7 +102,7 @@ function App() {
         <section className="panel">
           {error && <div className="error-banner"><CircleAlert size={18} />{error}</div>}
           {step === 0 && <LocalStep snapshot={snapshot} name={name} setName={setName} address={address} setAddress={setAddress} busy={busy} onContinue={() => perform("identity", () => api.createIdentity(name, address), 1)} />}
-          {step === 1 && <PairStep snapshot={snapshot} bundle={bundle} setBundle={setBundle} copied={copied} onCopy={async () => { await navigator.clipboard.writeText(snapshot.local?.publicBundle ?? ""); setCopied(true); window.setTimeout(() => setCopied(false), 1800); }} busy={busy} onImport={() => perform("pair", () => api.importPeer(bundle), 2)} />}
+          {step === 1 && <PairStep snapshot={snapshot} bundle={bundle} setBundle={setBundle} copied={copied} onCopy={async () => { await navigator.clipboard.writeText(snapshot.local?.publicBundle ?? ""); setCopied(true); window.setTimeout(() => setCopied(false), 1800); }} busy={busy} onImport={() => perform("pair", () => api.importPeer(bundle), 2)} onRequest={(peerId) => perform("pair-request", () => api.requestNearbyPairing(peerId))} onAccept={(requestId) => perform("pair-accept", () => api.acceptNearbyPairing(requestId))} onConfirm={(requestId) => perform("pair-confirm", () => api.confirmNearbyPairing(requestId), 2)} onDecline={(requestId) => perform("pair-decline", () => api.declineNearbyPairing(requestId))} />}
           {step === 2 && <ArrangeStep snapshot={snapshot} placement={placement} setPlacement={setPlacement} busy={busy} onContinue={() => perform("arrange", () => api.finalize(placement), 3)} />}
           {step === 3 && <ReadyStep snapshot={snapshot} busy={busy} onValidate={() => perform("validate", api.validate)} onStart={() => perform("start", api.start)} onStop={() => perform("stop", api.stop)} />}
         </section>
@@ -127,17 +131,20 @@ function LocalStep({ snapshot, name, setName, address, setAddress, busy, onConti
   </div>;
 }
 
-function PairStep({ snapshot, bundle, setBundle, copied, onCopy, busy, onImport }: { snapshot: SetupSnapshot; bundle: string; setBundle: (v: string) => void; copied: boolean; onCopy: () => void; busy: string | null; onImport: () => void }) {
+function PairStep({ snapshot, bundle, setBundle, copied, onCopy, busy, onImport, onRequest, onAccept, onConfirm, onDecline }: { snapshot: SetupSnapshot; bundle: string; setBundle: (v: string) => void; copied: boolean; onCopy: () => void; busy: string | null; onImport: () => void; onRequest: (peerId: string) => void; onAccept: (requestId: string) => void; onConfirm: (requestId: string) => void; onDecline: (requestId: string) => void }) {
   return <div className="step-content enter">
-    <SectionHeading number="02" kicker="TRUST" title="Exchange public link cards." copy="Copy this computer’s card to the other machine, then paste the other machine’s card below. It contains no private key." />
-    <NearbyPanel snapshot={snapshot}/>
-    <div className="bundle-card">
-      <div><span className="card-label">This computer’s public card</span><strong>{snapshot.local?.displayName}</strong><small>Certificate + address + display inventory</small></div>
-      <button className="copy-button" onClick={onCopy}>{copied ? <Check size={17} /> : <Copy size={17} />}{copied ? "Copied" : "Copy card"}</button>
-    </div>
-    <div className="link-divider"><span /><Link2 size={18}/><span /></div>
-    <label className="bundle-input"><span>Other computer’s public card</span><textarea value={bundle} onChange={(e) => setBundle(e.target.value)} placeholder="Paste the pairing card from the other machine…" /></label>
-    <PrimaryButton busy={busy === "pair"} disabled={bundle.trim().length < 16} onClick={onImport}>Verify and pair</PrimaryButton>
+    <SectionHeading number="02" kicker="MUTUAL TRUST" title="Pair with one request." copy="Choose the nearby computer. The other person must accept, then both screens show the same verification code before trust is saved." />
+    <NearbyPanel snapshot={snapshot} busy={busy} onRequest={onRequest} onAccept={onAccept} onConfirm={onConfirm} onDecline={onDecline}/>
+    <details className="manual-pairing">
+      <summary>Can’t see the other computer? Use a public link card</summary>
+      <div className="bundle-card">
+        <div><span className="card-label">This computer’s public card</span><strong>{snapshot.local?.displayName}</strong><small>Certificate + address + display inventory</small></div>
+        <button className="copy-button" onClick={onCopy}>{copied ? <Check size={17} /> : <Copy size={17} />}{copied ? "Copied" : "Copy card"}</button>
+      </div>
+      <div className="link-divider"><span /><Link2 size={18}/><span /></div>
+      <label className="bundle-input"><span>Other computer’s public card</span><textarea value={bundle} onChange={(e) => setBundle(e.target.value)} placeholder="Paste the pairing card from the other machine…" /></label>
+      <PrimaryButton busy={busy === "pair"} disabled={bundle.trim().length < 16} onClick={onImport}>Verify and pair</PrimaryButton>
+    </details>
   </div>;
 }
 
@@ -184,17 +191,32 @@ function ReadyStep({ snapshot, busy, onValidate, onStart, onStop }: { snapshot: 
   </div>;
 }
 
-function NearbyPanel({ snapshot }: { snapshot: SetupSnapshot }) {
+function NearbyPanel({ snapshot, busy = null, onRequest, onAccept, onConfirm, onDecline }: { snapshot: SetupSnapshot; busy?: string | null; onRequest?: (peerId: string) => void; onAccept?: (requestId: string) => void; onConfirm?: (requestId: string) => void; onDecline?: (requestId: string) => void }) {
+  const pairing = snapshot.nearbyPairing;
   return <section className="nearby-panel" aria-label="Nearby Software KVM computers">
     <div className="nearby-heading">
-      <div><span className="radar-mark"><Radio size={15}/></span><div><strong>LAN radar</strong><small>Untrusted presence · pairing still required</small></div></div>
+      <div><span className="radar-mark"><Radio size={15}/></span><div><strong>LAN radar</strong><small>Discovery is untrusted · both computers must approve</small></div></div>
       <span className={snapshot.discoveryAvailable ? "scanning" : "unavailable"}>{snapshot.discoveryAvailable ? "SCANNING" : "UNAVAILABLE"}</span>
     </div>
+    {pairing && <div className={`pairing-request ${pairing.status}`}>
+      <span className="pairing-glyph"><Handshake size={20}/></span>
+      <div className="pairing-copy">
+        <small>{pairing.status === "incoming_request" ? "PAIR REQUEST RECEIVED" : pairing.status === "verify_code" ? "VERIFY BOTH SCREENS" : "PAIRING IN PROGRESS"}</small>
+        <strong>{pairing.name}</strong>
+        <span>{pairing.status === "incoming_request" && "This computer has not trusted the request yet."}{pairing.status === "waiting_for_acceptance" && "Waiting for the other computer to accept."}{pairing.status === "verify_code" && "Make sure this code matches the other screen, then confirm."}{pairing.status === "waiting_for_confirmation" && "Keep this window open while the other computer confirms."}</span>
+      </div>
+      {pairing.verificationCode && <code className="verification-code">{pairing.verificationCode}</code>}
+      <div className="pairing-actions">
+        {pairing.status === "incoming_request" && onAccept && <button className="accept-pair" disabled={!!busy} onClick={() => onAccept(pairing.requestId)}>{busy === "pair-accept" ? <LoaderCircle className="spin" size={14}/> : <Check size={14}/>}Accept</button>}
+        {pairing.status === "verify_code" && onConfirm && <button className="accept-pair" disabled={!!busy} onClick={() => onConfirm(pairing.requestId)}>{busy === "pair-confirm" ? <LoaderCircle className="spin" size={14}/> : <ShieldCheck size={14}/>}Codes match</button>}
+        {onDecline && <button className="decline-pair" disabled={!!busy} aria-label="Cancel pairing" onClick={() => onDecline(pairing.requestId)}><X size={14}/></button>}
+      </div>
+    </div>}
     {snapshot.nearbyMachines.length === 0 ? <div className="nearby-empty"><i/><span>No other Software KVM consoles detected yet.</span></div> : <div className="nearby-list">
       {snapshot.nearbyMachines.map((machine) => <div className="nearby-machine" key={`${machine.address}-${machine.name}`}>
         <span className={`presence-orbit ${machine.presence}`}><i/></span>
         <div><strong>{machine.name}</strong><small>{machine.platform === "macos" ? "macOS" : "Windows"} · {machine.address}</small></div>
-        <div className="nearby-badges">{machine.paired && <span>PAIRED</span>}<em>{machine.presence === "runtime_active" ? "RUNTIME ACTIVE" : "SETTING UP"}</em></div>
+        <div className="nearby-badges">{machine.paired && <span>PAIRED</span>}<em>{machine.presence === "runtime_active" ? "RUNTIME ACTIVE" : "SETTING UP"}</em>{onRequest && !machine.paired && !pairing && <button className="request-pair" disabled={!!busy} onClick={() => onRequest(machine.peerId)}><Handshake size={13}/>Pair</button>}</div>
       </div>)}
     </div>}
   </section>;

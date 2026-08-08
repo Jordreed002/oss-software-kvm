@@ -25,7 +25,7 @@ use sha2::{Digest, Sha256};
 use tauri::{AppHandle, Manager, State};
 use uuid::Uuid;
 
-use crate::nearby::{NearbyDiscovery, NearbyMachineDto, NearbyPresence};
+use crate::nearby::{NearbyDiscovery, NearbyMachineDto, NearbyPairingDto, NearbyPresence};
 
 const KVM_PORT: u16 = 24_800;
 const PAIRING_VERSION: u16 = 2;
@@ -175,6 +175,7 @@ pub(crate) struct SetupSnapshot {
     runtime_log_path: Option<String>,
     discovery_available: bool,
     nearby_machines: Vec<NearbyMachineDto>,
+    nearby_pairing: Option<NearbyPairingDto>,
     setup_directory: Option<String>,
     profile_path: Option<String>,
 }
@@ -257,18 +258,7 @@ impl SetupService {
             None if last_fault.is_some() => RuntimeState::Faulted,
             None => RuntimeState::Stopped,
         };
-        let setup = self.inner.lock().map_err(|_| ())?.clone();
-        let host_id = setup
-            .local
-            .as_ref()
-            .map_or(setup.draft_host_id.as_str(), |local| local.host_id.as_str());
-        let displays = native_displays(parse_host_id(host_id).map_err(|_| ())?).map_err(|_| ())?;
-        let local = setup
-            .local
-            .as_ref()
-            .map(|local| self.local_dto(local, &displays))
-            .transpose()?;
-        let peer = setup.peer.clone().map(peer_dto);
+        let mut setup = self.inner.lock().map_err(|_| ())?.clone();
         let presence = if matches!(runtime_state, RuntimeState::Running) {
             NearbyPresence::RuntimeActive
         } else {
@@ -281,9 +271,36 @@ impl SetupService {
                 .map_or_else(suggested_name, |local| local.display_name.clone());
             discovery.refresh(&advertised_name, platform_name(), presence);
         }
-        let nearby_machines = self.discovery.as_ref().map_or_else(Vec::new, |discovery| {
+        let mut nearby_machines = self.discovery.as_ref().map_or_else(Vec::new, |discovery| {
             discovery.snapshot(setup.peer.as_ref().map(|peer| peer.peer_id.as_str()))
         });
+        if let Some(bundle) = self
+            .discovery
+            .as_ref()
+            .and_then(NearbyDiscovery::take_completed_bundle)
+        {
+            self.install_peer_bundle(&bundle).map_err(|_| ())?;
+            setup = self.inner.lock().map_err(|_| ())?.clone();
+            if let Some(discovery) = &self.discovery {
+                nearby_machines =
+                    discovery.snapshot(setup.peer.as_ref().map(|peer| peer.peer_id.as_str()));
+            }
+        }
+        let nearby_pairing = self
+            .discovery
+            .as_ref()
+            .and_then(NearbyDiscovery::pairing_snapshot);
+        let host_id = setup
+            .local
+            .as_ref()
+            .map_or(setup.draft_host_id.as_str(), |local| local.host_id.as_str());
+        let displays = native_displays(parse_host_id(host_id).map_err(|_| ())?).map_err(|_| ())?;
+        let local = setup
+            .local
+            .as_ref()
+            .map(|local| self.local_dto(local, &displays))
+            .transpose()?;
+        let peer = setup.peer.clone().map(peer_dto);
         Ok(SetupSnapshot {
             platform: current_platform(),
             suggested_name: suggested_name(),
@@ -304,6 +321,7 @@ impl SetupService {
             }),
             discovery_available: self.discovery.is_some(),
             nearby_machines,
+            nearby_pairing,
             setup_directory: setup
                 .configured
                 .then(|| self.directory.to_string_lossy().into_owned()),
@@ -344,6 +362,50 @@ impl SetupService {
             address: local.address.clone(),
             public_bundle: URL_SAFE_NO_PAD.encode(encoded),
         })
+    }
+
+    fn local_bundle(&self) -> Result<String, String> {
+        let setup = self.inner.lock().map_err(|_| coarse_error())?.clone();
+        let local = setup.local.as_ref().ok_or_else(coarse_error)?;
+        let displays =
+            native_displays(parse_host_id(&local.host_id)?).map_err(|_| coarse_error())?;
+        self.local_dto(local, &displays)
+            .map(|identity| identity.public_bundle)
+            .map_err(|()| coarse_error())
+    }
+
+    fn validate_peer_bundle(&self, bundle: &str) -> Result<(PairingBundle, Vec<u8>), String> {
+        let raw = URL_SAFE_NO_PAD
+            .decode(bundle.trim())
+            .map_err(|_| coarse_error())?;
+        if raw.len() > 64 * 1024 {
+            return Err(coarse_error());
+        }
+        let peer: PairingBundle = serde_json::from_slice(&raw).map_err(|_| coarse_error())?;
+        validate_bundle(&peer)?;
+        let certificate = URL_SAFE_NO_PAD
+            .decode(&peer.certificate_der)
+            .map_err(|_| coarse_error())?;
+        let setup = self.inner.lock().map_err(|_| coarse_error())?;
+        let local = setup.local.as_ref().ok_or_else(coarse_error)?;
+        if peer.host_id == local.host_id
+            || peer.peer_id == local.peer_id
+            || peer.platform == current_platform()
+        {
+            return Err(coarse_error());
+        }
+        Ok((peer, certificate))
+    }
+
+    fn install_peer_bundle(&self, bundle: &str) -> Result<(), String> {
+        let (peer, certificate) = self.validate_peer_bundle(bundle)?;
+        secure_write(&self.directory.join(TRUST_FILE), &certificate, false)
+            .map_err(|()| coarse_error())?;
+        let mut setup = self.inner.lock().map_err(|_| coarse_error())?;
+        setup.peer = Some(peer);
+        setup.configured = false;
+        setup.validated = false;
+        self.save(&setup).map_err(|()| coarse_error())
     }
 }
 
@@ -523,34 +585,92 @@ pub(crate) fn import_peer_bundle(
     service: State<'_, SetupService>,
 ) -> Result<SetupSnapshot, String> {
     ensure_runtime_stopped(&service)?;
-    let raw = URL_SAFE_NO_PAD
-        .decode(bundle.trim())
-        .map_err(|_| coarse_error())?;
-    if raw.len() > 64 * 1024 {
-        return Err(coarse_error());
-    }
-    let peer: PairingBundle = serde_json::from_slice(&raw).map_err(|_| coarse_error())?;
-    validate_bundle(&peer)?;
-    let certificate = URL_SAFE_NO_PAD
-        .decode(&peer.certificate_der)
-        .map_err(|_| coarse_error())?;
-    let setup = service.inner.lock().map_err(|_| coarse_error())?;
-    let local = setup.local.as_ref().ok_or_else(coarse_error)?;
-    if peer.host_id == local.host_id
-        || peer.peer_id == local.peer_id
-        || peer.platform == current_platform()
+    service.install_peer_bundle(&bundle)?;
+    service.snapshot().map_err(|()| coarse_error())
+}
+
+#[tauri::command]
+pub(crate) fn request_nearby_pairing(
+    peer_id: String,
+    service: State<'_, SetupService>,
+) -> Result<SetupSnapshot, String> {
+    ensure_runtime_stopped(&service)?;
     {
-        return Err(coarse_error());
+        let setup = service.inner.lock().map_err(|_| coarse_error())?;
+        if setup.local.is_none() || setup.peer.is_some() {
+            return Err(coarse_error());
+        }
     }
-    drop(setup);
-    secure_write(&service.directory.join(TRUST_FILE), &certificate, false)
+    let bundle = service.local_bundle()?;
+    service
+        .discovery
+        .as_ref()
+        .ok_or_else(coarse_error)?
+        .request_pairing(&peer_id, &bundle)
         .map_err(|()| coarse_error())?;
-    let mut setup = service.inner.lock().map_err(|_| coarse_error())?;
-    setup.peer = Some(peer);
-    setup.configured = false;
-    setup.validated = false;
-    service.save(&setup).map_err(|()| coarse_error())?;
-    drop(setup);
+    service.snapshot().map_err(|()| coarse_error())
+}
+
+#[tauri::command]
+pub(crate) fn accept_nearby_pairing(
+    request_id: String,
+    service: State<'_, SetupService>,
+) -> Result<SetupSnapshot, String> {
+    ensure_runtime_stopped(&service)?;
+    {
+        let setup = service.inner.lock().map_err(|_| coarse_error())?;
+        if setup.local.is_none() || setup.peer.is_some() {
+            return Err(coarse_error());
+        }
+    }
+    let discovery = service.discovery.as_ref().ok_or_else(coarse_error)?;
+    let remote_bundle = discovery
+        .incoming_pairing_bundle(&request_id)
+        .map_err(|()| coarse_error())?;
+    service.validate_peer_bundle(&remote_bundle)?;
+    let bundle = service.local_bundle()?;
+    discovery
+        .accept_pairing(&request_id, &bundle)
+        .map_err(|()| coarse_error())?;
+    service.snapshot().map_err(|()| coarse_error())
+}
+
+#[tauri::command]
+pub(crate) fn confirm_nearby_pairing(
+    request_id: String,
+    service: State<'_, SetupService>,
+) -> Result<SetupSnapshot, String> {
+    ensure_runtime_stopped(&service)?;
+    {
+        let setup = service.inner.lock().map_err(|_| coarse_error())?;
+        if setup.local.is_none() || setup.peer.is_some() {
+            return Err(coarse_error());
+        }
+    }
+    let discovery = service.discovery.as_ref().ok_or_else(coarse_error)?;
+    let bundle = discovery
+        .accepted_pairing_bundle(&request_id)
+        .map_err(|()| coarse_error())?;
+    service.validate_peer_bundle(&bundle)?;
+    discovery
+        .confirm_pairing(&request_id)
+        .map_err(|()| coarse_error())?;
+    service.install_peer_bundle(&bundle)?;
+    service.snapshot().map_err(|()| coarse_error())
+}
+
+#[tauri::command]
+pub(crate) fn decline_nearby_pairing(
+    request_id: String,
+    service: State<'_, SetupService>,
+) -> Result<SetupSnapshot, String> {
+    ensure_runtime_stopped(&service)?;
+    service
+        .discovery
+        .as_ref()
+        .ok_or_else(coarse_error)?
+        .decline_pairing(&request_id)
+        .map_err(|()| coarse_error())?;
     service.snapshot().map_err(|()| coarse_error())
 }
 
