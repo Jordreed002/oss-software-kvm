@@ -1,3 +1,5 @@
+use core::fmt;
+
 use serde::{Deserialize, Serialize};
 
 pub const MAX_HOST_NAME_BYTES: usize = 255;
@@ -53,7 +55,7 @@ pub struct HelloV1 {
     pub nonce: [u8; 32],
 }
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Deserialize, Eq, PartialEq, Serialize)]
 pub struct AuthenticateV1 {
     pub peer_id: WirePeerId,
     /// Authentication scheme identifier, such as `tls-exporter-v1`.
@@ -61,6 +63,17 @@ pub struct AuthenticateV1 {
     /// Scheme-specific challenge response. Long-term private credentials are
     /// never included in protocol values.
     pub proof: Vec<u8>,
+}
+
+impl fmt::Debug for AuthenticateV1 {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("AuthenticateV1")
+            .field("peer_id", &self.peer_id)
+            .field("scheme", &self.scheme)
+            .field("proof", &"[REDACTED]")
+            .finish()
+    }
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]

@@ -16,6 +16,16 @@ impl PairedPeer {
         Self { identity }
     }
 
+    /// Restores public identity metadata produced by an earlier approved pairing.
+    ///
+    /// This constructor does not perform pairing. Callers must use it only for
+    /// metadata read from their paired-peer persistence boundary; private
+    /// credential material belongs in [`crate::CredentialStore`].
+    #[must_use]
+    pub const fn from_persisted_public_identity(identity: PeerIdentity) -> Self {
+        Self { identity }
+    }
+
     /// Public identity approved during pairing.
     #[must_use]
     pub const fn identity(&self) -> &PeerIdentity {
@@ -189,6 +199,13 @@ where
         transport: &impl AuthenticatedPeerTransport,
     ) -> Result<InputAuthorization, AuthorizationError> {
         let presented = transport.authenticated_peer_identity()?;
+        self.authorize_identity(&presented)
+    }
+
+    pub(crate) fn authorize_identity(
+        &self,
+        presented: &PeerIdentity,
+    ) -> Result<InputAuthorization, AuthorizationError> {
         let paired = self
             .store
             .get(presented.peer_id())?

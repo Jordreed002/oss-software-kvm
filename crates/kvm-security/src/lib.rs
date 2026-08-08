@@ -6,12 +6,14 @@
 //! encrypted transport. Concrete rustls and operating-system credential-store
 //! adapters belong in platform and transport crates.
 
+mod admission;
 mod allowlist;
 mod channel_binding;
 mod credential;
 mod identity;
 mod pairing;
 
+pub use admission::{PairedSessionAdmission, PairedSessionAdmissionError, TLS_EXPORTER_SCHEME};
 pub use allowlist::{
     AuthenticatedPeerTransport, AuthorizationError, InputAuthorization, MemoryPairedPeerStore,
     PairedPeer, PairedPeerAllowlist, PairedPeerStore, PairedPeerStoreError,

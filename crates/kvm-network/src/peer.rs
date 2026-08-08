@@ -6,6 +6,7 @@ use crate::{
 };
 use kvm_protocol::{encode_frame, AuthenticateV1, HelloV1, MessageType, WireMessage};
 use std::time::Duration;
+use subtle::ConstantTimeEq;
 use thiserror::Error;
 use tokio::io::AsyncWriteExt;
 use tokio::sync::{mpsc, watch};
@@ -65,6 +66,8 @@ pub struct HandshakeTranscript {
     local_hello: HelloV1,
     remote_hello: HelloV1,
     transport_identity: TransportPeerIdentity,
+    local_exporter_proof: [u8; 32],
+    remote_exporter_proof: [u8; 32],
 }
 
 impl std::fmt::Debug for HandshakeTranscript {
@@ -75,6 +78,7 @@ impl std::fmt::Debug for HandshakeTranscript {
             .field("remote_host_id", &self.remote_hello.host_id)
             .field("remote_peer_id", &self.remote_hello.peer_id)
             .field("transport_identity", &self.transport_identity)
+            .field("exporter_proofs", &"[REDACTED]")
             .finish_non_exhaustive()
     }
 }
@@ -90,6 +94,21 @@ impl HandshakeTranscript {
 
     pub const fn transport_identity(&self) -> &TransportPeerIdentity {
         &self.transport_identity
+    }
+
+    /// Returns the direction-bound proof this endpoint may send in its
+    /// application authentication message.
+    #[must_use]
+    pub const fn local_exporter_proof(&self) -> [u8; 32] {
+        self.local_exporter_proof
+    }
+
+    /// Verifies the remote endpoint's direction-bound proof without exposing
+    /// the locally derived expected value.
+    #[must_use]
+    pub fn verify_remote_exporter_proof(&self, proof: &[u8]) -> bool {
+        proof.len() == self.remote_exporter_proof.len()
+            && bool::from(proof.ct_eq(self.remote_exporter_proof.as_slice()))
     }
 }
 
@@ -108,7 +127,14 @@ pub enum AdmissionError {
 /// Implementations should delegate proof verification and allow-list policy to
 /// `kvm-security`. This crate only sequences the exchange and gates traffic.
 pub trait SessionAdmission: Send + Sync {
-    fn local_hello(&self) -> HelloV1;
+    /// Creates the local Hello for this connection. Implementations must use a
+    /// fresh cryptographically random nonce on every call.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when fresh nonce generation or local identity loading
+    /// is unavailable.
+    fn local_hello(&self) -> Result<HelloV1, AdmissionError>;
 
     /// Builds the local channel-bound authentication response.
     ///
@@ -389,6 +415,8 @@ pub enum SessionError {
     TransportIdentityMismatch,
     #[error("local authentication response does not match the local hello")]
     LocalIdentityMismatch,
+    #[error("local and remote peer identities must be distinct")]
+    PeerIdentityCollision,
     #[error("received {0:?} before peer admission")]
     PreAdmissionMessage(MessageType),
     #[error("received repeated handshake message {0:?} after admission")]
@@ -770,7 +798,7 @@ fn collect_session_failure(
 }
 
 async fn perform_admission<S: SecurePeerStream, A: SessionAdmission>(
-    stream: S,
+    mut stream: S,
     admission: &A,
     events: &mpsc::Sender<PeerEvent>,
     shutdown: &mut watch::Receiver<bool>,
@@ -787,22 +815,25 @@ async fn perform_admission<S: SecurePeerStream, A: SessionAdmission>(
         PeerEvent::StateChanged(ConnectionState::Authenticating),
     )?;
     let transport_identity = stream.authenticated_peer_identity().clone();
-    let (read, write) = tokio::io::split(stream);
-    let mut reader = FrameReader::new_authenticated(read);
-    let mut writer = FrameWriter::new_authenticated(write);
-
-    let local_hello = admission.local_hello();
-    if !write_or_shutdown(
-        &mut writer,
-        &WireMessage::Hello(local_hello.clone()),
-        shutdown,
-    )
-    .await?
+    let local_hello = admission.local_hello()?;
     {
-        return Ok(None);
+        let mut writer = FrameWriter::new_authenticated(&mut stream);
+        if !write_or_shutdown(
+            &mut writer,
+            &WireMessage::Hello(local_hello.clone()),
+            shutdown,
+        )
+        .await?
+        {
+            return Ok(None);
+        }
     }
-    let Some(first_message) = read_or_shutdown(&mut reader, shutdown).await? else {
-        return Ok(None);
+    let first_message = {
+        let mut reader = FrameReader::new_authenticated(&mut stream);
+        let Some(message) = read_or_shutdown(&mut reader, shutdown).await? else {
+            return Ok(None);
+        };
+        message
     };
     let remote_hello = match first_message {
         WireMessage::Hello(hello) => hello,
@@ -813,27 +844,34 @@ async fn perform_admission<S: SecurePeerStream, A: SessionAdmission>(
     {
         return Err(SessionError::TransportIdentityMismatch);
     }
-
-    let transcript = HandshakeTranscript {
-        local_hello: local_hello.clone(),
+    let transcript = build_handshake_transcript(
+        &stream,
+        local_hello.clone(),
         remote_hello,
         transport_identity,
-    };
+    )?;
     let local_auth = admission.authentication_message(&transcript)?;
     if local_auth.peer_id != local_hello.peer_id {
         return Err(SessionError::LocalIdentityMismatch);
     }
-    if !write_or_shutdown(
-        &mut writer,
-        &WireMessage::Authenticate(local_auth),
-        shutdown,
-    )
-    .await?
     {
-        return Ok(None);
+        let mut writer = FrameWriter::new_authenticated(&mut stream);
+        if !write_or_shutdown(
+            &mut writer,
+            &WireMessage::Authenticate(local_auth),
+            shutdown,
+        )
+        .await?
+        {
+            return Ok(None);
+        }
     }
-    let Some(second_message) = read_or_shutdown(&mut reader, shutdown).await? else {
-        return Ok(None);
+    let second_message = {
+        let mut reader = FrameReader::new_authenticated(&mut stream);
+        let Some(message) = read_or_shutdown(&mut reader, shutdown).await? else {
+            return Ok(None);
+        };
+        message
     };
     let remote_auth = match second_message {
         WireMessage::Authenticate(authentication) => authentication,
@@ -851,7 +889,86 @@ async fn perform_admission<S: SecurePeerStream, A: SessionAdmission>(
     };
     send_event(events, PeerEvent::Admitted(admitted.clone()))?;
     send_event(events, PeerEvent::StateChanged(ConnectionState::Connected))?;
+    let (read, write) = tokio::io::split(stream);
+    let reader = FrameReader::new_authenticated(read);
+    let writer = FrameWriter::new_authenticated(write);
     Ok(Some((reader, writer, admitted)))
+}
+
+const AUTHENTICATION_EXPORTER_LABEL: &[u8] = b"EXPORTER-software-kvm-session-auth-v1";
+const AUTHENTICATION_CONTEXT_DOMAIN: &[u8] = b"software-kvm/session-auth-context/v1";
+
+fn build_handshake_transcript<S: SecurePeerStream>(
+    stream: &S,
+    local_hello: HelloV1,
+    remote_hello: HelloV1,
+    transport_identity: TransportPeerIdentity,
+) -> Result<HandshakeTranscript, SessionError> {
+    if remote_hello.peer_id == local_hello.peer_id {
+        return Err(SessionError::PeerIdentityCollision);
+    }
+    let local_context =
+        authentication_exporter_context(&local_hello, &remote_hello, local_hello.peer_id)?;
+    let remote_context =
+        authentication_exporter_context(&local_hello, &remote_hello, remote_hello.peer_id)?;
+    let local_exporter_proof = stream
+        .export_keying_material(AUTHENTICATION_EXPORTER_LABEL, &local_context)
+        .map_err(NetworkError::from)?;
+    let remote_exporter_proof = stream
+        .export_keying_material(AUTHENTICATION_EXPORTER_LABEL, &remote_context)
+        .map_err(NetworkError::from)?;
+
+    Ok(HandshakeTranscript {
+        local_hello,
+        remote_hello,
+        transport_identity,
+        local_exporter_proof,
+        remote_exporter_proof,
+    })
+}
+
+fn authentication_exporter_context(
+    local_hello: &HelloV1,
+    remote_hello: &HelloV1,
+    sender: kvm_protocol::WirePeerId,
+) -> Result<Vec<u8>, SessionError> {
+    if local_hello.peer_id == remote_hello.peer_id {
+        return Err(SessionError::PeerIdentityCollision);
+    }
+    let local_frame =
+        encode_frame(&WireMessage::Hello(local_hello.clone())).map_err(NetworkError::from)?;
+    let remote_frame =
+        encode_frame(&WireMessage::Hello(remote_hello.clone())).map_err(NetworkError::from)?;
+    let mut hellos = [
+        (local_hello.peer_id, local_frame),
+        (remote_hello.peer_id, remote_frame),
+    ];
+    hellos.sort_unstable_by_key(|(peer_id, _)| peer_id.0);
+    let sender_role = u8::from(sender != hellos[0].0);
+
+    let mut context = Vec::with_capacity(
+        AUTHENTICATION_CONTEXT_DOMAIN.len()
+            + 2
+            + 1
+            + hellos
+                .iter()
+                .map(|(_, frame)| 4 + frame.len())
+                .sum::<usize>(),
+    );
+    context.extend_from_slice(AUTHENTICATION_CONTEXT_DOMAIN);
+    context.extend_from_slice(&kvm_protocol::PROTOCOL_VERSION.to_be_bytes());
+    context.push(sender_role);
+    for (_, frame) in hellos {
+        let length = u32::try_from(frame.len()).map_err(|_| {
+            NetworkError::from(kvm_protocol::ProtocolError::PayloadTooLarge {
+                length: frame.len(),
+                maximum: kvm_protocol::MAX_FRAME_PAYLOAD,
+            })
+        })?;
+        context.extend_from_slice(&length.to_be_bytes());
+        context.extend_from_slice(&frame);
+    }
+    Ok(context)
 }
 
 fn handle_inbound(
@@ -993,6 +1110,7 @@ fn disconnect_reason(error: &SessionError) -> DisconnectReason {
         SessionError::AdmissionTimeout => DisconnectReason::AdmissionTimeout,
         SessionError::TransportIdentityMismatch
         | SessionError::LocalIdentityMismatch
+        | SessionError::PeerIdentityCollision
         | SessionError::MessageIdentityMismatch(_) => DisconnectReason::IdentityMismatch,
         SessionError::PreAdmissionMessage(_) => DisconnectReason::ProtocolViolation,
         SessionError::RepeatedHandshake(_) => DisconnectReason::RepeatedHandshake,
@@ -1070,6 +1188,7 @@ mod tests {
         WireClipboardId, WireDeviceId, WireDisplayId, WireEdge, WireHostId, WireInputPayloadV1,
         WirePeerId, WirePlatform, PROTOCOL_VERSION,
     };
+    use sha2::{Digest, Sha256};
     use std::pin::Pin;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
@@ -1119,6 +1238,17 @@ mod tests {
     impl SecurePeerStream for TestSecureStream {
         fn authenticated_peer_identity(&self) -> &TransportPeerIdentity {
             &self.identity
+        }
+
+        fn export_keying_material(
+            &self,
+            label: &[u8],
+            context: &[u8],
+        ) -> std::io::Result<[u8; 32]> {
+            let mut digest = Sha256::new();
+            digest.update(label);
+            digest.update(context);
+            Ok(digest.finalize().into())
         }
     }
 
@@ -1181,6 +1311,14 @@ mod tests {
     impl SecurePeerStream for PartialPendingSecureStream {
         fn authenticated_peer_identity(&self) -> &TransportPeerIdentity {
             &self.inner.identity
+        }
+
+        fn export_keying_material(
+            &self,
+            label: &[u8],
+            context: &[u8],
+        ) -> std::io::Result<[u8; 32]> {
+            self.inner.export_keying_material(label, context)
         }
     }
 
@@ -1245,6 +1383,14 @@ mod tests {
     impl SecurePeerStream for PartialPendingReadSecureStream {
         fn authenticated_peer_identity(&self) -> &TransportPeerIdentity {
             &self.inner.identity
+        }
+
+        fn export_keying_material(
+            &self,
+            label: &[u8],
+            context: &[u8],
+        ) -> std::io::Result<[u8; 32]> {
+            self.inner.export_keying_material(label, context)
         }
     }
 
@@ -1320,8 +1466,8 @@ mod tests {
     }
 
     impl SessionAdmission for TestAdmission {
-        fn local_hello(&self) -> HelloV1 {
-            self.hello.clone()
+        fn local_hello(&self) -> Result<HelloV1, AdmissionError> {
+            Ok(self.hello.clone())
         }
 
         fn authentication_message(
@@ -1509,6 +1655,105 @@ mod tests {
         invalid_timeout.admission_timeout = Duration::ZERO;
         assert!(invalid_timeout.validate().is_err());
         assert!(test_config().validate().is_ok());
+    }
+
+    #[test]
+    fn exporter_context_is_canonical_and_sender_direction_bound() {
+        let lower = hello(1);
+        let higher = hello(20);
+        let lower_sender = authentication_exporter_context(&lower, &higher, lower.peer_id).unwrap();
+        let reversed_view =
+            authentication_exporter_context(&higher, &lower, lower.peer_id).unwrap();
+        let higher_sender =
+            authentication_exporter_context(&lower, &higher, higher.peer_id).unwrap();
+
+        assert_eq!(lower_sender, reversed_view);
+        assert_ne!(lower_sender, higher_sender);
+    }
+
+    #[test]
+    fn exporter_context_changes_with_the_complete_hello_transcript() {
+        let local = hello(1);
+        let remote = hello(20);
+        let original = authentication_exporter_context(&local, &remote, local.peer_id).unwrap();
+        let mut modified = remote.clone();
+        modified.nonce[0] ^= 1;
+        let modified_context =
+            authentication_exporter_context(&local, &modified, local.peer_id).unwrap();
+
+        assert_ne!(original, modified_context);
+        let stream = TestSecureStream {
+            stream: tokio::io::duplex(1).0,
+            identity: identity(&remote),
+        };
+        assert_ne!(
+            stream
+                .export_keying_material(AUTHENTICATION_EXPORTER_LABEL, &original)
+                .unwrap(),
+            stream
+                .export_keying_material(AUTHENTICATION_EXPORTER_LABEL, &modified_context)
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn exporter_context_rejects_equal_peer_ids() {
+        let local = hello(1);
+        let mut remote = hello(20);
+        remote.peer_id = local.peer_id;
+
+        assert!(matches!(
+            authentication_exporter_context(&local, &remote, local.peer_id),
+            Err(SessionError::PeerIdentityCollision)
+        ));
+    }
+
+    #[tokio::test]
+    async fn equal_peer_ids_are_rejected_before_authenticate() {
+        let local_hello = hello(1);
+        let mut remote_hello = hello(20);
+        remote_hello.peer_id = local_hello.peer_id;
+        let (session_stream, peer_stream) = tokio::io::duplex(4_096);
+        let secure_stream = TestSecureStream {
+            stream: session_stream,
+            identity: identity(&remote_hello),
+        };
+        let admission = TestAdmission { hello: local_hello };
+        let (_outbound_sender, mut outbound) = mpsc::channel(8);
+        let (events, _event_receiver) = mpsc::channel(8);
+        let (_shutdown_sender, mut shutdown) = watch::channel(false);
+
+        let session = run_session(
+            secure_stream,
+            &admission,
+            test_config(),
+            &mut outbound,
+            &events,
+            &mut shutdown,
+        );
+        let peer = async move {
+            let (read, write) = tokio::io::split(peer_stream);
+            let mut reader = FrameReader::new_authenticated(read);
+            let mut writer = FrameWriter::new_authenticated(write);
+            assert!(matches!(
+                reader.read_message().await.unwrap(),
+                WireMessage::Hello(_)
+            ));
+            writer
+                .write_message(&WireMessage::Hello(remote_hello))
+                .await
+                .unwrap();
+            assert!(reader.read_message().await.is_err());
+        };
+
+        let (result, ()) = tokio::join!(session, peer);
+        assert!(matches!(
+            result,
+            Err(SessionFailure {
+                error: SessionError::PeerIdentityCollision,
+                ..
+            })
+        ));
     }
 
     #[tokio::test]

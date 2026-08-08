@@ -4,8 +4,9 @@
 
 Platform-neutral crates use deterministic unit tests for identifiers, geometry, routing,
 normalized edge mapping, key/button state, protocol framing, sequencing, configuration migration,
-and clipboard loop suppression. Simulated native backends allow daemon and peer integration tests
-without capturing the developer's real keyboard or pointer.
+clipboard loop suppression, client-certificate-enforcing loopback TLS, exporter-bound mutual
+admission, and daemon peer reconciliation. Simulated native backends allow daemon and peer
+integration tests without capturing the developer's real keyboard or pointer.
 
 Repository checks run on Linux, Windows, and macOS:
 

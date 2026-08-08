@@ -19,17 +19,18 @@ advanced gestures, Linux, display streaming, and WAN control are deliberately de
 - `kvm-router`: device-route decisions against an immutable workspace snapshot.
 - `kvm-topology`: logical display geometry and cross-display transitions.
 - `kvm-network`: authenticated-stream framing, admitted persistent peer sessions, channel
-  scheduling, peer health, and reconnect policy. Socket discovery and TLS adapters remain
-  integration work.
+  scheduling, peer health, reconnect policy, and a sealed outbound TCP/rustls adapter. Production
+  inbound listening and discovery remain integration work.
 - `kvm-security`: host identity, pairing, authorization, and credential interfaces. Native
-  credential stores and TLS exporter adapters remain integration work.
+  credential stores remain integration work; paired session admission now consumes the
+  network-owned, direction-bound TLS exporter proof.
 - `kvm-config`: versioned non-secret persistent configuration.
 - `kvm-clipboard`: loop-free clipboard synchronisation.
 - `kvm-windows` and `kvm-macos`: native device/display enumeration, observation-only capture,
   injection, identity, and capability/permission surfaces. Selective suppression remains behind
   the native feasibility gate described in `platform-notes.md`.
-- `kvm-daemon`: safety-state and routing composition foundation. Full native/network composition,
-  local IPC, and service lifecycle remain integration work.
+- `kvm-daemon`: safety-state, deliberate wire/domain conversion, and simulated admitted-peer
+  coordination. Full native composition, local IPC, and service lifecycle remain integration work.
 - `kvm-diagnostics`: read-only physical-host evidence collection. It never suppresses or routes
   input and redacts captured payload values by default.
 

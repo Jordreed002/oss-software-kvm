@@ -533,6 +533,20 @@ mod tests {
     }
 
     #[test]
+    fn authentication_proof_is_redacted_from_debug_output() {
+        let message = WireMessage::Authenticate(AuthenticateV1 {
+            peer_id: PEER,
+            scheme: "tls-exporter-v1".to_owned(),
+            proof: b"distinct-exporter-proof-marker".to_vec(),
+        });
+
+        let debug = format!("{message:?}");
+        assert!(debug.contains("[REDACTED]"));
+        assert!(!debug.contains("distinct-exporter-proof-marker"));
+        assert!(!debug.contains("100, 105, 115, 116, 105, 110, 99, 116"));
+    }
+
+    #[test]
     fn frame_header_is_fixed_width_and_network_endian() {
         let bytes = FrameHeader {
             protocol_version: 1,

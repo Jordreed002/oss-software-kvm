@@ -30,6 +30,8 @@ The detailed product and engineering requirements live in:
 
 - [Product and technical specification](.spec/spec.md)
 - [Implementation specification](.spec/implementation.md)
+- [Milestone 02: observable native capture](.spec/milestone-02-capture-transport.md)
+- [Milestone 03: secure session composition](.spec/milestone-03-secure-session-composition.md)
 
 The evolving engineering decisions live in:
 
