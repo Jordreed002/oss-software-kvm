@@ -38,7 +38,7 @@ function App() {
   }, []);
 
   useEffect(() => {
-    if (step !== 3) return;
+    if (step !== 1 && step !== 3) return;
     const timer = window.setInterval(() => {
       if (!busy) api.status().then(setSnapshot).catch(() => undefined);
     }, 1200);

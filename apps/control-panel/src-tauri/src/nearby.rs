@@ -1,18 +1,20 @@
 use std::collections::BTreeMap;
 use std::fmt;
-use std::net::{IpAddr, SocketAddr};
+use std::io::ErrorKind;
+use std::net::{IpAddr, Ipv4Addr, SocketAddr, UdpSocket};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
-use mdns_sd::{ResolvedService, ServiceDaemon, ServiceEvent, ServiceInfo};
 use serde::Serialize;
 
-const CONSOLE_SERVICE_TYPE: &str = "_software-kvm-console._tcp.local.";
-const CONSOLE_DISCOVERY_VERSION: &str = "1";
+const DISCOVERY_PORT: u16 = 24_801;
+const BEACON_MAGIC: &str = "software-kvm-presence/1";
 const MAX_NEARBY_MACHINES: usize = 32;
 const MAX_NAME_BYTES: usize = 64;
-const MAX_EVENT_DRAIN: usize = 128;
-const STALE_AFTER: Duration = Duration::from_secs(150);
+const MAX_BEACON_BYTES: usize = 512;
+const MAX_RECEIVE_DRAIN: usize = 64;
+const BEACON_INTERVAL: Duration = Duration::from_secs(2);
+const STALE_AFTER: Duration = Duration::from_secs(8);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -22,7 +24,7 @@ pub(crate) enum NearbyPresence {
 }
 
 impl NearbyPresence {
-    const fn as_txt(self) -> &'static str {
+    const fn as_wire(self) -> &'static str {
         match self {
             Self::SettingUp => "setup",
             Self::RuntimeActive => "active",
@@ -56,74 +58,78 @@ struct NearbyRecord {
     last_seen: Instant,
 }
 
-/// Process-local mDNS presence beacon and bounded nearby-machine cache.
+struct Advertisement {
+    state: AdvertisementState,
+    last_sent: Option<Instant>,
+}
+
+/// Process-local, bounded, unauthenticated LAN presence beacon.
+///
+/// Presence can help a user find another setup console, but never authorizes a
+/// connection or changes the certificate-pinned pairing boundary.
 pub(crate) struct NearbyDiscovery {
-    daemon: ServiceDaemon,
-    events: mdns_sd::Receiver<ServiceEvent>,
-    instance_name: String,
-    hostname: String,
-    addresses: Vec<IpAddr>,
-    port: u16,
-    advertised: Mutex<Option<AdvertisementState>>,
+    socket: UdpSocket,
+    peer_id: String,
+    advertised: Mutex<Option<Advertisement>>,
     records: Mutex<BTreeMap<String, NearbyRecord>>,
 }
 
 impl NearbyDiscovery {
-    pub(crate) fn start(peer_id: &str, addresses: Vec<IpAddr>, port: u16) -> Result<Self, ()> {
-        if peer_id.len() != 36
-            || peer_id.chars().any(char::is_control)
+    pub(crate) fn start(peer_id: &str, addresses: Vec<IpAddr>, _port: u16) -> Result<Self, ()> {
+        if !valid_peer_id(peer_id)
             || addresses.is_empty()
             || addresses.len() > 8
-            || port == 0
+            || addresses
+                .iter()
+                .copied()
+                .any(|address| !private_address(address))
         {
             return Err(());
         }
-        let daemon = ServiceDaemon::new().map_err(|_| ())?;
-        let events = daemon.browse(CONSOLE_SERVICE_TYPE).map_err(|_| ())?;
+        let socket = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, DISCOVERY_PORT)).map_err(|_| ())?;
+        socket.set_nonblocking(true).map_err(|_| ())?;
+        socket.set_broadcast(true).map_err(|_| ())?;
         Ok(Self {
-            daemon,
-            events,
-            instance_name: format!("software-kvm-{peer_id}"),
-            hostname: format!("software-kvm-{peer_id}.local."),
-            addresses,
-            port,
+            socket,
+            peer_id: peer_id.to_owned(),
             advertised: Mutex::new(None),
             records: Mutex::new(BTreeMap::new()),
         })
     }
 
     pub(crate) fn refresh(&self, name: &str, platform: &'static str, presence: NearbyPresence) {
-        let name = bounded_name(name);
         let next = AdvertisementState {
-            name,
+            name: bounded_name(name),
             platform,
             presence,
         };
+        let now = Instant::now();
         let Ok(mut advertised) = self.advertised.lock() else {
             return;
         };
-        if advertised.as_ref() == Some(&next) {
+        let should_send = advertised.as_ref().is_none_or(|advertisement| {
+            advertisement.state != next
+                || advertisement
+                    .last_sent
+                    .is_none_or(|last_sent| now.duration_since(last_sent) >= BEACON_INTERVAL)
+        });
+        if !should_send {
             return;
         }
-        let properties = [
-            ("ver", CONSOLE_DISCOVERY_VERSION),
-            ("peer", instance_peer_id(&self.instance_name)),
-            ("name", next.name.as_str()),
-            ("platform", next.platform),
-            ("state", next.presence.as_txt()),
-        ];
-        let Ok(service) = ServiceInfo::new(
-            CONSOLE_SERVICE_TYPE,
-            &self.instance_name,
-            &self.hostname,
-            self.addresses.as_slice(),
-            self.port,
-            properties.as_slice(),
-        ) else {
-            return;
-        };
-        if self.daemon.register(service).is_ok() {
-            *advertised = Some(next);
+        let packet = encode_beacon(&self.peer_id, &next);
+        if packet.len() <= MAX_BEACON_BYTES
+            && self
+                .socket
+                .send_to(
+                    packet.as_bytes(),
+                    SocketAddr::from((Ipv4Addr::BROADCAST, DISCOVERY_PORT)),
+                )
+                .is_ok()
+        {
+            *advertised = Some(Advertisement {
+                state: next,
+                last_sent: Some(now),
+            });
         }
     }
 
@@ -132,29 +138,21 @@ impl NearbyDiscovery {
         let Ok(mut records) = self.records.lock() else {
             return Vec::new();
         };
-        for _ in 0..MAX_EVENT_DRAIN {
-            let Ok(event) = self.events.try_recv() else {
-                break;
-            };
-            match event {
-                ServiceEvent::ServiceResolved(service) => {
-                    if service.get_fullname() == service_fullname(&self.instance_name) {
-                        continue;
-                    }
-                    if let Some(record) = parse_service(&service, now) {
-                        if records.contains_key(service.get_fullname())
-                            || records.len() < MAX_NEARBY_MACHINES
+        let mut buffer = [0_u8; MAX_BEACON_BYTES];
+        for _ in 0..MAX_RECEIVE_DRAIN {
+            match self.socket.recv_from(&mut buffer) {
+                Ok((length, source)) => {
+                    if let Some(record) = parse_beacon(&buffer[..length], source, now) {
+                        if record.peer_id != self.peer_id
+                            && (records.contains_key(&record.peer_id)
+                                || records.len() < MAX_NEARBY_MACHINES)
                         {
-                            records.insert(service.get_fullname().to_owned(), record);
+                            records.insert(record.peer_id.clone(), record);
                         }
                     }
                 }
-                ServiceEvent::ServiceRemoved(service_type, fullname)
-                    if service_type == CONSOLE_SERVICE_TYPE =>
-                {
-                    records.remove(&fullname);
-                }
-                _ => {}
+                Err(error) if error.kind() == ErrorKind::WouldBlock => break,
+                Err(_) => break,
             }
         }
         records.retain(|_, record| now.duration_since(record.last_seen) < STALE_AFTER);
@@ -175,7 +173,6 @@ impl fmt::Debug for NearbyDiscovery {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("NearbyDiscovery")
-            .field("address_count", &self.addresses.len())
             .field(
                 "advertisement_present",
                 &matches!(self.advertised.lock().as_deref(), Ok(Some(_))),
@@ -188,69 +185,65 @@ impl fmt::Debug for NearbyDiscovery {
     }
 }
 
-impl Drop for NearbyDiscovery {
-    fn drop(&mut self) {
-        let _ = self.daemon.stop_browse(CONSOLE_SERVICE_TYPE);
-        let _ = self
-            .daemon
-            .unregister(&service_fullname(&self.instance_name));
-        let _ = self.daemon.shutdown();
-    }
+fn encode_beacon(peer_id: &str, state: &AdvertisementState) -> String {
+    format!(
+        "{BEACON_MAGIC}\n{peer_id}\n{}\n{}\n{}\n",
+        state.platform,
+        state.presence.as_wire(),
+        state.name
+    )
 }
 
-fn parse_service(service: &ResolvedService, now: Instant) -> Option<NearbyRecord> {
-    if service.ty_domain != CONSOLE_SERVICE_TYPE
-        || service.get_properties().len() > 8
-        || service.get_addresses().is_empty()
-        || service.get_addresses().len() > 8
-    {
+fn parse_beacon(bytes: &[u8], source: SocketAddr, now: Instant) -> Option<NearbyRecord> {
+    if bytes.is_empty() || bytes.len() > MAX_BEACON_BYTES || !private_address(source.ip()) {
         return None;
     }
-    let property = |key: &str| {
-        service
-            .get_properties()
-            .get_property_val_str(key)
-            .map(str::to_owned)
-    };
-    if property("ver")?.as_str() != CONSOLE_DISCOVERY_VERSION {
+    let text = std::str::from_utf8(bytes).ok()?;
+    let mut lines = text.lines();
+    if lines.next()? != BEACON_MAGIC {
         return None;
     }
-    let peer_id = property("peer")?;
-    if peer_id.len() != 36 || peer_id.chars().any(char::is_control) {
+    let peer_id = lines.next()?;
+    if !valid_peer_id(peer_id) {
         return None;
     }
-    let name = property("name")?;
-    if name.is_empty() || name.len() > MAX_NAME_BYTES || name.chars().any(char::is_control) {
-        return None;
-    }
-    let platform = match property("platform")?.as_str() {
+    let platform = match lines.next()? {
         "macos" => "macos",
         "windows" => "windows",
         _ => return None,
-    }
-    .to_owned();
-    let presence = match property("state")?.as_str() {
+    };
+    let presence = match lines.next()? {
         "setup" => NearbyPresence::SettingUp,
         "active" => NearbyPresence::RuntimeActive,
         _ => return None,
     };
-    let mut addresses: Vec<_> = service
-        .get_addresses()
-        .iter()
-        .map(mdns_sd::ScopedIp::to_ip_addr)
-        .filter(|address| private_address(*address))
-        .collect();
-    addresses.sort_unstable();
-    addresses.dedup();
-    let address = SocketAddr::new(*addresses.first()?, service.get_port());
+    let name = lines.next()?;
+    if lines.next().is_some()
+        || name.is_empty()
+        || name.len() > MAX_NAME_BYTES
+        || name.chars().any(char::is_control)
+    {
+        return None;
+    }
     Some(NearbyRecord {
-        peer_id,
-        name,
-        platform,
+        peer_id: peer_id.to_owned(),
+        name: name.to_owned(),
+        platform: platform.to_owned(),
         presence,
-        address,
+        address: SocketAddr::new(source.ip(), 24_800),
         last_seen: now,
     })
+}
+
+fn valid_peer_id(peer_id: &str) -> bool {
+    peer_id.len() == 36
+        && peer_id
+            .bytes()
+            .enumerate()
+            .all(|(index, byte)| match index {
+                8 | 13 | 18 | 23 => byte == b'-',
+                _ => byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase(),
+            })
 }
 
 fn bounded_name(name: &str) -> String {
@@ -260,16 +253,6 @@ fn bounded_name(name: &str) -> String {
     } else {
         name.to_owned()
     }
-}
-
-fn instance_peer_id(instance: &str) -> &str {
-    instance
-        .strip_prefix("software-kvm-")
-        .unwrap_or("unavailable")
-}
-
-fn service_fullname(instance: &str) -> String {
-    format!("{instance}.{CONSOLE_SERVICE_TYPE}")
 }
 
 fn private_address(address: IpAddr) -> bool {
@@ -284,28 +267,45 @@ mod tests {
     use super::*;
 
     #[test]
-    fn helper_bounds_and_private_address_policy_are_stable() {
-        assert_eq!(bounded_name(" Desk Mac "), "Desk Mac");
-        assert_eq!(bounded_name(""), "Software KVM computer");
-        assert!(private_address("192.168.1.20".parse().unwrap()));
-        assert!(private_address("fd00::20".parse().unwrap()));
-        assert!(!private_address("203.0.113.20".parse().unwrap()));
-        assert_eq!(
-            service_fullname("example"),
-            "example._software-kvm-console._tcp.local."
-        );
+    fn beacon_round_trip_is_bounded_and_rejects_hostile_shapes() {
+        let state = AdvertisementState {
+            name: "Desk Mac".to_owned(),
+            platform: "macos",
+            presence: NearbyPresence::RuntimeActive,
+        };
+        let peer = "11111111-1111-4111-8111-111111111111";
+        let encoded = encode_beacon(peer, &state);
+        let parsed = parse_beacon(
+            encoded.as_bytes(),
+            "192.168.1.20:24801".parse().unwrap(),
+            Instant::now(),
+        )
+        .unwrap();
+        assert_eq!(parsed.peer_id, peer);
+        assert_eq!(parsed.name, "Desk Mac");
+        assert_eq!(parsed.presence, NearbyPresence::RuntimeActive);
+        assert!(parse_beacon(
+            format!("{encoded}extra\n").as_bytes(),
+            "192.168.1.20:24801".parse().unwrap(),
+            Instant::now(),
+        )
+        .is_none());
+        assert!(parse_beacon(
+            encoded.as_bytes(),
+            "203.0.113.20:24801".parse().unwrap(),
+            Instant::now(),
+        )
+        .is_none());
     }
 
     #[test]
-    #[ignore = "manual multicast smoke probe"]
-    fn advertises_for_manual_multicast_probe() {
-        let discovery = NearbyDiscovery::start(
-            "11111111-1111-4111-8111-111111111111",
-            vec!["192.168.0.19".parse().unwrap()],
-            24_800,
-        )
-        .unwrap();
-        discovery.refresh("Software KVM smoke", "macos", NearbyPresence::SettingUp);
-        std::thread::sleep(Duration::from_secs(15));
+    fn helper_bounds_and_private_address_policy_are_stable() {
+        assert_eq!(bounded_name(" Desk Mac "), "Desk Mac");
+        assert_eq!(bounded_name(""), "Software KVM computer");
+        assert!(valid_peer_id("11111111-1111-4111-8111-111111111111"));
+        assert!(!valid_peer_id("11111111-1111-4111-8111-11111111111Z"));
+        assert!(private_address("192.168.1.20".parse().unwrap()));
+        assert!(private_address("fd00::20".parse().unwrap()));
+        assert!(!private_address("203.0.113.20".parse().unwrap()));
     }
 }
