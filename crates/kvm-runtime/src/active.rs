@@ -558,9 +558,11 @@ where
 {
     let start = {
         let mut manager = lock_manager(manager)?;
-        match manager.inbound_accepted(stream) {
-            Ok(start) => start,
-            Err(_) => return Ok(None),
+        if let Ok(start) = manager.inbound_accepted(stream) {
+            start
+        } else {
+            developer_event("transport=inbound_rejected");
+            return Ok(None);
         }
     };
     prepare_session(manager, admission_factory, start, now_ns).map(Some)
@@ -611,6 +613,7 @@ where
 {
     let peer_id = start.peer_id();
     let Ok(admission) = admission_factory.build() else {
+        developer_event("session=admission_factory_failed");
         lock_manager(manager)?
             .cancel_established(start, Duration::from_nanos(now_ns))
             .map_err(|_| RuntimeTransportError::new(RuntimeTransportErrorKind::Authority))?;
@@ -621,6 +624,7 @@ where
     let prepared = match start.build(admission, PersistentPeerConfig::default()) {
         Ok(prepared) => prepared,
         Err(error) => {
+            developer_event("session=admission_failed");
             let cancellation = error.into_cancellation();
             lock_manager(manager)?
                 .handle_bound_event(peer_id, cancellation, now_ns)
