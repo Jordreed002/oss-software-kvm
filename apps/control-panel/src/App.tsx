@@ -104,7 +104,7 @@ function App() {
           {step === 0 && <LocalStep snapshot={snapshot} name={name} setName={setName} address={address} setAddress={setAddress} busy={busy} onContinue={() => perform("identity", () => api.createIdentity(name, address), 1)} />}
           {step === 1 && <PairStep snapshot={snapshot} bundle={bundle} setBundle={setBundle} copied={copied} onCopy={async () => { await navigator.clipboard.writeText(snapshot.local?.publicBundle ?? ""); setCopied(true); window.setTimeout(() => setCopied(false), 1800); }} busy={busy} onImport={() => perform("pair", () => api.importPeer(bundle), 2)} onRequest={(peerId) => perform("pair-request", () => api.requestNearbyPairing(peerId))} onAccept={(requestId) => perform("pair-accept", () => api.acceptNearbyPairing(requestId))} onConfirm={(requestId) => perform("pair-confirm", () => api.confirmNearbyPairing(requestId), 2)} onDecline={(requestId) => perform("pair-decline", () => api.declineNearbyPairing(requestId))} onForget={() => perform("forget-pair", api.forgetPairedComputer)} />}
           {step === 2 && <ArrangeStep snapshot={snapshot} placement={placement} setPlacement={setPlacement} busy={busy} onContinue={() => perform("arrange", () => api.finalize(placement), 3)} />}
-          {step === 3 && <ReadyStep snapshot={snapshot} busy={busy} onValidate={() => perform("validate", api.validate)} onStart={() => perform("start", api.start)} onStop={() => perform("stop", api.stop)} />}
+          {step === 3 && <ReadyStep snapshot={snapshot} busy={busy} onValidate={() => perform("validate", api.validate)} onStart={() => perform("start", api.start)} onStop={() => perform("stop", api.stop)} onReplace={() => perform("forget-pair", async () => { if (snapshot.runtime === "running") await api.stop(); return api.forgetPairedComputer(); }, 1)} />}
         </section>
       </section>
       <footer><span>ALPHA · TWO HOSTS · LOCAL NETWORK ONLY</span><span className="escape"><KeyRound size={13} /> Emergency: Ctrl + Alt + Shift + Backspace</span></footer>
@@ -179,9 +179,10 @@ function DisplayTile({ label, name, display, local = false }: { label: string; n
   return <div className={`display-tile ${local ? "is-local" : ""}`}><div className="screen"><div className="screen-glow"/><Monitor size={24}/><span>{display?.width ?? "—"} × {display?.height ?? "—"}</span></div><div className="stand"/><small>{label}</small><strong>{name}</strong><span>{display?.name ?? "Display"}</span></div>;
 }
 
-function ReadyStep({ snapshot, busy, onValidate, onStart, onStop }: { snapshot: SetupSnapshot; busy: string | null; onValidate: () => void; onStart: () => void; onStop: () => void }) {
+function ReadyStep({ snapshot, busy, onValidate, onStart, onStop, onReplace }: { snapshot: SetupSnapshot; busy: string | null; onValidate: () => void; onStart: () => void; onStop: () => void; onReplace: () => void }) {
   const running = snapshot.runtime === "running";
   const runtimeFault = snapshot.runtime === "faulted" ? runtimeFaultMessage(snapshot.runtimeFault) : null;
+  const [confirmReplace, setConfirmReplace] = useState(false);
   return <div className="step-content enter">
     <SectionHeading number="04" kicker="ACTIVATE" title={running ? "Your desk is linked." : "One last safety check."} copy={running ? "Pointer and keyboard routing are active. Closing this console does not terminate the runtime." : "Validate identities, certificates, network addresses, topology, and file protections before capture can start."} />
     <NearbyPanel snapshot={snapshot}/>
@@ -191,6 +192,10 @@ function ReadyStep({ snapshot, busy, onValidate, onStart, onStop }: { snapshot: 
       <CheckRow label="Display topology" detail="Bidirectional edge link configured" good={snapshot.configured}/>
       <CheckRow label="Runtime validation" detail={snapshot.validated ? "All safety checks passed" : "Not checked yet"} good={snapshot.validated}/>
     </div>
+    {snapshot.peer && <section className="ready-pair-management">
+      <div><span>Paired with</span><strong>{snapshot.peer.displayName}</strong><small>Replace this peer if the other computer does not show the same pairing.</small></div>
+      {!confirmReplace ? <button onClick={() => setConfirmReplace(true)}><Unplug size={14}/>Replace paired computer</button> : <div className="ready-replace-confirm"><span>{running ? "Routing will stop first. " : ""}The local private identity will be preserved.</span><button onClick={() => setConfirmReplace(false)}>Keep pairing</button><button className="danger" disabled={!!busy} onClick={onReplace}>{busy === "forget-pair" ? <LoaderCircle className="spin" size={14}/> : <Unplug size={14}/>}Replace now</button></div>}
+    </section>}
     {runtimeFault && <div className="error-banner"><CircleAlert size={18}/><div><strong>{runtimeFault.title}</strong><br/><span>{runtimeFault.detail}</span></div></div>}
     {snapshot.setupDirectory && <div className="path-note"><span>Setup stored securely</span><code>{snapshot.setupDirectory}</code></div>}
     {runtimeFault && snapshot.runtimeLogPath && <div className="path-note"><span>Private diagnostic log</span><code>{snapshot.runtimeLogPath}</code></div>}
