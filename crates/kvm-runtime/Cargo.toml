@@ -6,6 +6,7 @@ repository.workspace = true
 description = "Fail-closed runtime composition boundary for Software KVM"
 
 [dependencies]
+fs2 = "0.4"
 kvm-config = { path = "../kvm-config" }
 kvm-daemon = { path = "../kvm-daemon" }
 kvm-network = { path = "../kvm-network" }

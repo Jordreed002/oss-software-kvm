@@ -14,7 +14,10 @@ OSS Software KVM is a planned open-source, bidirectional software KVM for Window
 
 The core is a Rust Cargo workspace with platform-neutral domain, protocol, routing, topology, networking, security, configuration, clipboard, and daemon crates. Native Windows and macOS crates currently provide device and display discovery, input injection, capability reporting, and safe unsupported-platform stubs.
 
-A separate Tauri, React, and TypeScript control panel will configure and monitor the daemon over local IPC. Peer communication will be authenticated and encrypted over the local network.
+A separate Tauri, React, and TypeScript control panel configures and monitors the two-host runtime.
+It provides native identity creation, public pairing-card exchange, visual display placement,
+secure profile validation, and gate-first start/stop controls. Peer communication is authenticated
+and encrypted over the local network.
 
 ## Status
 
@@ -45,6 +48,10 @@ The detailed product and engineering requirements live in:
 - [Milestone 08: authenticated device inventory and routing](.spec/milestone-08-authenticated-device-routing.md)
 - [Milestone 09: exact-generation multi-peer device routing](.spec/milestone-09-multi-peer-routing.md)
 - [Milestone 10: two-host native runtime alpha](.spec/milestone-10-two-host-native-alpha.md)
+
+To try the current Mac/Windows source alpha, follow the
+[Link Console setup guide](apps/control-panel/README.md). It replaces the earlier hand-written
+profile workflow, while keeping the daemon independent from the UI.
 
 The evolving engineering decisions live in:
 
