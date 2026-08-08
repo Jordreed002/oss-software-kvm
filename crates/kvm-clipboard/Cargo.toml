@@ -1,0 +1,13 @@
+[package]
+name = "kvm-clipboard"
+version = "0.1.0"
+edition = "2021"
+description = "Bounded plain-text clipboard synchronization state for Software KVM"
+
+[dependencies]
+kvm-types = { path = "../kvm-types" }
+sha2 = "0.11"
+uuid = { version = "1", features = ["v4"] }
+
+[lints]
+workspace = true

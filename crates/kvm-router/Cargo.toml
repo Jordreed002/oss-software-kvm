@@ -1,0 +1,13 @@
+[package]
+name = "kvm-router"
+version = "0.1.0"
+edition = "2021"
+description = "Deterministic per-device input routing for Software KVM"
+
+[dependencies]
+kvm-input = { path = "../kvm-input" }
+kvm-types = { path = "../kvm-types" }
+serde = { version = "1", features = ["derive"] }
+
+[lints]
+workspace = true

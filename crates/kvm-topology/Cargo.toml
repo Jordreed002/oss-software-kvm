@@ -1,0 +1,11 @@
+[package]
+name = "kvm-topology"
+version = "0.1.0"
+edition = "2021"
+description = "Logical display workspace topology for Software KVM"
+
+[dependencies]
+kvm-types = { path = "../kvm-types" }
+
+[lints]
+workspace = true

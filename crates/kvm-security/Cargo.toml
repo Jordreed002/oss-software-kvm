@@ -1,0 +1,13 @@
+[package]
+name = "kvm-security"
+version = "0.1.0"
+edition = "2021"
+description = "Pairing, peer identity, authorization, and credential boundaries for Software KVM"
+
+[dependencies]
+kvm-types = { path = "../kvm-types" }
+thiserror = "2"
+zeroize = "1"
+
+[lints]
+workspace = true

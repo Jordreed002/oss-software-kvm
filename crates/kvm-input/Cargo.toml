@@ -1,0 +1,15 @@
+[package]
+name = "kvm-input"
+version = "0.1.0"
+edition = "2021"
+description = "Platform-neutral input model and state tracking for Software KVM"
+
+[dependencies]
+kvm-types = { path = "../kvm-types" }
+serde = { version = "1", features = ["derive"] }
+
+[dev-dependencies]
+serde_json = "1"
+
+[lints]
+workspace = true

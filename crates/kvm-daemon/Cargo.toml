@@ -1,0 +1,19 @@
+[package]
+name = "kvm-daemon"
+version = "0.1.0"
+edition = "2021"
+description = "Production daemon lifecycle and safety coordinator for Software KVM"
+
+[dependencies]
+arc-swap = "1"
+kvm-config = { path = "../kvm-config" }
+kvm-input = { path = "../kvm-input" }
+kvm-router = { path = "../kvm-router" }
+kvm-types = { path = "../kvm-types" }
+thiserror = "2"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "time"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+
+[lints]
+workspace = true

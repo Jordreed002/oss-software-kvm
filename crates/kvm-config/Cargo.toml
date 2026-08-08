@@ -1,0 +1,14 @@
+[package]
+name = "kvm-config"
+version = "0.1.0"
+edition = "2021"
+description = "Versioned persistent configuration for Software KVM"
+
+[dependencies]
+kvm-types = { path = "../kvm-types" }
+serde = { version = "1", features = ["derive"] }
+thiserror = "2"
+toml = "1.1"
+
+[lints]
+workspace = true

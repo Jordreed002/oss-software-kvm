@@ -1,0 +1,19 @@
+[package]
+name = "kvm-diagnostics"
+version = "0.1.0"
+edition = "2021"
+description = "Read-only physical-host validation runner for Software KVM"
+
+[dependencies]
+kvm-daemon = { path = "../kvm-daemon" }
+kvm-input = { path = "../kvm-input" }
+kvm-types = { path = "../kvm-types" }
+
+[target.'cfg(windows)'.dependencies]
+kvm-windows = { path = "../kvm-windows" }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+kvm-macos = { path = "../kvm-macos" }
+
+[lints]
+workspace = true

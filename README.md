@@ -10,20 +10,34 @@ OSS Software KVM is a planned open-source, bidirectional software KVM for Window
 - Preserve safe local control through disconnects, crashes, and an emergency shortcut.
 - Keep the native Rust daemon running independently from the control-panel UI.
 
-## Planned architecture
+## Architecture
 
-The core will be a Rust Cargo workspace with platform-neutral domain, protocol, routing, topology, networking, security, configuration, and clipboard crates. Native Windows and macOS backends will handle input capture, suppression, injection, and display discovery.
+The core is a Rust Cargo workspace with platform-neutral domain, protocol, routing, topology, networking, security, configuration, clipboard, and daemon crates. Native Windows and macOS crates currently provide device and display discovery, input injection, capability reporting, and safe unsupported-platform stubs.
 
 A separate Tauri, React, and TypeScript control panel will configure and monitor the daemon over local IPC. Peer communication will be authenticated and encrypted over the local network.
 
 ## Status
 
-This repository is in the specification and project-initialization phase. No working KVM implementation exists yet.
+The initial engineering foundation is implemented and covered by automated tests. It includes the
+shared input path, protocol, routing, topology, configuration, persistent admitted peer sessions,
+pairing and authorization state, daemon safety state, clipboard synchronization, and native
+enumeration, observation, and injection surfaces.
+
+Device-aware capture and per-device suppression are deliberately still gated on physical Windows
+and macOS validation. No release currently provides working KVM control.
 
 The detailed product and engineering requirements live in:
 
 - [Product and technical specification](.spec/spec.md)
 - [Implementation specification](.spec/implementation.md)
+
+The evolving engineering decisions live in:
+
+- [Architecture](docs/architecture.md)
+- [Protocol](docs/protocol.md)
+- [Security](docs/security.md)
+- [Platform notes](docs/platform-notes.md)
+- [Windows Codex worktree and hardware-validation handoff](docs/windows-codex-worktree.md)
 
 ## Initial scope
 
@@ -33,4 +47,15 @@ Linux support, display streaming, WAN remote control, advanced trackpad gestures
 
 ## Contributing
 
-The implementation sequence and acceptance criteria are documented in the implementation specification. Contribution guidance will be added once the initial Cargo workspace and development workflow are established.
+Install the current stable Rust toolchain with the `rustfmt` and `clippy` components. The standard
+checks are:
+
+```sh
+cargo fmt --all --check
+cargo clippy --workspace --all-targets -- -D warnings
+cargo test --workspace --all-targets
+```
+
+The same checks run on Linux, Windows, and macOS in CI. Native KVM behavior must additionally be
+tested on physical Windows and macOS systems; platform-neutral CI cannot validate input
+suppression, injection, permissions, or end-to-end latency.
