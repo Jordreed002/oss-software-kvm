@@ -487,16 +487,47 @@ fn announce_listener_ready(ready: Option<tokio::sync::oneshot::Sender<()>>) {
 
 fn report_manager_snapshot<I>(
     manager: &Arc<Mutex<PeerManager<I, ManagedSessionOutbound>>>,
-    previous: &mut Option<PeerManagerSnapshot>,
+    previous: &mut Option<ManagerDiagnosticSnapshot>,
 ) -> Result<(), RuntimeTransportError>
 where
     I: OutputInjectionBackend,
 {
-    let snapshot = lock_manager(manager)?.snapshot();
+    let manager = lock_manager(manager)?;
+    let manager_snapshot = manager.snapshot();
+    let routing = manager
+        .selected_routing_handle()
+        .map_err(|_| RuntimeTransportError::new(RuntimeTransportErrorKind::Authority))?
+        .load();
+    let routing_state = if routing.enabled {
+        RoutingDiagnosticState::Enabled
+    } else if routing.workspace_ready {
+        RoutingDiagnosticState::Gated
+    } else {
+        RoutingDiagnosticState::WaitingForWorkspace
+    };
+    let snapshot = ManagerDiagnosticSnapshot {
+        manager: manager_snapshot,
+        routing: routing_state,
+        handoff: if routing.handoff_pending {
+            HandoffDiagnosticState::Pending
+        } else {
+            HandoffDiagnosticState::Settled
+        },
+        authority: if routing.workspace.active_host == routing.workspace.local_host {
+            AuthorityDiagnosticState::Local
+        } else {
+            AuthorityDiagnosticState::Remote
+        },
+    };
     if *previous != Some(snapshot) {
         developer_event(&format!(
-            "manager=state candidates:{} connecting:{} sessions:{}",
-            snapshot.peers_with_candidates, snapshot.connecting_tasks, snapshot.session_tasks,
+            "manager=state candidates:{} connecting:{} sessions:{} routing:{} handoff:{} authority:{}",
+            snapshot.manager.peers_with_candidates,
+            snapshot.manager.connecting_tasks,
+            snapshot.manager.session_tasks,
+            snapshot.routing.as_str(),
+            snapshot.handoff.as_str(),
+            snapshot.authority.as_str(),
         ));
         *previous = Some(snapshot);
     }
@@ -506,6 +537,61 @@ where
 struct DialResult {
     task: OutboundDialTask,
     result: std::io::Result<RustlsPeerStream>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ManagerDiagnosticSnapshot {
+    manager: PeerManagerSnapshot,
+    routing: RoutingDiagnosticState,
+    handoff: HandoffDiagnosticState,
+    authority: AuthorityDiagnosticState,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RoutingDiagnosticState {
+    Enabled,
+    Gated,
+    WaitingForWorkspace,
+}
+
+impl RoutingDiagnosticState {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Enabled => "enabled",
+            Self::Gated => "gated",
+            Self::WaitingForWorkspace => "waiting_for_workspace",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum HandoffDiagnosticState {
+    Pending,
+    Settled,
+}
+
+impl HandoffDiagnosticState {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::Settled => "settled",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum AuthorityDiagnosticState {
+    Local,
+    Remote,
+}
+
+impl AuthorityDiagnosticState {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Local => "local",
+            Self::Remote => "remote",
+        }
+    }
 }
 
 async fn finish_transport_tasks<I>(
@@ -685,6 +771,7 @@ where
                     .handle_bound_event(peer_id, event, now_ns(started))
                     .is_err()
                 {
+                    developer_event("session=event_rejected");
                     let _ = session_shutdown.send(true);
                 }
             }
@@ -692,8 +779,10 @@ where
     }
 
     match runner.await {
-        Ok(Ok(_)) | Err(_) => {}
+        Ok(Ok(end)) => developer_event(&format!("session=runner_ended end:{:?}", end.end)),
+        Err(_) => developer_event("session=runner_task_failed"),
         Ok(Err(error)) => {
+            developer_event(&format!("session=runner_failed detail:{error:?}"));
             if let Some(terminal) = error.into_terminal_event() {
                 let _ =
                     lock_manager(&manager)?.handle_bound_event(peer_id, terminal, now_ns(started));
