@@ -10,7 +10,7 @@ use kvm_daemon::{
     InstalledPeerSessionParts, ManagedPairedPeer, ManagedSessionOutbound, OutboundDialTask,
     OutputInjectionBackend, PeerManager, PeerManagerConfig, PeerManagerSnapshot,
     PeerSessionCoordinator, PeerSessionSupervisor, PointerHandoffConfig, SealedPeerSessionStart,
-    WorkspaceControlPlane,
+    SupervisorEventOutcome, WorkspaceControlPlane,
 };
 use kvm_network::{
     AuthenticatedLanConnector, BoundedLanListener, ConnectionGenerationGate, ConnectionRole,
@@ -767,12 +767,31 @@ where
             }
             event = events.recv() => {
                 let Some(event) = event else { break; };
-                if lock_manager(&manager)?
+                let event_diagnostic = developer_logging_enabled().then(|| format!("{event:?}"));
+                match lock_manager(&manager)?
                     .handle_bound_event(peer_id, event, now_ns(started))
-                    .is_err()
                 {
-                    developer_event("session=event_rejected");
-                    let _ = session_shutdown.send(true);
+                    Ok(outcome) => {
+                        if matches!(
+                            outcome,
+                            SupervisorEventOutcome::Retired(_)
+                                | SupervisorEventOutcome::StaleIgnored
+                                | SupervisorEventOutcome::PendingCancelled
+                        ) {
+                            developer_event(&format!(
+                                "session=event_retired event:{} outcome:{outcome:?}",
+                                event_diagnostic.as_deref().unwrap_or("[REDACTED]")
+                            ));
+                            let _ = session_shutdown.send(true);
+                        }
+                    }
+                    Err(error) => {
+                        developer_event(&format!(
+                            "session=event_rejected event:{} error:{error:?}",
+                            event_diagnostic.as_deref().unwrap_or("[REDACTED]")
+                        ));
+                        let _ = session_shutdown.send(true);
+                    }
                 }
             }
         }
@@ -866,9 +885,13 @@ fn duration_ns(duration: Duration) -> u64 {
 }
 
 fn developer_event(message: &str) {
-    if std::env::var_os("SOFTWARE_KVM_DEV_LOG").is_some() {
+    if developer_logging_enabled() {
         eprintln!("[dev] {message}");
     }
+}
+
+fn developer_logging_enabled() -> bool {
+    std::env::var_os("SOFTWARE_KVM_DEV_LOG").is_some()
 }
 
 impl PreparedTwoHostAlpha {
