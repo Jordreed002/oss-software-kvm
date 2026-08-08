@@ -36,6 +36,9 @@ const TRUST_FILE: &str = "selected-peer.der";
 const CONTROL_FILE: &str = "runtime.control";
 const RUNTIME_LOG_FILE: &str = "runtime.log";
 const MAX_RUNTIME_LOG_READ: u64 = 16 * 1024;
+#[cfg(windows)]
+// Keep credentials separate from WebView2's profile in the app-data root.
+const WINDOWS_SETUP_DIRECTORY: &str = "runtime";
 
 #[derive(Debug)]
 pub(crate) struct SetupService {
@@ -169,7 +172,19 @@ pub(crate) struct SetupSnapshot {
 
 impl SetupService {
     pub(crate) fn open(app: &AppHandle) -> Result<Self, Box<dyn std::error::Error>> {
-        let directory = app.path().app_local_data_dir()?;
+        let app_data_directory = app.path().app_local_data_dir()?;
+        fs::create_dir_all(&app_data_directory)?;
+        #[cfg(windows)]
+        let directory = {
+            let directory = app_data_directory.join(WINDOWS_SETUP_DIRECTORY);
+            fs::create_dir_all(&directory)?;
+            secure_directory(&directory)?;
+            migrate_legacy_windows_setup(&app_data_directory, &directory)?;
+            restore_windows_app_data_acl(&app_data_directory)?;
+            directory
+        };
+        #[cfg(not(windows))]
+        let directory = app_data_directory;
         fs::create_dir_all(&directory)?;
         secure_directory(&directory)?;
         let state_path = directory.join(STATE_FILE);
@@ -288,6 +303,80 @@ impl SetupService {
             public_bundle: URL_SAFE_NO_PAD.encode(encoded),
         })
     }
+}
+
+#[cfg(windows)]
+fn migrate_legacy_windows_setup(root: &Path, directory: &Path) -> Result<(), std::io::Error> {
+    let legacy_state = root.join(STATE_FILE);
+    let files = [
+        (CONFIG_FILE, true),
+        (CERT_FILE, false),
+        (KEY_FILE, true),
+        (TRUST_FILE, false),
+        (PROFILE_FILE, true),
+        (RUNTIME_LOG_FILE, true),
+        (STATE_FILE, true),
+    ];
+
+    if legacy_state.is_file() && !directory.join(STATE_FILE).is_file() {
+        // State is copied last so an interrupted migration is retried rather
+        // than treating a partial destination as authoritative.
+        for (name, private) in files {
+            let source = root.join(name);
+            if !source.is_file() {
+                continue;
+            }
+            let mut contents = fs::read(&source)?;
+            if name == PROFILE_FILE {
+                contents = rewrite_windows_profile_paths(&contents, root, directory)?;
+            }
+            secure_write(&directory.join(name), &contents, private)
+                .map_err(|()| std::io::Error::other("setup migration failed"))?;
+        }
+    }
+
+    let profile_path = directory.join(PROFILE_FILE);
+    if profile_path.is_file() {
+        let profile = fs::read(&profile_path)?;
+        let rewritten = rewrite_windows_profile_paths(&profile, root, directory)?;
+        if rewritten != profile {
+            secure_write(&profile_path, &rewritten, true)
+                .map_err(|()| std::io::Error::other("setup migration failed"))?;
+        }
+    }
+
+    if directory.join(STATE_FILE).is_file() {
+        for (name, _) in files {
+            let source = root.join(name);
+            if source.is_file() {
+                fs::remove_file(source)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn rewrite_windows_profile_paths(
+    contents: &[u8],
+    root: &Path,
+    directory: &Path,
+) -> Result<Vec<u8>, std::io::Error> {
+    let source = std::str::from_utf8(contents)
+        .map_err(|_| std::io::Error::other("setup migration failed"))?;
+    let mut rewritten = source.to_owned();
+    for name in [CONFIG_FILE, CERT_FILE, KEY_FILE, TRUST_FILE] {
+        rewritten = rewritten.replace(
+            root.join(name).to_string_lossy().as_ref(),
+            directory.join(name).to_string_lossy().as_ref(),
+        );
+    }
+    Ok(rewritten.into_bytes())
+}
+
+#[cfg(windows)]
+fn restore_windows_app_data_acl(path: &Path) -> Result<(), std::io::Error> {
+    run_icacls(path, &["/reset"])
 }
 
 #[tauri::command]
@@ -431,7 +520,8 @@ pub(crate) fn finalize_setup(
 #[tauri::command]
 pub(crate) fn validate_setup(service: State<'_, SetupService>) -> Result<SetupSnapshot, String> {
     ensure_runtime_stopped(&service)?;
-    kvm_runtime::prepare(&service.directory.join(PROFILE_FILE)).map_err(|_| coarse_error())?;
+    kvm_runtime::prepare(&service.directory.join(PROFILE_FILE))
+        .map_err(|error| format!("runtime validation failed safely: {error}"))?;
     let mut setup = service.inner.lock().map_err(|_| coarse_error())?;
     setup.validated = true;
     service.save(&setup).map_err(|()| coarse_error())?;
@@ -826,7 +916,16 @@ fn secure_directory(path: &Path) -> Result<(), std::io::Error> {
 
 #[cfg(windows)]
 fn secure_directory(path: &Path) -> Result<(), std::io::Error> {
-    secure_windows_acl(path).map_err(|()| std::io::Error::other("directory protection failed"))
+    // Reset first so Windows' explicit default-token grants become inherited;
+    // removing inheritance then leaves a clean DACL for the owner-only grant.
+    run_icacls(path, &["/reset"])?;
+    run_icacls(path, &["/inheritance:r"])?;
+    let grant = format!(
+        "{}:(OI)(CI)(F)",
+        std::env::var("USERNAME")
+            .map_err(|_| std::io::Error::other("directory protection identity unavailable"))?
+    );
+    run_icacls(path, &["/grant:r", &grant])
 }
 
 #[cfg(not(any(unix, windows)))]
@@ -841,18 +940,22 @@ fn secure_directory(path: &Path) -> Result<(), std::io::Error> {
 
 #[cfg(windows)]
 fn secure_windows_acl(path: &Path) -> Result<(), ()> {
+    let grant = format!("{}:(F)", std::env::var("USERNAME").map_err(|_| ())?);
+    run_icacls(path, &["/inheritance:r", "/grant:r", &grant]).map_err(|_| ())
+}
+
+#[cfg(windows)]
+fn run_icacls(path: &Path, arguments: &[&str]) -> Result<(), std::io::Error> {
     let status = Command::new("icacls")
         .arg(path)
-        .args(["/inheritance:r", "/grant:r"])
-        .arg(format!(
-            "{}:(F)",
-            std::env::var("USERNAME").map_err(|_| ())?
-        ))
+        .args(arguments)
         .stdout(Stdio::null())
         .stderr(Stdio::null())
-        .status()
-        .map_err(|_| ())?;
-    status.success().then_some(()).ok_or(())
+        .status()?;
+    status
+        .success()
+        .then_some(())
+        .ok_or_else(|| std::io::Error::other("Windows ACL update failed"))
 }
 
 fn runtime_binary() -> Option<PathBuf> {
@@ -899,10 +1002,14 @@ fn runtime_lock_held(directory: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{build_config, validate_bundle, DisplayDto, PairingBundle, Placement, PlatformDto};
+    #[cfg(windows)]
+    use super::{rewrite_windows_profile_paths, CONFIG_FILE, KEY_FILE};
     use base64::engine::general_purpose::URL_SAFE_NO_PAD;
     use base64::Engine;
     use rcgen::{CertificateParams, KeyPair};
     use sha2::{Digest, Sha256};
+    #[cfg(windows)]
+    use std::path::Path;
 
     fn display(id: &str, primary: bool) -> DisplayDto {
         DisplayDto {
@@ -954,5 +1061,31 @@ mod tests {
         assert_eq!(config.topology.displays.len(), 2);
         assert_eq!(config.topology.links.len(), 2);
         assert!(config.validate().is_ok());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_profile_migration_rewrites_only_legacy_material_paths() {
+        let root = Path::new(r"C:\Users\test\AppData\Local\software-kvm");
+        let directory = root.join("runtime");
+        let source = format!(
+            "kvm_config_path = '{}'\nprivate_key = '{}'\n",
+            root.join(CONFIG_FILE).display(),
+            root.join(KEY_FILE).display()
+        );
+        let expected = format!(
+            "kvm_config_path = '{}'\nprivate_key = '{}'\n",
+            directory.join(CONFIG_FILE).display(),
+            directory.join(KEY_FILE).display()
+        );
+
+        let rewritten = rewrite_windows_profile_paths(source.as_bytes(), root, &directory)
+            .expect("legacy paths should rewrite");
+        assert_eq!(rewritten, expected.as_bytes());
+        assert_eq!(
+            rewrite_windows_profile_paths(&rewritten, root, &directory)
+                .expect("rewritten paths should remain stable"),
+            rewritten
+        );
     }
 }

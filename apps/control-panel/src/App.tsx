@@ -51,8 +51,13 @@ function App() {
       const state = await operation();
       setSnapshot(state);
       if (next !== undefined) setStep(next);
-    } catch {
-      setError("That step could not be completed safely. Nothing was changed.");
+    } catch (operationError) {
+      const detail = typeof operationError === "string"
+        ? operationError
+        : operationError instanceof Error
+          ? operationError.message
+          : "That step could not be completed safely. Nothing was changed.";
+      setError(detail);
     } finally { setBusy(null); }
   };
 
