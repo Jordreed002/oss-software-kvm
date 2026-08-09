@@ -58,7 +58,7 @@ pub(crate) enum NearbyPairingStatus {
     WaitingForConfirmation,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct NearbyPairingDto {
     request_id: String,
@@ -68,6 +68,24 @@ pub(crate) struct NearbyPairingDto {
     address: String,
     status: NearbyPairingStatus,
     verification_code: Option<String>,
+}
+
+impl fmt::Debug for NearbyPairingDto {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // N-5: redact the verification SAS code. The other fields are non-secret
+        // metadata already surfaced to the UI; this keeps the code out of {:?}
+        // output, including transitively through SetupSnapshot.
+        formatter
+            .debug_struct("NearbyPairingDto")
+            .field("request_id", &self.request_id)
+            .field("peer_id", &self.peer_id)
+            .field("name", &self.name)
+            .field("platform", &self.platform)
+            .field("address", &self.address)
+            .field("status", &self.status)
+            .field("verification_code_present", &self.verification_code.is_some())
+            .finish_non_exhaustive()
+    }
 }
 
 #[derive(Clone, Eq, PartialEq)]
@@ -240,18 +258,16 @@ impl NearbyDiscovery {
         });
         if should_send {
             let packet = encode_beacon(&self.peer_id, &next);
-            let limited_broadcast = SocketAddr::from((Ipv4Addr::BROADCAST, DISCOVERY_PORT));
             let mut sent = false;
             if packet.len() <= MAX_BEACON_BYTES {
-                for target in self
-                    .broadcast_targets
-                    .iter()
-                    .copied()
-                    .chain(std::iter::once(limited_broadcast))
-                {
-                    // Always attempt every interface. Short-circuiting after
-                    // a successful Hyper-V/VPN/WSL send can hide the beacon
-                    // from the physical Wi-Fi LAN.
+                // N-1: send only to the per-private-interface directed broadcast
+                // targets (RFC1918/ULA, validated at construction). The previous
+                // blanket send to Ipv4Addr::BROADCAST (255.255.255.255) reached
+                // every broadcast-capable adapter — including public Wi-Fi —
+                // leaking hostname, OS, and a stable cross-LAN peer_id. Always
+                // attempt every interface; short-circuiting after a successful
+                // Hyper-V/VPN/WSL send can hide the beacon from the physical LAN.
+                for target in self.broadcast_targets.iter().copied() {
                     if self.socket.send_to(packet.as_bytes(), target).is_ok() {
                         sent = true;
                     }

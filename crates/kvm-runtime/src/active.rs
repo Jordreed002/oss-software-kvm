@@ -447,7 +447,9 @@ where
                             developer_event(&format!("transport=manager_tick_failed detail:{error:?}"));
                             return Err(error);
                         }
-                        report_manager_snapshot(&self.manager, &mut last_manager_snapshot)?;
+                        // R-1: best-effort diagnostic snapshot; failures are
+                        // logged inside the helper and never tear down the loop.
+                        report_manager_snapshot(&self.manager, &mut last_manager_snapshot);
                         if dial_tasks.is_empty() {
                             if let Some(task) = poll_dial(&self.manager, now_duration(started))? {
                                 developer_event("transport=outbound_dial_started");
@@ -490,16 +492,23 @@ fn announce_listener_ready(ready: Option<tokio::sync::oneshot::Sender<()>>) {
 fn report_manager_snapshot<I>(
     manager: &Arc<Mutex<PeerManager<I, ManagedSessionOutbound>>>,
     previous: &mut Option<ManagerDiagnosticSnapshot>,
-) -> Result<(), RuntimeTransportError>
-where
+) where
     I: OutputInjectionBackend,
 {
-    let manager = lock_manager(manager)?;
+    // R-1: this is a best-effort diagnostic read. A failure here reads no
+    // pressed-key state, so it must never propagate and tear down the transport
+    // loop — log and return instead.
+    let Ok(manager) = lock_manager(manager) else {
+        developer_event("transport=manager_snapshot_failed detail:lock");
+        return;
+    };
     let manager_snapshot = manager.snapshot();
-    let routing = manager
-        .selected_routing_handle()
-        .map_err(|_| RuntimeTransportError::new(RuntimeTransportErrorKind::Authority))?
-        .load();
+    let routing = if let Ok(handle) = manager.selected_routing_handle() {
+        handle.load()
+    } else {
+        developer_event("transport=manager_snapshot_failed detail:authority");
+        return;
+    };
     let routing_state = if routing.enabled {
         RoutingDiagnosticState::Enabled
     } else if routing.workspace_ready {
@@ -533,7 +542,6 @@ where
         ));
         *previous = Some(snapshot);
     }
-    Ok(())
 }
 
 struct DialResult {
