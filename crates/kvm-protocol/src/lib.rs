@@ -4,6 +4,7 @@
 //! model. Callers must deliberately translate to and from `kvm-types` and
 //! `kvm-input`; this keeps the public wire format independently versionable.
 
+mod control;
 mod error;
 mod frame;
 mod message;
@@ -18,3 +19,4 @@ pub use frame::{
 };
 pub use message::{MessageType, WireMessage};
 pub use wire::*;
+pub use control::*;
