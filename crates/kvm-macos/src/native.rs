@@ -414,6 +414,7 @@ struct WholeHostCallbackContext {
     active: Arc<AtomicBool>,
     run_loop: CFRunLoopRef,
     sequence: AtomicU64,
+    timebase: MachTimebaseInfo,
 }
 
 #[derive(Debug)]
@@ -1071,6 +1072,21 @@ fn run_whole_host_capture_thread(
         return Ok(());
     }
 
+    // F-28: query the mach timebase so Quartz (whole-host alpha) timestamps can
+    // be converted to nanoseconds — matching the IOHID path — instead of being
+    // passed through as raw mach absolute-time ticks (~41x too small on Apple
+    // Silicon if read as ns).
+    let mut timebase = MachTimebaseInfo::default();
+    // SAFETY: `timebase` is valid writable storage for the fixed C structure.
+    let timebase_status = unsafe { mach_timebase_info(&raw mut timebase) };
+    if timebase_status != 0 || timebase.denominator == 0 {
+        let _ = ready.send(Err(MacBackendError::NativeStatus {
+            operation: "mach_timebase_info",
+            code: timebase_status,
+        }));
+        return Ok(());
+    }
+
     let mut context = Box::new(WholeHostCallbackContext {
         host_id,
         keyboard_device: derive_whole_host_device_id(host_id, WholeHostDeviceKind::Keyboard),
@@ -1080,6 +1096,7 @@ fn run_whole_host_capture_thread(
         active: Arc::clone(active),
         run_loop,
         sequence: AtomicU64::new(1),
+        timebase,
     });
     let context_ptr = (&raw mut *context).cast::<c_void>();
     // SAFETY: The callback context remains boxed until after this tap is
@@ -1319,7 +1336,13 @@ fn dispatch_quartz_event(
     let mut captured = CapturedInput::new(
         InputEvent::new(
             sequence,
-            unsafe { CGEventGetTimestamp(event) },
+            // F-28: convert mach absolute-time ticks to nanoseconds via the
+            // queried timebase, so downstream ns-assuming logic is correct.
+            mach_timestamp_ns(
+                unsafe { CGEventGetTimestamp(event) },
+                context.timebase.numerator,
+                context.timebase.denominator,
+            ),
             context.host_id,
             source_device,
             payload,
