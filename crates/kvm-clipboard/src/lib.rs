@@ -121,9 +121,21 @@ impl ContentHash {
 }
 
 /// Clipboard payload supported by the initial protocol.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Eq, PartialEq)]
 pub enum ClipboardContent {
     Text(String),
+}
+
+impl fmt::Debug for ClipboardContent {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // F-11: never surface clipboard text (passwords/tokens) via Debug.
+        match self {
+            Self::Text(text) => formatter
+                .debug_struct("ClipboardContent::Text")
+                .field("len", &text.len())
+                .finish(),
+        }
+    }
 }
 
 impl ClipboardContent {
@@ -141,12 +153,26 @@ impl ClipboardContent {
 }
 
 /// One origin-authored clipboard update and its integrity metadata.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Eq, PartialEq)]
 pub struct ClipboardUpdate {
     id: Uuid,
     origin: HostId,
     content_hash: ContentHash,
     content: ClipboardContent,
+}
+
+impl fmt::Debug for ClipboardUpdate {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // F-11: redact content text; show only non-sensitive metadata. HostId's
+        // own Debug already redacts (see kvm-types).
+        formatter
+            .debug_struct("ClipboardUpdate")
+            .field("id", &self.id)
+            .field("origin", &self.origin)
+            .field("content_hash", &self.content_hash)
+            .field("content_len", &self.content.utf8_len())
+            .finish_non_exhaustive()
+    }
 }
 
 impl ClipboardUpdate {
@@ -216,7 +242,7 @@ impl ClipboardUpdate {
 }
 
 /// Required side effect, or explicit refusal, after a state transition.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Eq, PartialEq)]
 pub enum ClipboardDecision {
     /// Publish this locally authored update to peers.
     Publish(ClipboardUpdate),
@@ -226,6 +252,19 @@ pub enum ClipboardDecision {
     Ignore(IgnoreReason),
     /// Drop malformed or policy-violating content.
     Reject(RejectReason),
+}
+
+impl fmt::Debug for ClipboardDecision {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // F-11: delegate to the redacting ClipboardUpdate Debug; Ignore/Reject
+        // reasons carry only an id/enum and no payload text.
+        match self {
+            Self::Publish(update) => formatter.debug_tuple("Publish").field(update).finish(),
+            Self::Apply(update) => formatter.debug_tuple("Apply").field(update).finish(),
+            Self::Ignore(reason) => formatter.debug_tuple("Ignore").field(reason).finish(),
+            Self::Reject(reason) => formatter.debug_tuple("Reject").field(reason).finish(),
+        }
+    }
 }
 
 /// Reasons an otherwise valid observation requires no action.
@@ -515,6 +554,29 @@ mod tests {
             panic!("expected publish decision, got {decision:?}");
         };
         update
+    }
+
+    #[test]
+    fn debug_never_exposes_clipboard_text() {
+        // F-11: payload text must not reach Debug output for any sensitive type.
+        const SECRET: &str = "SUPER-SECRET-CLIPBOARD-TOKEN";
+        let update = fixed_update(1, HOST_A, SECRET);
+        let content = ClipboardContent::Text(SECRET.to_owned());
+        let decisions = [
+            ClipboardDecision::Publish(update.clone()),
+            ClipboardDecision::Apply(update.clone()),
+            ClipboardDecision::Ignore(IgnoreReason::UnchangedContent),
+            ClipboardDecision::Reject(RejectReason::PayloadTooLarge {
+                actual: 999,
+                maximum: 256,
+            }),
+        ];
+
+        assert!(!format!("{update:?}").contains(SECRET));
+        assert!(!format!("{content:?}").contains(SECRET));
+        for decision in &decisions {
+            assert!(!format!("{decision:?}").contains(SECRET));
+        }
     }
 
     #[test]

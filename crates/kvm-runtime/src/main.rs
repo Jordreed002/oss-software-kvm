@@ -42,7 +42,14 @@ async fn main() -> ExitCode {
     let (shutdown, receiver) = tokio::sync::watch::channel(false);
     let interrupt_shutdown = shutdown.clone();
     tokio::spawn(async move {
-        let _ = tokio::signal::ctrl_c().await;
+        // F-06: drive graceful shutdown from both SIGINT (Ctrl-C) and, on Unix,
+        // SIGTERM (systemd/launchd/Docker stop). Without this, SIGTERM hits the
+        // OS default handler and terminates immediately — skipping cleanup, which
+        // on Windows leaves injected modifier state stuck.
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {}
+            () = terminate_signal() => {}
+        }
         let _ = interrupt_shutdown.send(true);
     });
     if let Some(control) = managed_control {
@@ -153,6 +160,25 @@ fn managed_stop_requested(control: &Path) -> bool {
         return false;
     };
     matches!(&bytes[..length], b"stop" | b"stop\n")
+}
+
+/// Waits for SIGTERM on Unix; never resolves elsewhere so `tokio::select!` falls
+/// back to `ctrl_c`. Failure to install the handler degrades to ctrl_c-only
+/// rather than panicking.
+#[cfg(unix)]
+async fn terminate_signal() {
+    use tokio::signal::unix::{signal, SignalKind};
+    match signal(SignalKind::terminate()) {
+        Ok(mut stream) => {
+            stream.recv().await;
+        }
+        Err(_) => std::future::pending::<()>().await,
+    }
+}
+
+#[cfg(not(unix))]
+async fn terminate_signal() {
+    std::future::pending::<()>().await
 }
 
 #[cfg(test)]
