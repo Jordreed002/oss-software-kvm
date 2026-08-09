@@ -1005,10 +1005,20 @@ impl PreparedTwoHostAlpha {
         let supervisor = PeerSessionSupervisor::new(gate, coordinator);
         let paired = PairedPeer::from_persisted_public_identity(parts.remote_identity.clone());
         let managed_peer = ManagedPairedPeer::new(&paired, supervisor);
-        let mut manager =
-            PeerManager::new(local_peer, [managed_peer], PeerManagerConfig::default()).map_err(
-                |_| RuntimeCompositionError::new(RuntimeCompositionErrorKind::Authority),
-            )?;
+        // F-08: pin discovery-derived dial candidates to this host's service
+        // port so a malicious LAN peer can't induce internal connects by
+        // advertising a paired PeerId with a forged mDNS SRV port. All listen
+        // addresses share one port (validated at profile load), so the first
+        // suffices; `None` only if no address is configured.
+        let manager_config = PeerManagerConfig {
+            expected_service_port: parts
+                .listen_addresses
+                .first()
+                .map(std::net::SocketAddr::port),
+            ..PeerManagerConfig::default()
+        };
+        let mut manager = PeerManager::new(local_peer, [managed_peer], manager_config)
+            .map_err(|_| RuntimeCompositionError::new(RuntimeCompositionErrorKind::Authority))?;
         let workspace = WorkspaceControlPlane::new(
             remote_peer,
             prepared_workspace.inventory,
