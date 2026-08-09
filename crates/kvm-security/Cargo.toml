@@ -9,6 +9,7 @@ kvm-network = { path = "../kvm-network" }
 kvm-protocol = { path = "../kvm-protocol" }
 kvm-types = { path = "../kvm-types" }
 getrandom = "0.3"
+subtle = "2.6"
 thiserror = "2"
 zeroize = "1"
 

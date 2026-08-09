@@ -151,9 +151,18 @@ impl ConfigStore for FileConfigStore {
 
         let temp_path = create_temp_path(&self.path);
         let write_result = (|| {
-            let mut temp = OpenOptions::new()
-                .create_new(true)
-                .write(true)
+            // F-10: peer metadata (identity fingerprint, last address, host/peer
+            // ids) must not be world-readable. Set mode 0o600 on the temp file; the
+            // atomic rename carries this mode onto the final config path (mirrors
+            // the control panel's setup.rs).
+            let mut options = OpenOptions::new();
+            options.create_new(true).write(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                options.mode(0o600);
+            }
+            let mut temp = options
                 .open(&temp_path)
                 .map_err(|source| ConfigError::Write {
                     path: temp_path.clone(),

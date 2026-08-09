@@ -2,6 +2,7 @@ use std::collections::BTreeMap;
 use std::fmt;
 
 use kvm_types::{HostId, PeerId};
+use subtle::ConstantTimeEq;
 use thiserror::Error;
 
 use crate::{IdentityFingerprint, PeerIdentity};
@@ -266,7 +267,7 @@ where
 
         let expected = paired.identity();
         if expected.host_id() != presented.host_id()
-            || expected.fingerprint() != presented.fingerprint()
+            || !bool::from(expected.fingerprint().ct_eq(&presented.fingerprint()))
         {
             return Err(AuthorizationError::IdentityMismatch {
                 peer_id: presented.peer_id(),

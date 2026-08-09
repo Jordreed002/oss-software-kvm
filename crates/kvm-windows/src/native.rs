@@ -2387,8 +2387,8 @@ fn display_from_monitor(
         .unwrap_or(info.szDevice.len());
     let name = String::from_utf16_lossy(&info.szDevice[..name_end]);
     let bounds = info.monitorInfo.rcMonitor;
-    let width = bounds.right - bounds.left;
-    let height = bounds.bottom - bounds.top;
+    let width = bounds.right.saturating_sub(bounds.left);
+    let height = bounds.bottom.saturating_sub(bounds.top);
     if width <= 0 || height <= 0 {
         return Err(WindowsBackendError::InvalidInput(
             "Windows returned non-positive display bounds",
