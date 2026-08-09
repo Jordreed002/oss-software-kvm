@@ -582,6 +582,7 @@ name = "kvm-topology"
 version = "0.1.0"
 dependencies = [
  "kvm-types",
+ "sha2",
 ]
 
 [[package]]

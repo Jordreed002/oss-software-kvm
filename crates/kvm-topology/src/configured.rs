@@ -4,6 +4,7 @@ use std::fmt;
 use std::sync::Arc;
 
 use kvm_types::{Display, DisplayId, Edge, HostId, Point, Rect, Size};
+use sha2::{Digest, Sha256};
 
 use crate::{close, covers, perpendicular_coordinate, touches, valid_position, GEOMETRY_EPSILON};
 
@@ -151,6 +152,7 @@ struct LinkTarget {
 #[derive(Clone, PartialEq)]
 struct CompiledWorkspaceData {
     epoch: WorkspaceEpoch,
+    protocol_epoch: u64,
     displays: BTreeMap<DisplayId, CompiledDisplay>,
     links: BTreeMap<(DisplayId, u8), LinkTarget>,
     host_count: usize,
@@ -166,6 +168,14 @@ impl ConfiguredWorkspace {
     #[must_use]
     pub fn epoch(&self) -> WorkspaceEpoch {
         self.data.epoch
+    }
+
+    /// Deterministic nonzero identity shared by peers that compiled the same
+    /// authenticated display geometry and links. Unlike [`Self::epoch`], this
+    /// value is independent of how many local recompilations occurred.
+    #[must_use]
+    pub fn protocol_epoch(&self) -> u64 {
+        self.data.protocol_epoch
     }
 
     #[must_use]
@@ -390,15 +400,57 @@ where
             .map(|entry| entry.workspace_bounds),
     )?;
     let compiled_links = compile_links(&compiled_displays, links)?;
+    let protocol_epoch = protocol_epoch(&compiled_displays, &compiled_links);
 
     Ok(ConfiguredWorkspace {
         data: Arc::new(CompiledWorkspaceData {
             epoch,
+            protocol_epoch,
             displays: compiled_displays,
             links: compiled_links,
             host_count,
         }),
     })
+}
+
+fn protocol_epoch(
+    displays: &BTreeMap<DisplayId, CompiledDisplay>,
+    links: &BTreeMap<(DisplayId, u8), LinkTarget>,
+) -> u64 {
+    let mut digest = Sha256::new();
+    digest.update(b"software-kvm-workspace-v1\0");
+    digest.update((displays.len() as u64).to_be_bytes());
+    for (display_id, display) in displays {
+        digest.update(display_id.into_bytes());
+        digest.update(display.host_id.into_bytes());
+        for value in [
+            display.logical_size.width,
+            display.logical_size.height,
+            display.workspace_bounds.x,
+            display.workspace_bounds.y,
+            display.workspace_bounds.width,
+            display.workspace_bounds.height,
+        ] {
+            digest.update(canonical_float_bits(value).to_be_bytes());
+        }
+    }
+    digest.update((links.len() as u64).to_be_bytes());
+    for ((source_display, source_edge), target) in links {
+        digest.update(source_display.into_bytes());
+        digest.update([*source_edge]);
+        digest.update(target.display_id.into_bytes());
+        digest.update([edge_key(target.edge)]);
+    }
+    let bytes: [u8; 32] = digest.finalize().into();
+    u64::from_be_bytes(bytes[..8].try_into().expect("fixed digest prefix")).max(1)
+}
+
+fn canonical_float_bits(value: f64) -> u64 {
+    if value == 0.0 {
+        0
+    } else {
+        value.to_bits()
+    }
 }
 
 fn compile_inventory(

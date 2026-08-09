@@ -346,7 +346,7 @@ pub enum WireEdge {
 #[derive(Clone, Copy, Deserialize, PartialEq, Serialize)]
 pub struct PointerEnterV1 {
     pub transition_id: u64,
-    /// Monotonic workspace revision used to reject stale handoffs.
+    /// Deterministic identity of the source's compiled workspace.
     pub workspace_epoch: u64,
     pub sequence: u64,
     pub source_host: WireHostId,
@@ -367,7 +367,7 @@ impl fmt::Debug for PointerEnterV1 {
 #[derive(Clone, Copy, Deserialize, PartialEq, Serialize)]
 pub struct PointerLeaveV1 {
     pub transition_id: u64,
-    /// Monotonic workspace revision used to reject stale handoffs.
+    /// Deterministic identity of the source's compiled workspace.
     pub workspace_epoch: u64,
     pub sequence: u64,
     pub source_host: WireHostId,

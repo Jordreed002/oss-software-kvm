@@ -3881,8 +3881,7 @@ mod tests {
             .unwrap()
             .pointer()
             .unwrap()
-            .workspace_epoch()
-            .get();
+            .protocol_epoch();
         let leave = PointerLeaveV1 {
             transition_id: 1,
             workspace_epoch: epoch,

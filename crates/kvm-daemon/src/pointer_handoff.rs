@@ -754,8 +754,8 @@ where
         }
         let transition_id = self.next_outbound_sequence()?;
         let deadline_ns = self.deadline(now_ns)?;
-        let leave = make_leave(transition_id, self.workspace.epoch().get(), transition);
-        let enter = make_enter(transition_id, self.workspace.epoch().get(), transition);
+        let leave = make_leave(transition_id, self.workspace.protocol_epoch(), transition);
+        let enter = make_enter(transition_id, self.workspace.protocol_epoch(), transition);
         self.last_outbound_sequence = transition_id;
         self.outbound = Some(PendingOutbound {
             session: session.clone(),
@@ -810,7 +810,7 @@ where
         let transition = self.resolve_leave(message)?;
         let expected_enter = make_enter(
             message.transition_id,
-            self.workspace.epoch().get(),
+            self.workspace.protocol_epoch(),
             transition,
         );
         let deadline_ns = self.deadline(now_ns)?;
@@ -1179,7 +1179,7 @@ where
     ) -> CoreEffect<B> {
         let expected_leave = make_leave(
             message.transition_id,
-            self.workspace.epoch().get(),
+            self.workspace.protocol_epoch(),
             transition,
         );
         let ack = make_ack(
@@ -1312,7 +1312,7 @@ where
         session: &B,
         message: PointerLeaveV1,
     ) -> Result<(), PointerHandoffError> {
-        if message.workspace_epoch != self.workspace.epoch().get() {
+        if message.workspace_epoch != self.workspace.protocol_epoch() {
             return Err(PointerHandoffError::new(
                 PointerHandoffErrorKind::InvalidWorkspaceEpoch,
             ));
@@ -1338,7 +1338,7 @@ where
         session: &B,
         message: PointerEnterV1,
     ) -> Result<(), PointerHandoffErrorKind> {
-        if message.workspace_epoch != self.workspace.epoch().get() {
+        if message.workspace_epoch != self.workspace.protocol_epoch() {
             return Err(PointerHandoffErrorKind::InvalidWorkspaceEpoch);
         }
         if message.source_host != wire_host(session.remote_host_id())
@@ -1994,6 +1994,11 @@ impl PointerHandoffCoordinator {
     }
 
     #[must_use]
+    pub(crate) fn protocol_epoch(&self) -> u64 {
+        self.core.workspace.protocol_epoch()
+    }
+
+    #[must_use]
     pub fn has_local_authority(&self) -> bool {
         self.core.has_local_authority()
     }
@@ -2438,6 +2443,13 @@ mod tests {
     fn pair() -> Pair {
         let mut compiler = ConfiguredWorkspaceCompiler::new();
         let workspace = workspace(&mut compiler);
+        pair_with_workspaces(workspace.clone(), workspace)
+    }
+
+    fn pair_with_workspaces(
+        workspace_a: ConfiguredWorkspace,
+        workspace_b: ConfiguredWorkspace,
+    ) -> Pair {
         let config = PointerHandoffConfig::new(Duration::from_nanos(100)).unwrap();
         let state_a =
             WorkspaceState::new(HOST_A, HOST_A, LogicalPointer::new(DISPLAY_A, 99.0, 37.5));
@@ -2445,14 +2457,14 @@ mod tests {
             WorkspaceState::new(HOST_B, HOST_A, LogicalPointer::new(DISPLAY_A, 99.0, 37.5));
         let mut a = CoordinatorCore::new(
             config,
-            workspace.clone(),
+            workspace_a,
             state_a,
             LogicalPointer::new(DISPLAY_A, 50.0, 50.0),
         )
         .unwrap();
         let mut b = CoordinatorCore::new(
             config,
-            workspace,
+            workspace_b,
             state_b,
             LogicalPointer::new(DISPLAY_B, 0.0, 75.0),
         )
@@ -2475,6 +2487,23 @@ mod tests {
             session_a,
             session_b,
         }
+    }
+
+    #[test]
+    fn equivalent_workspaces_handoff_across_divergent_local_compile_epochs() {
+        let mut compiler_a = ConfiguredWorkspaceCompiler::new();
+        let workspace_a = workspace(&mut compiler_a);
+        let mut compiler_b = ConfiguredWorkspaceCompiler::new();
+        let _ = workspace(&mut compiler_b);
+        let workspace_b = workspace(&mut compiler_b);
+        assert_ne!(workspace_a.epoch(), workspace_b.epoch());
+        assert_eq!(workspace_a.protocol_epoch(), workspace_b.protocol_epoch());
+        let mut pair = pair_with_workspaces(workspace_a, workspace_b);
+
+        handoff_a_to_b(&mut pair, 1);
+
+        assert_eq!(pair.a.workspace_state.active_host, HOST_B);
+        assert_eq!(pair.b.workspace_state.active_host, HOST_B);
     }
 
     fn leave_message<B>(effect: &CoreEffect<B>) -> PointerLeaveV1 {

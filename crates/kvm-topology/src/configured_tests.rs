@@ -503,6 +503,34 @@ fn failed_candidate_never_replaces_active_or_consumes_an_epoch() {
         .compile_candidate(displays, placements, links)
         .unwrap();
     assert_eq!(second.epoch().get(), 2);
+    assert_eq!(second.protocol_epoch(), first.protocol_epoch());
+}
+
+#[test]
+fn protocol_epoch_is_content_bound_not_local_compile_order() {
+    let (displays, placements, links) = two_display_candidate();
+    let mut first = ConfiguredWorkspaceCompiler::new();
+    let first_workspace = first
+        .compile_candidate(displays.clone(), placements.clone(), links.clone())
+        .unwrap();
+    let mut second = ConfiguredWorkspaceCompiler::new();
+    let _ = second
+        .compile_candidate(displays.clone(), placements.clone(), links.clone())
+        .unwrap();
+    let second_workspace = second
+        .compile_candidate(displays.clone(), placements.clone(), links.clone())
+        .unwrap();
+
+    assert_ne!(first_workspace.epoch(), second_workspace.epoch());
+    assert_eq!(
+        first_workspace.protocol_epoch(),
+        second_workspace.protocol_epoch()
+    );
+
+    let changed = second
+        .compile_candidate(displays, placements, [link(1, Edge::Right, 2, Edge::Left)])
+        .unwrap();
+    assert_ne!(changed.protocol_epoch(), first_workspace.protocol_epoch());
 }
 
 #[test]
