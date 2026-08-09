@@ -2,6 +2,7 @@
 name = "kvm-windows"
 version = "0.1.0"
 edition = "2021"
+license.workspace = true
 description = "Windows native input, injection, and display backend for Software KVM"
 
 [dependencies]

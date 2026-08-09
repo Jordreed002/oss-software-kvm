@@ -2,6 +2,7 @@
 name = "kvm-macos"
 version = "0.1.0"
 edition = "2021"
+license.workspace = true
 description = "macOS native input, output, display, and permission backend for Software KVM"
 
 [dependencies]

@@ -2,6 +2,7 @@
 name = "kvm-clipboard"
 version = "0.1.0"
 edition = "2021"
+license.workspace = true
 description = "Bounded plain-text clipboard synchronization state for Software KVM"
 
 [dependencies]

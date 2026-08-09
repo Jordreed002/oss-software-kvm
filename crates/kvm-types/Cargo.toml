@@ -2,6 +2,7 @@
 name = "kvm-types"
 version = "0.1.0"
 edition = "2021"
+license.workspace = true
 description = "Platform-neutral domain types for Software KVM"
 
 [dependencies]

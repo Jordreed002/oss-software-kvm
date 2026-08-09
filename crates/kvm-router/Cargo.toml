@@ -2,6 +2,7 @@
 name = "kvm-router"
 version = "0.1.0"
 edition = "2021"
+license.workspace = true
 description = "Deterministic per-device input routing for Software KVM"
 
 [dependencies]
