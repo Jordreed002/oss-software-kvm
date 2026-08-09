@@ -39,6 +39,7 @@ const KEY_FILE: &str = "local-key.pk8";
 const TRUST_FILE: &str = "selected-peer.der";
 const CONTROL_FILE: &str = "runtime.control";
 const RUNTIME_LOG_FILE: &str = "runtime.log";
+const RUNTIME_STATUS_FILE: &str = "runtime.status";
 const MAX_RUNTIME_LOG_READ: u64 = 16 * 1024;
 #[cfg(windows)]
 // Keep credentials separate from WebView2's profile in the app-data root.
@@ -160,6 +161,57 @@ enum RuntimeFault {
 
 #[derive(Clone, Copy, Debug, Serialize)]
 #[serde(rename_all = "snake_case")]
+enum InputOwnerState {
+    Local,
+    Peer,
+    Transitioning,
+    Unavailable,
+}
+
+#[derive(Clone, Copy, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct InputAuthorityDto {
+    owner: InputOwnerState,
+    link_ready: bool,
+    session_active: bool,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum RuntimeStatusService {
+    Starting,
+    Running,
+    Stopping,
+    Faulted,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum RuntimeStatusOwner {
+    Local,
+    Peer,
+    Transitioning,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum RuntimeStatusRouting {
+    Enabled,
+    Gated,
+    WaitingForWorkspace,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize)]
+struct RuntimeStatusFile {
+    schema_version: u16,
+    service: RuntimeStatusService,
+    input_owner: RuntimeStatusOwner,
+    routing: RuntimeStatusRouting,
+    session_active: bool,
+}
+
+#[derive(Clone, Copy, Debug, Serialize)]
+#[serde(rename_all = "snake_case")]
 enum LanBindingState {
     Healthy,
     Mismatch,
@@ -192,6 +244,7 @@ pub(crate) struct SetupSnapshot {
     validated: bool,
     runtime: RuntimeState,
     runtime_fault: Option<RuntimeFault>,
+    input_authority: InputAuthorityDto,
     runtime_log_path: Option<String>,
     discovery_available: bool,
     nearby_machines: Vec<NearbyMachineDto>,
@@ -324,6 +377,7 @@ impl SetupService {
             .map(|local| self.local_dto(local, &displays))
             .transpose()?;
         let peer = setup.peer.clone().map(peer_dto);
+        let input_authority = snapshot_input_authority(runtime_state, &self.directory);
         Ok(SetupSnapshot {
             platform: current_platform(),
             suggested_name: suggested_name(),
@@ -336,6 +390,7 @@ impl SetupService {
             validated: setup.validated,
             runtime: runtime_state,
             runtime_fault: *last_fault,
+            input_authority,
             runtime_log_path: setup.configured.then(|| {
                 self.directory
                     .join(RUNTIME_LOG_FILE)
@@ -756,7 +811,7 @@ pub(crate) fn forget_paired_computer(
 
     // The local private identity remains intact. Only peer-derived public
     // trust and runtime configuration are discarded and can be regenerated.
-    for name in [TRUST_FILE, CONFIG_FILE, PROFILE_FILE] {
+    for name in [TRUST_FILE, CONFIG_FILE, PROFILE_FILE, RUNTIME_STATUS_FILE] {
         match fs::remove_file(service.directory.join(name)) {
             Ok(()) => {}
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
@@ -826,6 +881,11 @@ pub(crate) fn start_runtime(service: State<'_, SetupService>) -> Result<SetupSna
     let binary = runtime_binary().ok_or_else(coarse_error)?;
     let control = service.directory.join(CONTROL_FILE);
     secure_write(&control, b"run\n", true).map_err(|()| coarse_error())?;
+    match fs::remove_file(service.directory.join(RUNTIME_STATUS_FILE)) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(_) => return Err(coarse_error()),
+    }
     let log_path = service.directory.join(RUNTIME_LOG_FILE);
     secure_write(&log_path, b"", true).map_err(|()| coarse_error())?;
     let stdout_log = fs::OpenOptions::new()
@@ -1121,6 +1181,62 @@ fn read_runtime_fault(directory: &Path) -> RuntimeFault {
         RuntimeFault::RuntimeTask
     } else {
         RuntimeFault::Unknown
+    }
+}
+
+fn snapshot_input_authority(runtime: RuntimeState, directory: &Path) -> InputAuthorityDto {
+    if matches!(runtime, RuntimeState::Running) {
+        read_input_authority(directory)
+    } else {
+        InputAuthorityDto {
+            owner: InputOwnerState::Unavailable,
+            link_ready: false,
+            session_active: false,
+        }
+    }
+}
+
+fn read_input_authority(directory: &Path) -> InputAuthorityDto {
+    let unavailable = InputAuthorityDto {
+        owner: InputOwnerState::Unavailable,
+        link_ready: false,
+        session_active: false,
+    };
+    let Ok(file) = fs::File::open(directory.join(RUNTIME_STATUS_FILE)) else {
+        return unavailable;
+    };
+    let mut source = String::new();
+    if file.take(4 * 1024).read_to_string(&mut source).is_err() {
+        return unavailable;
+    }
+    let Ok(status) = toml::from_str::<RuntimeStatusFile>(&source) else {
+        return unavailable;
+    };
+    if status.schema_version != 1 {
+        return unavailable;
+    }
+
+    let running = matches!(status.service, RuntimeStatusService::Running);
+    let link_ready = running
+        && status.session_active
+        && matches!(status.routing, RuntimeStatusRouting::Enabled);
+    let owner = match status.service {
+        RuntimeStatusService::Starting
+        | RuntimeStatusService::Stopping
+        | RuntimeStatusService::Faulted => InputOwnerState::Local,
+        RuntimeStatusService::Running => match status.input_owner {
+            RuntimeStatusOwner::Peer if link_ready => InputOwnerState::Peer,
+            RuntimeStatusOwner::Transitioning if status.session_active => {
+                InputOwnerState::Transitioning
+            }
+            RuntimeStatusOwner::Local | RuntimeStatusOwner::Peer => InputOwnerState::Local,
+            RuntimeStatusOwner::Transitioning => InputOwnerState::Unavailable,
+        },
+    };
+    InputAuthorityDto {
+        owner,
+        link_ready,
+        session_active: running && status.session_active,
     }
 }
 
@@ -1420,8 +1536,8 @@ fn runtime_lock_held(directory: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_config, validate_bundle, DisplayDto, PairingBundle, Placement, PlatformDto,
-        PAIRING_VERSION,
+        build_config, read_input_authority, validate_bundle, DisplayDto, InputOwnerState,
+        PairingBundle, Placement, PlatformDto, PAIRING_VERSION, RUNTIME_STATUS_FILE,
     };
     #[cfg(windows)]
     use super::{rewrite_windows_profile_paths, CONFIG_FILE, KEY_FILE};
@@ -1429,6 +1545,7 @@ mod tests {
     use base64::Engine;
     use rcgen::{CertificateParams, KeyPair};
     use sha2::{Digest, Sha256};
+    use std::fs;
     #[cfg(windows)]
     use std::path::Path;
 
@@ -1482,6 +1599,35 @@ mod tests {
         assert_eq!(config.topology.displays.len(), 2);
         assert_eq!(config.topology.links.len(), 2);
         assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn runtime_status_reports_only_an_effective_peer_authority() {
+        let directory = std::env::temp_dir().join(format!(
+            "software-kvm-status-{}",
+            uuid::Uuid::new_v4()
+        ));
+        fs::create_dir(&directory).unwrap();
+        fs::write(
+            directory.join(RUNTIME_STATUS_FILE),
+            b"schema_version = 1\nservice = \"running\"\ninput_owner = \"peer\"\nrouting = \"enabled\"\nsession_active = true\n",
+        )
+        .unwrap();
+
+        let status = read_input_authority(&directory);
+        assert!(matches!(status.owner, InputOwnerState::Peer));
+        assert!(status.link_ready);
+        assert!(status.session_active);
+
+        fs::write(
+            directory.join(RUNTIME_STATUS_FILE),
+            b"schema_version = 1\nservice = \"running\"\ninput_owner = \"peer\"\nrouting = \"gated\"\nsession_active = true\n",
+        )
+        .unwrap();
+        let gated = read_input_authority(&directory);
+        assert!(matches!(gated.owner, InputOwnerState::Local));
+        assert!(!gated.link_ready);
+        fs::remove_dir_all(directory).unwrap();
     }
 
     #[cfg(windows)]

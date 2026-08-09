@@ -429,7 +429,14 @@ where
     /// Returns an error until the selected workspace is attached.
     pub fn local_pointer_authority(&self) -> Result<bool, PeerManagerError> {
         let routing = self.selected_routing_handle()?.load();
-        Ok(routing.workspace.active_host == routing.workspace.local_host)
+        // Cursor ownership follows effective routing authority, not only the
+        // last committed workspace host. A disconnected, gated, or
+        // in-progress workspace always fails open locally; keeping the cursor
+        // hidden in those states would strand the user on a stale peer.
+        Ok(!routing.enabled
+            || !routing.workspace_ready
+            || routing.handoff_pending
+            || routing.workspace.active_host == routing.workspace.local_host)
     }
 
     /// Synchronously routes one trusted capture decision through the sole
@@ -3757,6 +3764,29 @@ mod tests {
         let selected = manager.selected_routing_handle().unwrap().load();
         assert_eq!(selected.workspace.active_host, LOCAL_HOST);
         assert!(!selected.handoff_pending);
+    }
+
+    #[test]
+    fn visible_pointer_authority_returns_local_when_remote_routing_is_unavailable() {
+        let outbound = TestOutbound::default();
+        let mut manager = manager_with_outbound(DIAL_PEER, outbound.clone());
+
+        assert!(manager.local_pointer_authority().unwrap());
+        activate_selected(&mut manager);
+        assert!(manager.local_pointer_authority().unwrap());
+
+        commit_selected_pointer(&mut manager, &outbound, 3);
+        assert!(!manager.local_pointer_authority().unwrap());
+
+        let generation = manager.peers[&DIAL_PEER]
+            .supervisor
+            .active_generation()
+            .unwrap();
+        assert!(matches!(
+            manager.connection_lost(DIAL_PEER, generation, 6).unwrap(),
+            SupervisorEventOutcome::Retired(_)
+        ));
+        assert!(manager.local_pointer_authority().unwrap());
     }
 
     #[test]

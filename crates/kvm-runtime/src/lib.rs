@@ -18,6 +18,7 @@ mod active;
 mod native_capture;
 mod platform_run;
 mod preparation;
+mod runtime_status;
 
 pub use active::{
     RuntimeCompositionError, RuntimeCompositionErrorKind, RuntimeTransportError,

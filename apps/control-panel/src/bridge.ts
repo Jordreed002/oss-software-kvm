@@ -17,6 +17,7 @@ const mock: SetupSnapshot = {
   validated: false,
   runtime: "stopped",
   runtimeFault: null,
+  inputAuthority: { owner: "unavailable", linkReady: false, sessionActive: false },
   runtimeLogPath: null,
   discoveryAvailable: true,
   nearbyMachines: [],
@@ -93,6 +94,7 @@ const invokeOrPreview = async <T>(command: string, args?: Record<string, unknown
     previewState.configured = false;
     previewState.validated = false;
     previewState.runtime = "stopped";
+    previewState.inputAuthority = { owner: "unavailable", linkReady: false, sessionActive: false };
     previewState.nearbyPairing = null;
     return structuredClone(previewState) as T;
   }
@@ -117,10 +119,12 @@ const invokeOrPreview = async <T>(command: string, args?: Record<string, unknown
   if (command === "start_runtime") {
     previewState.runtime = "running";
     previewState.runtimeFault = null;
+    previewState.inputAuthority = { owner: "local", linkReady: true, sessionActive: true };
   }
   if (command === "stop_runtime") {
     previewState.runtime = "stopped";
     previewState.runtimeFault = null;
+    previewState.inputAuthority = { owner: "unavailable", linkReady: false, sessionActive: false };
   }
   return structuredClone(previewState) as T;
 };

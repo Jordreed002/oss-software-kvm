@@ -5,6 +5,13 @@ export type NearbyPresence = "setting_up" | "runtime_active";
 export type NearbyPairingStatus = "incoming_request" | "waiting_for_acceptance" | "verify_code" | "waiting_for_confirmation";
 export type Placement = "local_left" | "local_right";
 export type LanBindingState = "healthy" | "mismatch" | "waiting_for_peer" | "not_configured";
+export type InputOwnerState = "local" | "peer" | "transitioning" | "unavailable";
+
+export interface InputAuthority {
+  owner: InputOwnerState;
+  linkReady: boolean;
+  sessionActive: boolean;
+}
 
 export interface DisplayInfo {
   id: string;
@@ -48,6 +55,7 @@ export interface SetupSnapshot {
   validated: boolean;
   runtime: RuntimeState;
   runtimeFault: RuntimeFault | null;
+  inputAuthority: InputAuthority;
   runtimeLogPath: string | null;
   discoveryAvailable: boolean;
   nearbyMachines: NearbyMachine[];

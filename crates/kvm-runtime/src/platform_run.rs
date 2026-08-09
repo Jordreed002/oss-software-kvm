@@ -8,6 +8,8 @@ use kvm_daemon::{DisplayBackend, InputCaptureBackend};
 
 #[cfg(any(target_os = "macos", windows))]
 use crate::prepare;
+#[cfg(any(target_os = "macos", windows))]
+use crate::runtime_status::RuntimeStatusPublisher;
 
 /// Coarse category for a foreground native runtime failure.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -116,7 +118,11 @@ async fn run_windows(
         .compose(WindowsOutputBackend::new(), displays, devices)
         .map_err(|_| NativeRuntimeError::new(NativeRuntimeErrorKind::Composition))?;
     runtime
-        .run_with_capture(input, shutdown)
+        .run_with_capture_status(
+            input,
+            shutdown,
+            Some(RuntimeStatusPublisher::for_profile(profile_path)),
+        )
         .await
         .map_err(native_service_error)
 }
@@ -142,7 +148,11 @@ async fn run_macos(
         .compose(MacOutputBackend::new(), displays, devices)
         .map_err(|_| NativeRuntimeError::new(NativeRuntimeErrorKind::Composition))?;
     runtime
-        .run_with_capture(input, shutdown)
+        .run_with_capture_status(
+            input,
+            shutdown,
+            Some(RuntimeStatusPublisher::for_profile(profile_path)),
+        )
         .await
         .map_err(native_service_error)
 }

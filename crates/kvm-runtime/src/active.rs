@@ -23,6 +23,9 @@ use kvm_topology::{WorkspaceLink, WorkspacePlacement};
 use kvm_types::{Display, InputDevice, LogicalPointer, Point, WorkspaceState};
 
 use crate::preparation::{PreparedAcceptor, PreparedAdmissionFactory};
+use crate::runtime_status::{
+    RuntimeInputOwner, RuntimeRoutingState, RuntimeStatusPublisher, RuntimeStatusSnapshot,
+};
 use crate::{NativeCaptureSupervisor, PreparedTwoHostAlpha};
 
 const INITIAL_DISPLAY_REVISION: u64 = 1;
@@ -252,7 +255,7 @@ where
         self,
         shutdown: tokio::sync::watch::Receiver<bool>,
     ) -> Result<(), RuntimeTransportError> {
-        self.run_transport_ready(shutdown, None, Instant::now())
+        self.run_transport_ready(shutdown, None, Instant::now(), None)
             .await
     }
 
@@ -268,18 +271,35 @@ where
     pub async fn run_with_capture<B>(
         self,
         backend: B,
+        shutdown: tokio::sync::watch::Receiver<bool>,
+    ) -> Result<(), RuntimeServiceError>
+    where
+        B: InputCaptureBackend + 'static,
+    {
+        self.run_with_capture_status(backend, shutdown, None).await
+    }
+
+    pub(crate) async fn run_with_capture_status<B>(
+        self,
+        backend: B,
         mut shutdown: tokio::sync::watch::Receiver<bool>,
+        status: Option<RuntimeStatusPublisher>,
     ) -> Result<(), RuntimeServiceError>
     where
         B: InputCaptureBackend + 'static,
     {
         developer_event("service=starting");
+        publish_status(status.as_ref(), RuntimeStatusSnapshot::starting());
         let manager = Arc::clone(&self.manager);
         let started = Instant::now();
         let (transport_shutdown, transport_receiver) = tokio::sync::watch::channel(false);
         let (ready_sender, ready_receiver) = tokio::sync::oneshot::channel();
-        let mut transport_task =
-            tokio::spawn(self.run_transport_ready(transport_receiver, Some(ready_sender), started));
+        let mut transport_task = tokio::spawn(self.run_transport_ready(
+            transport_receiver,
+            Some(ready_sender),
+            started,
+            status.clone(),
+        ));
         tokio::select! {
             ready = ready_receiver => {
                 if ready.is_err() {
@@ -336,19 +356,11 @@ where
                         break Err(RuntimeServiceError::new(RuntimeServiceErrorKind::Capture));
                     }
                     if Instant::now() >= next_capture_report {
-                        let metrics = capture.metrics();
-                        if metrics != last_capture_metrics {
-                            developer_event(&format!(
-                                "capture=activity observed:{} suppressed:{} local:{} contention:{} panics:{}",
-                                metrics.observed,
-                                metrics.suppressed,
-                                metrics.allowed_local,
-                                metrics.lock_contention,
-                                metrics.callback_panics,
-                            ));
-                            last_capture_metrics = metrics;
-                        }
-                        next_capture_report = Instant::now() + Duration::from_secs(1);
+                        report_capture_metrics(
+                            capture.metrics(),
+                            &mut last_capture_metrics,
+                            &mut next_capture_report,
+                        );
                     }
                 }
             }
@@ -359,6 +371,7 @@ where
             .map_err(|_| RuntimeServiceError::new(RuntimeServiceErrorKind::Capture));
         let _ = transport_shutdown.send(true);
         developer_event("service=stopping");
+        publish_status(status.as_ref(), RuntimeStatusSnapshot::stopping());
         let transport_result = if transport_finished {
             Ok(())
         } else {
@@ -368,7 +381,11 @@ where
                 .map_err(|_| RuntimeServiceError::new(RuntimeServiceErrorKind::Task))?
                 .map_err(|_| RuntimeServiceError::new(RuntimeServiceErrorKind::Transport))
         };
-        service_result.and(capture_result).and(transport_result)
+        let result = service_result.and(capture_result).and(transport_result);
+        if result.is_err() {
+            publish_status(status.as_ref(), RuntimeStatusSnapshot::faulted());
+        }
+        result
     }
 
     async fn run_transport_ready(
@@ -376,6 +393,7 @@ where
         mut shutdown: tokio::sync::watch::Receiver<bool>,
         ready: Option<tokio::sync::oneshot::Sender<()>>,
         started: Instant,
+        status: Option<RuntimeStatusPublisher>,
     ) -> Result<(), RuntimeTransportError> {
         let (listener, mut accepted) = BoundedLanListener::bind(
             self.acceptor,
@@ -447,7 +465,7 @@ where
                             developer_event(&format!("transport=manager_tick_failed detail:{error:?}"));
                             return Err(error);
                         }
-                        report_manager_snapshot(&self.manager, &mut last_manager_snapshot)?;
+                        report_manager_snapshot(&self.manager, &mut last_manager_snapshot, status.as_ref())?;
                         if dial_tasks.is_empty() {
                             if let Some(task) = poll_dial(&self.manager, now_duration(started))? {
                                 developer_event("transport=outbound_dial_started");
@@ -490,16 +508,20 @@ fn announce_listener_ready(ready: Option<tokio::sync::oneshot::Sender<()>>) {
 fn report_manager_snapshot<I>(
     manager: &Arc<Mutex<PeerManager<I, ManagedSessionOutbound>>>,
     previous: &mut Option<ManagerDiagnosticSnapshot>,
+    status: Option<&RuntimeStatusPublisher>,
 ) -> Result<(), RuntimeTransportError>
 where
     I: OutputInjectionBackend,
 {
-    let manager = lock_manager(manager)?;
-    let manager_snapshot = manager.snapshot();
-    let routing = manager
-        .selected_routing_handle()
-        .map_err(|_| RuntimeTransportError::new(RuntimeTransportErrorKind::Authority))?
-        .load();
+    let (manager_snapshot, routing) = {
+        let manager = lock_manager(manager)?;
+        let manager_snapshot = manager.snapshot();
+        let routing = manager
+            .selected_routing_handle()
+            .map_err(|_| RuntimeTransportError::new(RuntimeTransportErrorKind::Authority))?
+            .load();
+        (manager_snapshot, routing)
+    };
     let routing_state = if routing.enabled {
         RoutingDiagnosticState::Enabled
     } else if routing.workspace_ready {
@@ -521,6 +543,29 @@ where
             AuthorityDiagnosticState::Remote
         },
     };
+    let input_owner = if snapshot.handoff == HandoffDiagnosticState::Pending {
+        RuntimeInputOwner::Transitioning
+    } else if snapshot.routing == RoutingDiagnosticState::Enabled
+        && snapshot.manager.session_tasks != 0
+        && snapshot.authority == AuthorityDiagnosticState::Remote
+    {
+        RuntimeInputOwner::Peer
+    } else {
+        RuntimeInputOwner::Local
+    };
+    if let Some(status) = status {
+        status.publish(RuntimeStatusSnapshot::running(
+            input_owner,
+            match snapshot.routing {
+                RoutingDiagnosticState::Enabled => RuntimeRoutingState::Enabled,
+                RoutingDiagnosticState::Gated => RuntimeRoutingState::Gated,
+                RoutingDiagnosticState::WaitingForWorkspace => {
+                    RuntimeRoutingState::WaitingForWorkspace
+                }
+            },
+            snapshot.manager.session_tasks != 0,
+        ));
+    }
     if *previous != Some(snapshot) {
         developer_event(&format!(
             "manager=state candidates:{} connecting:{} sessions:{} routing:{} handoff:{} authority:{}",
@@ -534,6 +579,31 @@ where
         *previous = Some(snapshot);
     }
     Ok(())
+}
+
+fn report_capture_metrics(
+    metrics: crate::native_capture::NativeCaptureMetrics,
+    previous: &mut crate::native_capture::NativeCaptureMetrics,
+    next_report: &mut Instant,
+) {
+    if metrics != *previous {
+        developer_event(&format!(
+            "capture=activity observed:{} suppressed:{} local:{} contention:{} panics:{}",
+            metrics.observed,
+            metrics.suppressed,
+            metrics.allowed_local,
+            metrics.lock_contention,
+            metrics.callback_panics,
+        ));
+        *previous = metrics;
+    }
+    *next_report = Instant::now() + Duration::from_secs(1);
+}
+
+fn publish_status(publisher: Option<&RuntimeStatusPublisher>, snapshot: RuntimeStatusSnapshot) {
+    if let Some(publisher) = publisher {
+        publisher.publish(snapshot);
+    }
 }
 
 struct DialResult {
