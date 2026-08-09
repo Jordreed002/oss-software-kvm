@@ -56,7 +56,6 @@ const CG_ERROR_SUCCESS: i32 = 0;
 const CG_HID_EVENT_TAP: u32 = 0;
 const CG_EVENT_SOURCE_USER_DATA: u32 = 42;
 const CG_SCROLL_EVENT_UNIT_PIXEL: u32 = 0;
-const CG_SESSION_EVENT_TAP: u32 = 1;
 const CG_HEAD_INSERT_EVENT_TAP: u32 = 0;
 const CG_EVENT_TAP_OPTION_DEFAULT: u32 = 0;
 const CG_KEYBOARD_EVENT_AUTOREPEAT: u32 = 8;
@@ -1135,7 +1134,10 @@ fn run_whole_host_capture_thread(
     // disabled, removed from the run loop, invalidated, and released.
     let tap_ptr = unsafe {
         CGEventTapCreate(
-            CG_SESSION_EVENT_TAP,
+            // A session tap can observe motion after WindowServer has already
+            // advanced the local cursor. Suppress at the HID tap so each
+            // physical delta has exactly one visible destination.
+            CG_HID_EVENT_TAP,
             CG_HEAD_INSERT_EVENT_TAP,
             CG_EVENT_TAP_OPTION_DEFAULT,
             whole_host_event_mask(),

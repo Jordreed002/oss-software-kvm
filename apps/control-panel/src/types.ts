@@ -28,6 +28,12 @@ export interface DisplayInfo {
   };
 }
 
+export interface DisplayPlacement {
+  displayId: string;
+  x: number;
+  y: number;
+}
+
 export interface LocalIdentity {
   hostId: string;
   peerId: string;
@@ -57,6 +63,7 @@ export interface SetupSnapshot {
   peer: PeerIdentity | null;
   displays: DisplayInfo[];
   placement: Placement;
+  displayLayout: DisplayPlacement[];
   configured: boolean;
   validated: boolean;
   runtime: RuntimeState;

@@ -1,10 +1,10 @@
 import { useEffect, useMemo, useState } from "react";
 import {
-  ArrowLeftRight, Check, ChevronRight, CircleAlert, Copy, KeyRound,
-  Handshake, Laptop, Link2, LoaderCircle, Monitor, MousePointer2, Play, Radio, ShieldCheck, Square, Unplug, X,
+    ArrowLeftRight, Check, ChevronRight, CircleAlert, Copy, KeyRound,
+  Handshake, Laptop, Link2, LoaderCircle, Monitor, MousePointer2, Move, Play, Radio, RotateCcw, ShieldCheck, Square, Unplug, X,
 } from "lucide-react";
 import { api } from "./bridge";
-import type { Placement, SetupSnapshot } from "./types";
+import type { DisplayInfo, DisplayPlacement, Placement, SetupSnapshot } from "./types";
 
 const steps = ["This computer", "Pair", "Arrange", "Ready"] as const;
 
@@ -20,7 +20,6 @@ function App() {
   const [name, setName] = useState("");
   const [address, setAddress] = useState("");
   const [bundle, setBundle] = useState("");
-  const [placement, setPlacement] = useState<Placement>("local_left");
   const [busy, setBusy] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [copied, setCopied] = useState(false);
@@ -30,7 +29,6 @@ function App() {
       setSnapshot(state);
       setName(state.local?.displayName ?? state.suggestedName);
       setAddress(hostFromSocketAddress(state.local?.address) || state.addressOptions[0] || "");
-      setPlacement(state.placement);
       if (state.configured) setStep(3);
       else if (state.peer) setStep(2);
       else if (state.local) setStep(1);
@@ -107,7 +105,7 @@ function App() {
           {error && <div className="error-banner"><CircleAlert size={18} />{error}</div>}
           {step === 0 && <LocalStep snapshot={snapshot} name={name} setName={setName} address={address} setAddress={setAddress} busy={busy} onContinue={() => perform("identity", () => api.createIdentity(name, address), 1)} />}
           {step === 1 && <PairStep snapshot={snapshot} bundle={bundle} setBundle={setBundle} copied={copied} onCopy={async () => { await navigator.clipboard.writeText(snapshot.local?.publicBundle ?? ""); setCopied(true); window.setTimeout(() => setCopied(false), 1800); }} busy={busy} onImport={() => perform("pair", () => api.importPeer(bundle), 2)} onRequest={(peerId) => perform("pair-request", () => api.requestNearbyPairing(peerId))} onAccept={(requestId) => perform("pair-accept", () => api.acceptNearbyPairing(requestId))} onConfirm={(requestId) => perform("pair-confirm", () => api.confirmNearbyPairing(requestId), 2)} onDecline={(requestId) => perform("pair-decline", () => api.declineNearbyPairing(requestId))} onForget={() => perform("forget-pair", api.forgetPairedComputer)} />}
-          {step === 2 && <ArrangeStep snapshot={snapshot} placement={placement} setPlacement={setPlacement} busy={busy} onContinue={() => perform("arrange", () => api.finalize(placement), 3)} />}
+          {step === 2 && <ArrangeStep snapshot={snapshot} busy={busy} onContinue={(nextPlacement, layout) => perform("arrange", () => api.finalize(nextPlacement, layout), 3)} />}
           {step === 3 && <ReadyStep snapshot={snapshot} busy={busy} onValidate={() => perform("validate", api.validate)} onStart={() => perform("start", api.start)} onStop={() => perform("stop", api.stop)} onReplace={() => perform("forget-pair", async () => { if (snapshot.runtime === "running") await api.stop(); return api.forgetPairedComputer(); }, 1)} onRepair={() => perform("repair-lan", async () => { const restart = snapshot.runtime === "running"; if (restart) await api.stop(); const repaired = await api.repairLanBinding(); return restart ? api.start() : repaired; })} />}
         </section>
       </section>
@@ -159,28 +157,181 @@ function PairStep({ snapshot, bundle, setBundle, copied, onCopy, busy, onImport,
   </div>;
 }
 
-function ArrangeStep({ snapshot, placement, setPlacement, busy, onContinue }: { snapshot: SetupSnapshot; placement: Placement; setPlacement: (v: Placement) => void; busy: string | null; onContinue: () => void }) {
-  const localFirst = placement === "local_left";
-  return <div className="step-content enter">
-    <SectionHeading number="03" kicker="WORKSPACE" title="Arrange the desk you actually have." copy="Choose which side this computer occupies. Moving through the touching edge hands off pointer and keyboard together." />
-    <div className="desk-stage">
-      <div className="desk-grid" />
-      <div className={`display-row ${localFirst ? "" : "reverse"}`}>
-        <DisplayTile label="THIS COMPUTER" name={snapshot.local?.displayName ?? "Local"} display={snapshot.displays[0]} local />
-        <div className="handoff"><ChevronRight /></div>
-        <DisplayTile label="PAIRED COMPUTER" name={snapshot.peer?.displayName ?? "Peer"} display={snapshot.peer?.displays[0]} />
-      </div>
-    </div>
-    <div className="segmented" role="group" aria-label="Computer position">
-      <button className={placement === "local_left" ? "selected" : ""} onClick={() => setPlacement("local_left")}>This computer on left</button>
-      <button className={placement === "local_right" ? "selected" : ""} onClick={() => setPlacement("local_right")}>This computer on right</button>
-    </div>
-    <PrimaryButton busy={busy === "arrange"} onClick={onContinue}>Write secure configuration</PrimaryButton>
-  </div>;
+type DisplayOwner = "local" | "peer";
+type MappedDisplay = DisplayInfo & { owner: DisplayOwner; hostName: string; number: number };
+
+const MAP_PADDING = 28;
+
+function mappedDisplays(snapshot: SetupSnapshot): MappedDisplay[] {
+  const localName = snapshot.local?.displayName ?? "This computer";
+  const peerName = snapshot.peer?.displayName ?? "Paired computer";
+  return [
+    ...snapshot.displays.map((display, index) => ({ ...display, owner: "local" as const, hostName: localName, number: index + 1 })),
+    ...(snapshot.peer?.displays ?? []).map((display, index) => ({ ...display, owner: "peer" as const, hostName: peerName, number: snapshot.displays.length + index + 1 })),
+  ];
 }
 
-function DisplayTile({ label, name, display, local = false }: { label: string; name: string; display?: { name: string; width: number; height: number }; local?: boolean }) {
-  return <div className={`display-tile ${local ? "is-local" : ""}`}><div className="screen"><div className="screen-glow"/><Monitor size={24}/><span>{display?.width ?? "—"} × {display?.height ?? "—"}</span></div><div className="stand"/><small>{label}</small><strong>{name}</strong><span>{display?.name ?? "Display"}</span></div>;
+function defaultDisplayLayout(snapshot: SetupSnapshot, displays: MappedDisplay[]): DisplayPlacement[] {
+  const ids = new Set(displays.map((display) => display.id));
+  if (snapshot.displayLayout.length === displays.length && snapshot.displayLayout.every((item) => ids.has(item.displayId))) {
+    const minimumX = Math.min(...snapshot.displayLayout.map((item) => item.x));
+    const minimumY = Math.min(...snapshot.displayLayout.map((item) => item.y));
+    return snapshot.displayLayout.map((item) => ({ ...item, x: item.x - minimumX, y: item.y - minimumY }));
+  }
+  const ordered = (owner: DisplayOwner) => displays
+    .filter((display) => display.owner === owner)
+    .sort((left, right) => (left.nativeBounds?.x ?? Number(!left.primary)) - (right.nativeBounds?.x ?? Number(!right.primary)) || (left.nativeBounds?.y ?? 0) - (right.nativeBounds?.y ?? 0));
+  const groups = snapshot.placement === "local_left" ? [ordered("local"), ordered("peer")] : [ordered("peer"), ordered("local")];
+  const layout: DisplayPlacement[] = [];
+  let x = 0;
+  for (const group of groups) {
+    for (const display of group) {
+      layout.push({ displayId: display.id, x, y: 0 });
+      x += display.width;
+    }
+  }
+  return layout;
+}
+
+function displayTouch(
+  first: DisplayPlacement,
+  firstDisplay: MappedDisplay,
+  second: DisplayPlacement,
+  secondDisplay: MappedDisplay,
+) {
+  const epsilon = .01;
+  const verticalOverlap = Math.min(first.y + firstDisplay.height, second.y + secondDisplay.height) - Math.max(first.y, second.y);
+  const horizontalOverlap = Math.min(first.x + firstDisplay.width, second.x + secondDisplay.width) - Math.max(first.x, second.x);
+  return (verticalOverlap > 1 && (Math.abs(first.x + firstDisplay.width - second.x) < epsilon || Math.abs(second.x + secondDisplay.width - first.x) < epsilon))
+    || (horizontalOverlap > 1 && (Math.abs(first.y + firstDisplay.height - second.y) < epsilon || Math.abs(second.y + secondDisplay.height - first.y) < epsilon));
+}
+
+function hasCrossHostEdge(layout: DisplayPlacement[], displays: MappedDisplay[]) {
+  const byId = new Map(displays.map((display) => [display.id, display]));
+  return layout.some((first, index) => layout.slice(index + 1).some((second) => {
+    const firstDisplay = byId.get(first.displayId);
+    const secondDisplay = byId.get(second.displayId);
+    return !!firstDisplay && !!secondDisplay && firstDisplay.owner !== secondDisplay.owner
+      && displayTouch(first, firstDisplay, second, secondDisplay);
+  }));
+}
+
+function hasDisplayOverlap(layout: DisplayPlacement[], displays: MappedDisplay[]) {
+  const byId = new Map(displays.map((display) => [display.id, display]));
+  return layout.some((first, index) => layout.slice(index + 1).some((second) => {
+    const firstDisplay = byId.get(first.displayId);
+    const secondDisplay = byId.get(second.displayId);
+    if (!firstDisplay || !secondDisplay) return false;
+    const horizontalOverlap = Math.min(first.x + firstDisplay.width, second.x + secondDisplay.width) - Math.max(first.x, second.x);
+    const verticalOverlap = Math.min(first.y + firstDisplay.height, second.y + secondDisplay.height) - Math.max(first.y, second.y);
+    return horizontalOverlap > .01 && verticalOverlap > .01;
+  }));
+}
+
+function snapDisplay(layout: DisplayPlacement[], movingId: string, displays: MappedDisplay[], scale: number) {
+  const byId = new Map(displays.map((display) => [display.id, display]));
+  const moving = layout.find((item) => item.displayId === movingId);
+  const movingDisplay = byId.get(movingId);
+  if (!moving || !movingDisplay) return layout;
+  const threshold = 22 / scale;
+  let best = { distance: threshold, x: moving.x, y: moving.y };
+  for (const other of layout) {
+    if (other.displayId === movingId) continue;
+    const otherDisplay = byId.get(other.displayId);
+    if (!otherDisplay) continue;
+    const horizontal = [
+      { x: other.x + otherDisplay.width, distance: Math.abs(moving.x - (other.x + otherDisplay.width)) },
+      { x: other.x - movingDisplay.width, distance: Math.abs(moving.x + movingDisplay.width - other.x) },
+    ];
+    for (const candidate of horizontal) {
+      const overlap = Math.min(moving.y + movingDisplay.height, other.y + otherDisplay.height) - Math.max(moving.y, other.y);
+      if (overlap > 1 && candidate.distance < best.distance) best = { ...best, x: candidate.x, distance: candidate.distance };
+    }
+    const vertical = [
+      { y: other.y + otherDisplay.height, distance: Math.abs(moving.y - (other.y + otherDisplay.height)) },
+      { y: other.y - movingDisplay.height, distance: Math.abs(moving.y + movingDisplay.height - other.y) },
+    ];
+    for (const candidate of vertical) {
+      const overlap = Math.min(moving.x + movingDisplay.width, other.x + otherDisplay.width) - Math.max(moving.x, other.x);
+      if (overlap > 1 && candidate.distance < best.distance) best = { ...best, y: candidate.y, distance: candidate.distance };
+    }
+  }
+  const next = layout.map((item) => item.displayId === movingId
+    ? { ...item, x: Math.max(0, Math.round(best.x * 1000) / 1000), y: Math.max(0, Math.round(best.y * 1000) / 1000) }
+    : item);
+  const minimumX = Math.min(...next.map((item) => item.x));
+  const minimumY = Math.min(...next.map((item) => item.y));
+  return next.map((item) => ({ ...item, x: item.x - minimumX, y: item.y - minimumY }));
+}
+
+function ArrangeStep({ snapshot, busy, onContinue }: { snapshot: SetupSnapshot; busy: string | null; onContinue: (placement: Placement, layout: DisplayPlacement[]) => void }) {
+  const displays = useMemo(() => mappedDisplays(snapshot), [snapshot]);
+  const [layout, setLayout] = useState(() => defaultDisplayLayout(snapshot, displays));
+  const [drag, setDrag] = useState<{ displayId: string; pointerId: number; clientX: number; clientY: number; x: number; y: number } | null>(null);
+  const scale = useMemo(() => {
+    const totalWidth = displays.reduce((sum, display) => sum + display.width, 0);
+    const tallest = Math.max(...displays.map((display) => display.height), 1);
+    return Math.min(.16, 690 / Math.max(totalWidth, 1), 285 / tallest);
+  }, [displays]);
+  const byId = useMemo(() => new Map(displays.map((display) => [display.id, display])), [displays]);
+  const maxRight = Math.max(...layout.map((item) => item.x + (byId.get(item.displayId)?.width ?? 0)), 1);
+  const maxBottom = Math.max(...layout.map((item) => item.y + (byId.get(item.displayId)?.height ?? 0)), 1);
+  const canvasWidth = Math.max(720, maxRight * scale + MAP_PADDING * 2);
+  const canvasHeight = Math.max(330, maxBottom * scale + MAP_PADDING * 2);
+  const linked = hasCrossHostEdge(layout, displays);
+  const overlapping = hasDisplayOverlap(layout, displays);
+  const valid = linked && !overlapping;
+  const localCenter = layout.filter((item) => byId.get(item.displayId)?.owner === "local").reduce((sum, item) => sum + item.x + (byId.get(item.displayId)?.width ?? 0) / 2, 0) / Math.max(snapshot.displays.length, 1);
+  const peerCenter = layout.filter((item) => byId.get(item.displayId)?.owner === "peer").reduce((sum, item) => sum + item.x + (byId.get(item.displayId)?.width ?? 0) / 2, 0) / Math.max(snapshot.peer?.displays.length ?? 0, 1);
+  const placement: Placement = localCenter <= peerCenter ? "local_left" : "local_right";
+
+  return <div className="step-content enter arrange-content">
+    <SectionHeading number="03" kicker="WORKSPACE MAP" title="Build the desk you actually have." copy="Drag every screen into its physical position. Touch one Mac edge to one Windows edge to choose where the pointer crosses." />
+    <div className="display-map-toolbar">
+      <div className="map-legend"><span className="local"><i/>This computer</span><span className="peer"><i/>Paired computer</span></div>
+      <button onClick={() => setLayout(defaultDisplayLayout(snapshot, displays))}><RotateCcw size={13}/>Reset arrangement</button>
+    </div>
+    <div className="display-map-viewport">
+      <div className="display-map-grid" style={{ width: canvasWidth, height: canvasHeight }}>
+        <div className="map-instruction"><Move size={13}/>DRAG TO POSITION · EDGES SNAP TOGETHER</div>
+        {layout.map((position) => {
+          const display = byId.get(position.displayId);
+          if (!display) return null;
+          return <button
+            key={display.id}
+            className={`mapped-display ${display.owner} ${display.primary ? "primary" : ""} ${drag?.displayId === display.id ? "dragging" : ""}`}
+            style={{ left: MAP_PADDING + position.x * scale, top: MAP_PADDING + position.y * scale, width: display.width * scale, height: display.height * scale }}
+            onPointerDown={(event) => {
+              event.currentTarget.setPointerCapture(event.pointerId);
+              setDrag({ displayId: display.id, pointerId: event.pointerId, clientX: event.clientX, clientY: event.clientY, x: position.x, y: position.y });
+            }}
+            onPointerMove={(event) => {
+              if (!drag || drag.displayId !== display.id || drag.pointerId !== event.pointerId) return;
+              setLayout((current) => current.map((item) => item.displayId === display.id ? {
+                ...item,
+                x: Math.max(0, drag.x + (event.clientX - drag.clientX) / scale),
+                y: Math.max(0, drag.y + (event.clientY - drag.clientY) / scale),
+              } : item));
+            }}
+            onPointerUp={(event) => {
+              if (!drag || drag.pointerId !== event.pointerId) return;
+              setLayout((current) => snapDisplay(current, display.id, displays, scale));
+              setDrag(null);
+            }}
+          >
+            <span className="display-number">{display.number}</span>
+            <span className="display-identity"><small>{display.owner === "local" ? "THIS COMPUTER" : "PAIRED COMPUTER"}</small><strong>{display.hostName}</strong></span>
+            <span className="display-spec">{Math.round(display.width)} × {Math.round(display.height)}{display.primary ? " · MAIN" : ""}</span>
+          </button>;
+        })}
+      </div>
+    </div>
+    <div className={`map-validation ${valid ? "ready" : "needs-edge"}`}>
+      <span><i/>{overlapping ? "SCREENS CANNOT OVERLAP" : linked ? "HANDOFF EDGE READY" : "CONNECT THE TWO COMPUTERS"}</span>
+      <p>{overlapping ? "Separate the overlapping screens, then join one Mac edge to one Windows edge." : linked ? "The touching boundary becomes the bidirectional input handoff." : "Drag a screen from each computer together until their edges snap."}</p>
+    </div>
+    <PrimaryButton busy={busy === "arrange"} disabled={!valid} onClick={() => onContinue(placement, layout)}>Save display map</PrimaryButton>
+  </div>;
 }
 
 function ReadyStep({ snapshot, busy, onValidate, onStart, onStop, onReplace, onRepair }: { snapshot: SetupSnapshot; busy: string | null; onValidate: () => void; onStart: () => void; onStop: () => void; onReplace: () => void; onRepair: () => void }) {

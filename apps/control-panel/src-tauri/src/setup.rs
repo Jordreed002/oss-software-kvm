@@ -2,7 +2,7 @@
 // the command body only borrows them.
 #![allow(clippy::needless_pass_by_value)]
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::net::{IpAddr, SocketAddr, UdpSocket};
@@ -69,6 +69,8 @@ struct StoredSetup {
     local: Option<StoredLocal>,
     peer: Option<PairingBundle>,
     placement: Placement,
+    #[serde(default)]
+    display_layout: Vec<DisplayLayoutDto>,
     configured: bool,
     validated: bool,
 }
@@ -126,6 +128,14 @@ struct NativeBoundsDto {
     y: f64,
     width: f64,
     height: f64,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct DisplayLayoutDto {
+    display_id: DisplayId,
+    x: f64,
+    y: f64,
 }
 
 #[derive(Debug, Serialize)]
@@ -251,6 +261,7 @@ pub(crate) struct SetupSnapshot {
     peer: Option<PeerIdentityDto>,
     displays: Vec<DisplayDto>,
     placement: Placement,
+    display_layout: Vec<DisplayLayoutDto>,
     configured: bool,
     validated: bool,
     runtime: RuntimeState,
@@ -397,6 +408,7 @@ impl SetupService {
             peer,
             displays,
             placement: setup.placement,
+            display_layout: setup.display_layout,
             configured: setup.configured,
             validated: setup.validated,
             runtime: runtime_state,
@@ -493,6 +505,7 @@ impl SetupService {
             .map_err(|()| coarse_error())?;
         let mut setup = self.inner.lock().map_err(|_| coarse_error())?;
         setup.peer = Some(peer);
+        setup.display_layout.clear();
         setup.configured = false;
         setup.validated = false;
         self.save(&setup).map_err(|()| coarse_error())
@@ -562,6 +575,7 @@ fn reset_legacy_credentials(
     setup.draft_peer_id = Uuid::new_v4().to_string();
     setup.local = None;
     setup.peer = None;
+    setup.display_layout.clear();
     setup.configured = false;
     setup.validated = false;
     Ok(true)
@@ -838,11 +852,13 @@ pub(crate) fn forget_paired_computer(
 #[tauri::command]
 pub(crate) fn finalize_setup(
     placement: Placement,
+    layout: Vec<DisplayLayoutDto>,
     service: State<'_, SetupService>,
 ) -> Result<SetupSnapshot, String> {
     ensure_runtime_stopped(&service)?;
     let mut setup = service.inner.lock().map_err(|_| coarse_error())?;
     setup.placement = placement;
+    setup.display_layout = layout;
     write_setup_configuration(&service, &mut setup)?;
     drop(setup);
     service.snapshot().map_err(|()| coarse_error())
@@ -1048,7 +1064,12 @@ fn write_setup_configuration(
     if local_displays.is_empty() || peer.displays.is_empty() {
         return Err(coarse_error());
     }
-    let config = build_config(&peer, &local_displays, &setup.placement)?;
+    let config = build_config(
+        &peer,
+        &local_displays,
+        &setup.placement,
+        &setup.display_layout,
+    )?;
     let config_source = encode_config(&config).map_err(|_| coarse_error())?;
     secure_write(
         &service.directory.join(CONFIG_FILE),
@@ -1090,42 +1111,40 @@ fn build_config(
     peer: &PairingBundle,
     local_displays: &[DisplayDto],
     placement: &Placement,
+    requested_layout: &[DisplayLayoutDto],
 ) -> Result<Config, String> {
     let remote_host = parse_host_id(&peer.host_id)?;
-    let ordered_local = displays_left_to_right(local_displays);
-    let ordered_peer = displays_left_to_right(&peer.displays);
-    let (first, second) = match placement {
-        Placement::LocalLeft => (&ordered_local, &ordered_peer),
-        Placement::LocalRight => (&ordered_peer, &ordered_local),
+    let layout = if requested_layout.is_empty() {
+        default_display_layout(local_displays, &peer.displays, placement)?
+    } else {
+        validate_display_layout(requested_layout, local_displays, &peer.displays)?;
+        requested_layout.to_vec()
     };
-    let mut x = 0.0;
-    let mut placements = Vec::new();
-    for display in first.iter().chain(second) {
-        placements.push(DisplayPlacement {
-            display_id: display.id.parse().map_err(|_| coarse_error())?,
-            x,
-            y: 0.0,
-        });
-        x += display.width;
-    }
-    let (left_display, right_display) = (
-        first.last().ok_or_else(coarse_error)?,
-        second.first().ok_or_else(coarse_error)?,
-    );
-    let links = vec![
+    let placements = layout
+        .iter()
+        .map(|display| DisplayPlacement {
+            display_id: display.display_id,
+            x: display.x,
+            y: display.y,
+        })
+        .collect();
+    let (local_display, local_edge, remote_display, remote_edge) =
+        selected_cross_host_edge(&layout, local_displays, &peer.displays)?;
+    let mut links = vec![
         TopologyLink {
-            from_display: left_display.id.parse().map_err(|_| coarse_error())?,
-            from_edge: Edge::Right,
-            to_display: right_display.id.parse().map_err(|_| coarse_error())?,
-            to_edge: Edge::Left,
+            from_display: local_display,
+            from_edge: local_edge,
+            to_display: remote_display,
+            to_edge: remote_edge,
         },
         TopologyLink {
-            from_display: right_display.id.parse().map_err(|_| coarse_error())?,
-            from_edge: Edge::Left,
-            to_display: left_display.id.parse().map_err(|_| coarse_error())?,
-            to_edge: Edge::Right,
+            from_display: remote_display,
+            from_edge: remote_edge,
+            to_display: local_display,
+            to_edge: local_edge,
         },
     ];
+    links.sort_by_key(|link| link.from_display);
     let address: SocketAddr = peer.address.parse().map_err(|_| coarse_error())?;
     let config = Config {
         paired_hosts: vec![PairedHostConfig {
@@ -1152,6 +1171,160 @@ fn build_config(
     };
     config.validate().map_err(|_| coarse_error())?;
     Ok(config)
+}
+
+fn default_display_layout(
+    local_displays: &[DisplayDto],
+    peer_displays: &[DisplayDto],
+    placement: &Placement,
+) -> Result<Vec<DisplayLayoutDto>, String> {
+    let ordered_local = displays_left_to_right(local_displays);
+    let ordered_peer = displays_left_to_right(peer_displays);
+    let (first, second) = match placement {
+        Placement::LocalLeft => (&ordered_local, &ordered_peer),
+        Placement::LocalRight => (&ordered_peer, &ordered_local),
+    };
+    let mut x = 0.0;
+    let mut layout = Vec::with_capacity(first.len() + second.len());
+    for display in first.iter().chain(second) {
+        layout.push(DisplayLayoutDto {
+            display_id: display.id.parse().map_err(|_| coarse_error())?,
+            x,
+            y: 0.0,
+        });
+        x += display.width;
+    }
+    Ok(layout)
+}
+
+fn validate_display_layout(
+    layout: &[DisplayLayoutDto],
+    local_displays: &[DisplayDto],
+    peer_displays: &[DisplayDto],
+) -> Result<(), String> {
+    if layout.len() != local_displays.len() + peer_displays.len()
+        || layout.iter().any(|display| {
+            display.display_id == DisplayId::from_bytes([0; 16])
+                || !display.x.is_finite()
+                || !display.y.is_finite()
+                || display.x.abs() > 100_000.0
+                || display.y.abs() > 100_000.0
+        })
+    {
+        return Err(coarse_error());
+    }
+    let expected = local_displays
+        .iter()
+        .chain(peer_displays)
+        .map(|display| display.id.parse::<DisplayId>().map_err(|_| coarse_error()))
+        .collect::<Result<HashSet<_>, _>>()?;
+    let actual = layout
+        .iter()
+        .map(|display| display.display_id)
+        .collect::<HashSet<_>>();
+    if actual.len() != layout.len() || actual != expected {
+        return Err(coarse_error());
+    }
+    let dimensions = local_displays
+        .iter()
+        .chain(peer_displays)
+        .map(|display| {
+            Ok((
+                display.id.parse::<DisplayId>().map_err(|_| coarse_error())?,
+                (display.width, display.height),
+            ))
+        })
+        .collect::<Result<HashMap<_, _>, String>>()?;
+    for (index, first) in layout.iter().enumerate() {
+        let (first_width, first_height) = dimensions
+            .get(&first.display_id)
+            .copied()
+            .ok_or_else(coarse_error)?;
+        for second in &layout[index + 1..] {
+            let (second_width, second_height) = dimensions
+                .get(&second.display_id)
+                .copied()
+                .ok_or_else(coarse_error)?;
+            let horizontal_overlap = (first.x + first_width)
+                .min(second.x + second_width)
+                - first.x.max(second.x);
+            let vertical_overlap = (first.y + first_height)
+                .min(second.y + second_height)
+                - first.y.max(second.y);
+            if horizontal_overlap > 0.001 && vertical_overlap > 0.001 {
+                return Err(coarse_error());
+            }
+        }
+    }
+    Ok(())
+}
+
+fn selected_cross_host_edge(
+    layout: &[DisplayLayoutDto],
+    local_displays: &[DisplayDto],
+    peer_displays: &[DisplayDto],
+) -> Result<(DisplayId, Edge, DisplayId, Edge), String> {
+    let mut candidates = Vec::new();
+    for local in local_displays {
+        let local_id = local.id.parse::<DisplayId>().map_err(|_| coarse_error())?;
+        let local_position = layout
+            .iter()
+            .find(|position| position.display_id == local_id)
+            .ok_or_else(coarse_error)?;
+        for remote in peer_displays {
+            let remote_id = remote.id.parse::<DisplayId>().map_err(|_| coarse_error())?;
+            let remote_position = layout
+                .iter()
+                .find(|position| position.display_id == remote_id)
+                .ok_or_else(coarse_error)?;
+            if let Some((local_edge, remote_edge, overlap)) =
+                touching_edges(local_position, local, remote_position, remote)
+            {
+                candidates.push((overlap, local_id, local_edge, remote_id, remote_edge));
+            }
+        }
+    }
+    candidates.sort_by(|left, right| {
+        right
+            .0
+            .total_cmp(&left.0)
+            .then_with(|| left.1.cmp(&right.1))
+            .then_with(|| left.3.cmp(&right.3))
+    });
+    candidates
+        .first()
+        .map(|(_, local, local_edge, remote, remote_edge)| {
+            (*local, *local_edge, *remote, *remote_edge)
+        })
+        .ok_or_else(coarse_error)
+}
+
+fn touching_edges(
+    first_position: &DisplayLayoutDto,
+    first: &DisplayDto,
+    second_position: &DisplayLayoutDto,
+    second: &DisplayDto,
+) -> Option<(Edge, Edge, f64)> {
+    const EPSILON: f64 = 0.001;
+    let first_right = first_position.x + first.width;
+    let first_bottom = first_position.y + first.height;
+    let second_right = second_position.x + second.width;
+    let second_bottom = second_position.y + second.height;
+    let vertical_overlap =
+        first_bottom.min(second_bottom) - first_position.y.max(second_position.y);
+    let horizontal_overlap =
+        first_right.min(second_right) - first_position.x.max(second_position.x);
+    if vertical_overlap > EPSILON && (first_right - second_position.x).abs() <= EPSILON {
+        Some((Edge::Right, Edge::Left, vertical_overlap))
+    } else if vertical_overlap > EPSILON && (first_position.x - second_right).abs() <= EPSILON {
+        Some((Edge::Left, Edge::Right, vertical_overlap))
+    } else if horizontal_overlap > EPSILON && (first_bottom - second_position.y).abs() <= EPSILON {
+        Some((Edge::Bottom, Edge::Top, horizontal_overlap))
+    } else if horizontal_overlap > EPSILON && (first_position.y - second_bottom).abs() <= EPSILON {
+        Some((Edge::Top, Edge::Bottom, horizontal_overlap))
+    } else {
+        None
+    }
 }
 
 fn displays_left_to_right(displays: &[DisplayDto]) -> Vec<DisplayDto> {
@@ -1592,8 +1765,8 @@ fn runtime_lock_held(directory: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_config, read_input_authority, validate_bundle, DisplayDto, InputOwnerState,
-        NativeBoundsDto, PairingBundle, Placement, PlatformDto, PAIRING_VERSION,
+        build_config, read_input_authority, validate_bundle, DisplayDto, DisplayLayoutDto,
+        InputOwnerState, NativeBoundsDto, PairingBundle, Placement, PlatformDto, PAIRING_VERSION,
         RUNTIME_STATUS_FILE,
     };
     #[cfg(windows)]
@@ -1658,7 +1831,7 @@ mod tests {
     fn generated_topology_links_both_directions() {
         let peer = bundle();
         let local = [display("00000000-0000-4000-8000-000000000004", true)];
-        let config = build_config(&peer, &local, &Placement::LocalLeft)
+        let config = build_config(&peer, &local, &Placement::LocalLeft, &[])
             .expect("bounded two-display topology should build");
         assert_eq!(config.topology.displays.len(), 2);
         assert_eq!(config.topology.links.len(), 2);
@@ -1676,25 +1849,31 @@ mod tests {
             &peer,
             &[primary.clone(), left_secondary.clone()],
             &Placement::LocalRight,
+            &[],
         )
         .expect("left outer monitor should form the host boundary");
-        assert_eq!(
-            local_right.topology.links[1].from_display,
-            left_secondary.id.parse().unwrap()
-        );
-        assert_eq!(local_right.topology.links[1].from_edge, Edge::Left);
+        let local_right_link = local_right
+            .topology
+            .links
+            .iter()
+            .find(|link| link.from_display == left_secondary.id.parse().unwrap())
+            .unwrap();
+        assert_eq!(local_right_link.from_edge, Edge::Left);
 
         let local_left = build_config(
             &peer,
             &[primary.clone(), left_secondary],
             &Placement::LocalLeft,
+            &[],
         )
         .expect("right outer monitor should form the host boundary");
-        assert_eq!(
-            local_left.topology.links[0].from_display,
-            primary.id.parse().unwrap()
-        );
-        assert_eq!(local_left.topology.links[0].from_edge, Edge::Right);
+        let local_left_link = local_left
+            .topology
+            .links
+            .iter()
+            .find(|link| link.from_display == primary.id.parse().unwrap())
+            .unwrap();
+        assert_eq!(local_left_link.from_edge, Edge::Right);
     }
 
     #[test]
@@ -1711,6 +1890,7 @@ mod tests {
             &windows_bundle,
             std::slice::from_ref(&mac_display),
             &Placement::LocalLeft,
+            &[],
         )
         .unwrap();
 
@@ -1720,10 +1900,62 @@ mod tests {
             &mac_bundle,
             &[windows_primary, windows_secondary],
             &Placement::LocalRight,
+            &[],
         )
         .unwrap();
 
         assert_eq!(mac_config.topology, windows_config.topology);
+    }
+
+    #[test]
+    fn custom_display_map_supports_vertical_cross_host_handoff() {
+        let peer = bundle();
+        let local = [display("00000000-0000-4000-8000-000000000004", true)];
+        let local_id = local[0].id.parse().unwrap();
+        let peer_id = peer.displays[0].id.parse().unwrap();
+        let layout = [
+            DisplayLayoutDto {
+                display_id: local_id,
+                x: 0.0,
+                y: 1_080.0,
+            },
+            DisplayLayoutDto {
+                display_id: peer_id,
+                x: 0.0,
+                y: 0.0,
+            },
+        ];
+
+        let config = build_config(&peer, &local, &Placement::LocalLeft, &layout).unwrap();
+        let local_link = config
+            .topology
+            .links
+            .iter()
+            .find(|link| link.from_display == local_id)
+            .unwrap();
+        assert_eq!(local_link.from_edge, Edge::Top);
+        assert_eq!(local_link.to_display, peer_id);
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn custom_display_map_rejects_overlapping_screens() {
+        let peer = bundle();
+        let local = [display("00000000-0000-4000-8000-000000000004", true)];
+        let layout = [
+            DisplayLayoutDto {
+                display_id: local[0].id.parse().unwrap(),
+                x: 0.0,
+                y: 0.0,
+            },
+            DisplayLayoutDto {
+                display_id: peer.displays[0].id.parse().unwrap(),
+                x: 1_000.0,
+                y: 0.0,
+            },
+        ];
+
+        assert!(build_config(&peer, &local, &Placement::LocalLeft, &layout).is_err());
     }
 
     #[test]

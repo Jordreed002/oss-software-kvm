@@ -1,5 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
-import type { Placement, SetupSnapshot } from "./types";
+import type { DisplayPlacement, Placement, SetupSnapshot } from "./types";
 
 const inTauri = () => "__TAURI_INTERNALS__" in window;
 
@@ -13,6 +13,7 @@ const mock: SetupSnapshot = {
     { id: "preview-local-display", name: "Built-in display", width: 1512, height: 982, scaleFactor: 2, primary: true, nativeBounds: { x: 0, y: 0, width: 3024, height: 1964 } },
   ],
   placement: "local_left",
+  displayLayout: [],
   configured: false,
   validated: false,
   runtime: "stopped",
@@ -54,7 +55,10 @@ const invokeOrPreview = async <T>(command: string, args?: Record<string, unknown
       platform: previewState.platform === "macos" ? "windows" : "macos",
       serverName: "office-windows.kvm.test", certificateFingerprint: "3a".repeat(32),
       address: "192.168.1.31:24800",
-      displays: [{ id: "preview-peer-display", name: "Studio monitor", width: 2560, height: 1440, scaleFactor: 1, primary: true, nativeBounds: { x: 0, y: 0, width: 2560, height: 1440 } }],
+      displays: [
+        { id: "preview-peer-display", name: "Studio monitor", width: 2560, height: 1440, scaleFactor: 1, primary: true, nativeBounds: { x: 0, y: 0, width: 2560, height: 1440 } },
+        { id: "preview-peer-display-2", name: "Second monitor", width: 1920, height: 1080, scaleFactor: 1, primary: false, nativeBounds: { x: 2560, y: 0, width: 1920, height: 1080 } },
+      ],
     };
     return structuredClone(previewState) as T;
   }
@@ -80,7 +84,10 @@ const invokeOrPreview = async <T>(command: string, args?: Record<string, unknown
       displayName: previewState.nearbyPairing.name, platform: previewState.nearbyPairing.platform,
       serverName: "nearby-peer.kvm.test", certificateFingerprint: "3a".repeat(32),
       address: previewState.nearbyPairing.address,
-      displays: [{ id: "preview-peer-display", name: "Studio monitor", width: 2560, height: 1440, scaleFactor: 1, primary: true, nativeBounds: { x: 0, y: 0, width: 2560, height: 1440 } }],
+      displays: [
+        { id: "preview-peer-display", name: "Studio monitor", width: 2560, height: 1440, scaleFactor: 1, primary: true, nativeBounds: { x: 0, y: 0, width: 2560, height: 1440 } },
+        { id: "preview-peer-display-2", name: "Second monitor", width: 1920, height: 1080, scaleFactor: 1, primary: false, nativeBounds: { x: 2560, y: 0, width: 1920, height: 1080 } },
+      ],
     };
     previewState.nearbyPairing = null;
     return structuredClone(previewState) as T;
@@ -108,6 +115,7 @@ const invokeOrPreview = async <T>(command: string, args?: Record<string, unknown
   if (command === "finalize_setup") {
     previewState.configured = true;
     previewState.placement = args?.placement as Placement;
+    previewState.displayLayout = args?.layout as DisplayPlacement[];
     previewState.setupDirectory = "/Users/demo/Library/Application Support/software-kvm";
     previewState.profilePath = `${previewState.setupDirectory}/runtime.toml`;
     return structuredClone(previewState) as T;
@@ -140,7 +148,8 @@ export const api = {
   declineNearbyPairing: (requestId: string) => invokeOrPreview<SetupSnapshot>("decline_nearby_pairing", { requestId }),
   forgetPairedComputer: () => invokeOrPreview<SetupSnapshot>("forget_paired_computer"),
   repairLanBinding: () => invokeOrPreview<SetupSnapshot>("repair_lan_binding"),
-  finalize: (placement: Placement) => invokeOrPreview<SetupSnapshot>("finalize_setup", { placement }),
+  finalize: (placement: Placement, layout: DisplayPlacement[]) =>
+    invokeOrPreview<SetupSnapshot>("finalize_setup", { placement, layout }),
   validate: () => invokeOrPreview<SetupSnapshot>("validate_setup"),
   start: () => invokeOrPreview<SetupSnapshot>("start_runtime"),
   stop: () => invokeOrPreview<SetupSnapshot>("stop_runtime"),
