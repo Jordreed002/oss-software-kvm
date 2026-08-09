@@ -24,6 +24,7 @@ use crate::session::{CoordinatorError, OutboundPeer, PeerEventOutcome, SessionRo
 use crate::supervisor::CurrentAdmittedSession;
 
 const NATIVE_EDGE_TOLERANCE: f64 = 1.0;
+const NATIVE_CURSOR_INSET: f64 = 2.0;
 
 /// Coarse workspace-control failure. Pointer protocol failures are session-fatal.
 pub enum WorkspaceControlError {
@@ -261,7 +262,7 @@ impl WorkspaceControlPlane {
     /// Resolves a trusted native cursor position to one configured local
     /// display-edge transition. Ambiguous corners, unlinked edges, remote
     /// authority, and stale/unready workspaces return no proposal.
-    pub(crate) fn native_pointer_boundary(&self, position: Point) -> Option<(Edge, f64)> {
+    pub(crate) fn native_pointer_boundary(&mut self, position: Point) -> Option<(Edge, f64)> {
         if !position.x.is_finite()
             || !position.y.is_finite()
             || !self.selected_inventory_ready
@@ -274,29 +275,64 @@ impl WorkspaceControlPlane {
             return None;
         }
         let state = pointer.workspace_state();
-        let display = self
-            .inventory
-            .snapshot()
-            .host(state.local_host)?
-            .get(state.active_display)?
-            .clone();
+        let inventory = self.inventory.snapshot();
+        let local_displays = inventory.host(state.local_host)?;
         let mut candidate = None;
-        for link in self
-            .links
-            .iter()
-            .filter(|link| link.source_display() == display.id)
-        {
-            let edge = link.source_edge();
-            let Some(normalized) = native_edge_position(display.native_bounds, edge, position)
-            else {
-                continue;
-            };
-            if candidate.is_some() {
-                return None;
+        for display in local_displays.iter() {
+            for link in self
+                .links
+                .iter()
+                .filter(|link| link.source_display() == display.id)
+            {
+                let edge = link.source_edge();
+                let Some(normalized) = native_edge_position(display.native_bounds, edge, position)
+                else {
+                    continue;
+                };
+                if candidate.is_some() {
+                    return None;
+                }
+                candidate = Some((display.clone(), edge, normalized));
             }
-            candidate = Some((edge, normalized));
         }
-        candidate
+        let (display, edge, normalized) = candidate?;
+        let logical_position = match edge {
+            Edge::Left => Point::new(0.0, normalized * display.logical_size.height),
+            Edge::Right => Point::new(
+                display.logical_size.width,
+                normalized * display.logical_size.height,
+            ),
+            Edge::Top => Point::new(normalized * display.logical_size.width, 0.0),
+            Edge::Bottom => Point::new(
+                normalized * display.logical_size.width,
+                display.logical_size.height,
+            ),
+        };
+        self.pointer
+            .as_mut()?
+            .observe_local_pointer(LogicalPointer::new(
+                display.id,
+                logical_position.x,
+                logical_position.y,
+            ))
+            .ok()?;
+        Some((edge, normalized))
+    }
+
+    pub(crate) fn local_pointer_native_position(&self) -> Option<Point> {
+        if !self.selected_inventory_ready {
+            return None;
+        }
+        let pointer = self.pointer.as_ref()?;
+        if !pointer.has_local_authority() {
+            return None;
+        }
+        let state = pointer.workspace_state();
+        let inventory = self.inventory.snapshot();
+        let display = inventory
+            .host(state.local_host)?
+            .get(state.active_display)?;
+        map_logical_pointer_to_native(display, state.pointer.position())
     }
 
     pub(crate) fn activate<I, O>(
@@ -1234,6 +1270,42 @@ fn native_edge_position(bounds: Rect, edge: Edge, position: Point) -> Option<f64
         Edge::Top | Edge::Bottom => (position.x - bounds.min_x()) / bounds.width,
     };
     Some(normalized.clamp(0.0, 1.0))
+}
+
+fn map_logical_pointer_to_native(display: &Display, logical: Point) -> Option<Point> {
+    if !display.logical_size.is_valid()
+        || display.logical_size.width <= 0.0
+        || display.logical_size.height <= 0.0
+        || !display.native_bounds.is_valid()
+        || display.native_bounds.width <= 0.0
+        || display.native_bounds.height <= 0.0
+        || !logical.x.is_finite()
+        || !logical.y.is_finite()
+    {
+        return None;
+    }
+    let fraction_x = (logical.x / display.logical_size.width).clamp(0.0, 1.0);
+    let fraction_y = (logical.y / display.logical_size.height).clamp(0.0, 1.0);
+    Some(Point::new(
+        inset_native_coordinate(
+            display.native_bounds.x + fraction_x * display.native_bounds.width,
+            display.native_bounds.min_x(),
+            display.native_bounds.max_x(),
+        ),
+        inset_native_coordinate(
+            display.native_bounds.y + fraction_y * display.native_bounds.height,
+            display.native_bounds.min_y(),
+            display.native_bounds.max_y(),
+        ),
+    ))
+}
+
+fn inset_native_coordinate(value: f64, minimum: f64, maximum: f64) -> f64 {
+    if maximum - minimum > NATIVE_CURSOR_INSET * 2.0 {
+        value.clamp(minimum + NATIVE_CURSOR_INSET, maximum - NATIVE_CURSOR_INSET)
+    } else {
+        minimum.midpoint(maximum)
+    }
 }
 
 fn validate_topology_config(

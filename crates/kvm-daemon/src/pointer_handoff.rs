@@ -775,6 +775,38 @@ where
         ))
     }
 
+    fn observe_local_pointer(
+        &mut self,
+        pointer: LogicalPointer,
+    ) -> Result<PointerHandoffStatus, PointerHandoffError> {
+        self.ensure_running()?;
+        if !self.has_local_authority() {
+            return Err(PointerHandoffError::new(
+                PointerHandoffErrorKind::NotAuthoritative,
+            ));
+        }
+        if self.outbound.is_some() || self.inbound.is_some() || self.reply.is_some() {
+            return Err(PointerHandoffError::new(
+                PointerHandoffErrorKind::PendingConflict,
+            ));
+        }
+        if self.workspace.owner_of(pointer.display_id) != Some(self.workspace_state.local_host)
+            || !self
+                .workspace
+                .contains_local_point(pointer.display_id, pointer.position())
+        {
+            return Err(PointerHandoffError::new(
+                PointerHandoffErrorKind::InvalidWorkspaceState,
+            ));
+        }
+        if self.workspace_state.pointer == pointer {
+            return Ok(PointerHandoffStatus::Duplicate);
+        }
+        self.workspace_state
+            .set_active_pointer(self.workspace_state.local_host, pointer);
+        Ok(PointerHandoffStatus::Applied)
+    }
+
     fn receive_leave(
         &mut self,
         session: &B,
@@ -1346,7 +1378,7 @@ where
         }
         let source_display = display_from_wire(message.source_display);
         let remote_is_authoritative = self.workspace_state.active_host == session.remote_host_id()
-            && self.workspace_state.active_display == source_display;
+            && self.workspace.owner_of(source_display) == Some(session.remote_host_id());
         if !remote_is_authoritative && !self.has_local_authority() {
             return Err(PointerHandoffError::new(
                 PointerHandoffErrorKind::NotAuthoritative,
@@ -1376,7 +1408,7 @@ where
             return Err(PointerHandoffErrorKind::InvalidDisplay);
         }
         let remote_is_authoritative = self.workspace_state.active_host == session.remote_host_id()
-            && self.workspace_state.active_display == source_display;
+            && self.workspace.owner_of(source_display) == Some(session.remote_host_id());
         if !remote_is_authoritative && !self.has_local_authority() {
             return Err(PointerHandoffErrorKind::NotAuthoritative);
         }
@@ -2101,6 +2133,13 @@ impl PointerHandoffCoordinator {
             .map(PointerHandoffEffect)
     }
 
+    pub(crate) fn observe_local_pointer(
+        &mut self,
+        pointer: LogicalPointer,
+    ) -> Result<PointerHandoffStatus, PointerHandoffError> {
+        self.core.observe_local_pointer(pointer)
+    }
+
     pub(crate) fn receive_leave(
         &mut self,
         session: &CurrentAdmittedSession,
@@ -2404,6 +2443,7 @@ mod tests {
     const HOST_B: HostId = HostId::from_bytes([0x22; 16]);
     const DISPLAY_A: DisplayId = DisplayId::from_bytes([0x33; 16]);
     const DISPLAY_B: DisplayId = DisplayId::from_bytes([0x44; 16]);
+    const DISPLAY_B_SECONDARY: DisplayId = DisplayId::from_bytes([0x55; 16]);
 
     #[derive(Clone, Debug, Eq, PartialEq)]
     struct TestSession {
@@ -2457,6 +2497,29 @@ mod tests {
                 [
                     WorkspaceLink::new(DISPLAY_A, Edge::Right, DISPLAY_B, Edge::Left),
                     WorkspaceLink::new(DISPLAY_B, Edge::Left, DISPLAY_A, Edge::Right),
+                ],
+            )
+            .unwrap()
+    }
+
+    fn multi_monitor_workspace(compiler: &mut ConfiguredWorkspaceCompiler) -> ConfiguredWorkspace {
+        compiler
+            .compile_candidate(
+                [
+                    display(DISPLAY_A, HOST_A, 100.0, 100.0),
+                    display(DISPLAY_B, HOST_B, 100.0, 200.0),
+                    display(DISPLAY_B_SECONDARY, HOST_B, 100.0, 100.0),
+                ],
+                [
+                    WorkspacePlacement::new(DISPLAY_A, Point::new(0.0, 0.0)),
+                    WorkspacePlacement::new(DISPLAY_B, Point::new(100.0, 0.0)),
+                    WorkspacePlacement::new(DISPLAY_B_SECONDARY, Point::new(-100.0, 0.0)),
+                ],
+                [
+                    WorkspaceLink::new(DISPLAY_A, Edge::Right, DISPLAY_B, Edge::Left),
+                    WorkspaceLink::new(DISPLAY_B, Edge::Left, DISPLAY_A, Edge::Right),
+                    WorkspaceLink::new(DISPLAY_A, Edge::Left, DISPLAY_B_SECONDARY, Edge::Right),
+                    WorkspaceLink::new(DISPLAY_B_SECONDARY, Edge::Right, DISPLAY_A, Edge::Left),
                 ],
             )
             .unwrap()
@@ -2543,6 +2606,54 @@ mod tests {
         assert_eq!(pair.b.workspace_state.active_host, HOST_B);
         assert!(!pair.a.has_local_authority());
         assert!(pair.b.has_local_authority());
+    }
+
+    #[test]
+    fn authoritative_host_can_return_from_a_different_local_monitor() {
+        let mut compiler_a = ConfiguredWorkspaceCompiler::new();
+        let workspace_a = multi_monitor_workspace(&mut compiler_a);
+        let mut compiler_b = ConfiguredWorkspaceCompiler::new();
+        let workspace_b = multi_monitor_workspace(&mut compiler_b);
+        let mut pair = pair_with_workspaces(workspace_a, workspace_b);
+
+        handoff_a_to_b(&mut pair, 1);
+        assert_eq!(pair.a.workspace_state.active_display, DISPLAY_B);
+        assert_eq!(pair.b.workspace_state.active_display, DISPLAY_B);
+
+        assert_eq!(
+            pair.b
+                .observe_local_pointer(LogicalPointer::new(DISPLAY_B_SECONDARY, 100.0, 50.0,))
+                .unwrap(),
+            PointerHandoffStatus::Applied
+        );
+        assert_eq!(pair.b.workspace_state.active_display, DISPLAY_B_SECONDARY);
+        // The other host still has the last cross-host display until the
+        // authenticated leave/enter pair communicates this local transition.
+        assert_eq!(pair.a.workspace_state.active_display, DISPLAY_B);
+
+        let leave_effect = pair
+            .b
+            .propose_leave(&pair.session_b, Edge::Right, 0.5, 2)
+            .unwrap();
+        let leave = leave_message(&leave_effect);
+        pair.a.receive_leave(&pair.session_a, leave, 2).unwrap();
+        let enter_effect = next_effect(pair.b.effect_sent(leave_effect, 2).unwrap());
+        let enter = enter_message(&enter_effect);
+        let ack_effect = pair.a.receive_enter(&pair.session_a, enter, 2).unwrap();
+        pair.b.effect_sent(enter_effect, 2).unwrap();
+        let ack = ack_message(&ack_effect);
+        pair.a.effect_sent(ack_effect, 2).unwrap();
+        let commit_effect = commit_effect(pair.b.receive_ack(&pair.session_b, ack, 2).unwrap());
+        let commit = commit_message(&commit_effect);
+        pair.b
+            .dispatch_effect(commit_effect, 2, |_message, _local| Ok::<(), ()>(()))
+            .unwrap();
+        pair.a.receive_commit(&pair.session_a, commit, 2).unwrap();
+
+        assert_eq!(pair.a.workspace_state.active_host, HOST_A);
+        assert_eq!(pair.b.workspace_state.active_host, HOST_A);
+        assert_eq!(pair.a.workspace_state.active_display, DISPLAY_A);
+        assert_eq!(pair.b.workspace_state.active_display, DISPLAY_A);
     }
 
     fn leave_message<B>(effect: &CoreEffect<B>) -> PointerLeaveV1 {

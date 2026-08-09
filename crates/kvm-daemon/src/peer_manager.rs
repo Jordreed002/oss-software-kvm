@@ -24,7 +24,7 @@ use kvm_network::{
 use kvm_protocol::{WireHostId, WirePeerId};
 use kvm_security::{PairedPeer, PeerIdentity};
 use kvm_topology::{WorkspaceLink, WorkspacePlacement};
-use kvm_types::{DeviceId, DeviceRoute, Display, Edge, InputDevice, PeerId};
+use kvm_types::{DeviceId, DeviceRoute, Display, Edge, InputDevice, PeerId, Point};
 use thiserror::Error;
 use tokio::sync::{mpsc, watch};
 
@@ -452,6 +452,19 @@ where
             || routing.workspace.active_host == routing.workspace.local_host)
     }
 
+    /// Returns the destination's trusted native cursor position when this host
+    /// owns visible pointer authority.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error until workspace control is attached.
+    pub fn local_pointer_position(&self) -> Result<Option<Point>, PeerManagerError> {
+        self.workspace
+            .as_ref()
+            .ok_or(PeerManagerError::WorkspaceRequired)
+            .map(crate::workspace_control::WorkspaceControlPlane::local_pointer_native_position)
+    }
+
     /// Synchronously routes one trusted capture decision through the sole
     /// selected supervisor and its exact admitted FIFO.
     ///
@@ -472,7 +485,7 @@ where
         {
             captured.native_pointer_position().and_then(|position| {
                 self.workspace
-                    .as_ref()
+                    .as_mut()
                     .and_then(|workspace| workspace.native_pointer_boundary(position))
             })
         } else {

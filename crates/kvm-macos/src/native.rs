@@ -250,6 +250,9 @@ extern "C" {
     fn CGEventTapEnable(tap: CFMachPortRef, enable: bool);
     fn CGEventTapIsEnabled(tap: CFMachPortRef) -> bool;
 
+    fn CGAssociateMouseAndMouseCursorPosition(connected: bool) -> i32;
+    fn CGWarpMouseCursorPosition(position: CGPoint) -> i32;
+
     fn CGMainDisplayID() -> u32;
     fn CGDisplayHideCursor(display: u32) -> i32;
     fn CGDisplayShowCursor(display: u32) -> i32;
@@ -868,20 +871,35 @@ impl MacInputBackend {
         // SAFETY: CoreGraphics cursor visibility calls retain no references.
         // We issue exactly one matching show for each successful hide.
         let display = unsafe { CGMainDisplayID() };
-        let status = unsafe {
-            if visible {
-                CGDisplayShowCursor(display)
+        let status = if visible {
+            // Re-associate before revealing the cursor so the first local
+            // delta after an authority handoff has exactly one destination.
+            let association = unsafe { CGAssociateMouseAndMouseCursorPosition(true) };
+            let visibility = unsafe { CGDisplayShowCursor(display) };
+            if association == CG_ERROR_SUCCESS {
+                visibility
             } else {
-                CGDisplayHideCursor(display)
+                association
+            }
+        } else {
+            let visibility = unsafe { CGDisplayHideCursor(display) };
+            if visibility == CG_ERROR_SUCCESS {
+                // A HID event tap suppresses the event delivered to Quartz,
+                // but WindowServer may already have advanced the cursor for a
+                // trackpad delta. Disassociation freezes the inactive cursor
+                // while the same physical deltas continue to route remotely.
+                let association = unsafe { CGAssociateMouseAndMouseCursorPosition(false) };
+                if association != CG_ERROR_SUCCESS {
+                    let _ = unsafe { CGDisplayShowCursor(display) };
+                }
+                association
+            } else {
+                visibility
             }
         };
         if status != CG_ERROR_SUCCESS {
             return Err(MacBackendError::NativeStatus {
-                operation: if visible {
-                    "CGDisplayShowCursor"
-                } else {
-                    "CGDisplayHideCursor"
-                },
+                operation: "CG cursor authority update",
                 code: status,
             }
             .into());
@@ -942,6 +960,27 @@ impl InputCaptureBackend for MacInputBackend {
 
     fn set_cursor_visible(&mut self, visible: bool) -> Result<(), PlatformError> {
         self.update_cursor_visibility(visible)
+    }
+
+    fn set_cursor_position(&mut self, position: Point) -> Result<(), PlatformError> {
+        if !position.x.is_finite() || !position.y.is_finite() {
+            return Err(MacBackendError::CaptureDiscontinuity.into());
+        }
+        let status = unsafe {
+            CGWarpMouseCursorPosition(CGPoint {
+                x: position.x,
+                y: position.y,
+            })
+        };
+        if status == CG_ERROR_SUCCESS {
+            Ok(())
+        } else {
+            Err(MacBackendError::NativeStatus {
+                operation: "CGWarpMouseCursorPosition",
+                code: status,
+            }
+            .into())
+        }
     }
 }
 

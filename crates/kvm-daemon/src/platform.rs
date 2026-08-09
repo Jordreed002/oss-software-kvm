@@ -152,6 +152,20 @@ pub trait InputCaptureBackend: Send {
             .into())
         }
     }
+
+    /// Places the local cursor at a trusted native screen coordinate before
+    /// pointer authority becomes visible on this host.
+    ///
+    /// # Errors
+    ///
+    /// Returns a platform error when the coordinate cannot be established.
+    fn set_cursor_position(&mut self, _position: Point) -> Result<(), PlatformError> {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "cursor positioning is unavailable",
+        )
+        .into())
+    }
 }
 
 /// Injects canonical input received from an authenticated remote peer.

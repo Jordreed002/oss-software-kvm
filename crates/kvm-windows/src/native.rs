@@ -54,9 +54,9 @@ use windows::Win32::UI::Input::{
 use windows::Win32::UI::WindowsAndMessaging::{
     CallNextHookEx, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetCursorPos,
     GetMessageW, GetWindowThreadProcessId, PeekMessageW, PostMessageW, PostThreadMessageW,
-    SetWindowsHookExW, ShowCursor, TranslateMessage, UnhookWindowsHookEx, HHOOK, HWND_MESSAGE,
-    KBDLLHOOKSTRUCT, LLKHF_EXTENDED, LLKHF_INJECTED, LLKHF_UP, MONITORINFOF_PRIMARY, MSG,
-    MSLLHOOKSTRUCT, PM_NOREMOVE, WH_KEYBOARD_LL, WH_MOUSE_LL, WINDOW_EX_STYLE, WINDOW_STYLE,
+    SetCursorPos, SetWindowsHookExW, ShowCursor, TranslateMessage, UnhookWindowsHookEx, HHOOK,
+    HWND_MESSAGE, KBDLLHOOKSTRUCT, LLKHF_EXTENDED, LLKHF_INJECTED, LLKHF_UP, MONITORINFOF_PRIMARY,
+    MSG, MSLLHOOKSTRUCT, PM_NOREMOVE, WH_KEYBOARD_LL, WH_MOUSE_LL, WINDOW_EX_STYLE, WINDOW_STYLE,
     WM_APP, WM_INPUT, WM_INPUT_DEVICE_CHANGE, WM_KEYDOWN, WM_KEYUP, WM_LBUTTONDBLCLK,
     WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDBLCLK, WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEHWHEEL,
     WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_QUIT, WM_RBUTTONDBLCLK, WM_RBUTTONDOWN, WM_RBUTTONUP,
@@ -1346,6 +1346,24 @@ impl InputCaptureBackend for WindowsInputBackend {
     fn set_cursor_visible(&mut self, visible: bool) -> Result<(), PlatformError> {
         self.update_cursor_visibility(visible)
             .map_err(|error| Box::new(error) as PlatformError)
+    }
+
+    fn set_cursor_position(&mut self, position: Point) -> Result<(), PlatformError> {
+        if !position.x.is_finite()
+            || !position.y.is_finite()
+            || position.x < f64::from(i32::MIN)
+            || position.x > f64::from(i32::MAX)
+            || position.y < f64::from(i32::MIN)
+            || position.y > f64::from(i32::MAX)
+        {
+            return Err(Box::new(WindowsBackendError::InvalidInput(
+                "cursor position is outside the Windows coordinate range",
+            )) as PlatformError);
+        }
+        #[allow(clippy::cast_possible_truncation)]
+        let (x, y) = (position.x.round() as i32, position.y.round() as i32);
+        unsafe { SetCursorPos(x, y) }
+            .map_err(|error| Box::new(binding_error("SetCursorPos", &error)) as PlatformError)
     }
 }
 

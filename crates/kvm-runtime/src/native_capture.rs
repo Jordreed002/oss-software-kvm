@@ -10,6 +10,7 @@ use kvm_daemon::{
     CaptureCallback, CaptureDisposition, CaptureLifecycleState, CapturedInput, InputCaptureBackend,
     OutboundPeer, OutputInjectionBackend, PeerManager, PeerManagerError,
 };
+use kvm_types::Point;
 
 /// Serialized routing authority used by the native callback bridge.
 ///
@@ -49,6 +50,15 @@ pub trait NativeCaptureRouter: Send {
     ///
     /// Returns an implementation-defined, caller-redacted observation error.
     fn local_pointer_authority(&self) -> Result<bool, Self::Error>;
+
+    /// Returns the trusted native landing coordinate for local authority.
+    ///
+    /// # Errors
+    ///
+    /// Returns an implementation-defined observation error.
+    fn local_pointer_position(&self) -> Result<Option<Point>, Self::Error> {
+        Ok(None)
+    }
 }
 
 impl<I, O> NativeCaptureRouter for PeerManager<I, O>
@@ -76,6 +86,10 @@ where
 
     fn local_pointer_authority(&self) -> Result<bool, Self::Error> {
         self.local_pointer_authority()
+    }
+
+    fn local_pointer_position(&self) -> Result<Option<Point>, Self::Error> {
+        self.local_pointer_position()
     }
 }
 
@@ -389,16 +403,34 @@ where
     }
 
     fn sync_cursor_visibility(&mut self, now_ns: u64) -> Result<(), NativeCaptureError> {
-        let local_authority = self
-            .router
-            .lock()
-            .map_err(|_| NativeCaptureError::new(NativeCaptureErrorKind::Cursor))?
-            .local_pointer_authority()
-            .map_err(|_| NativeCaptureError::new(NativeCaptureErrorKind::Cursor))?;
+        let (local_authority, local_position) = {
+            let router = self
+                .router
+                .lock()
+                .map_err(|_| NativeCaptureError::new(NativeCaptureErrorKind::Cursor))?;
+            let local_authority = router
+                .local_pointer_authority()
+                .map_err(|_| NativeCaptureError::new(NativeCaptureErrorKind::Cursor))?;
+            let local_position = if local_authority {
+                router
+                    .local_pointer_position()
+                    .map_err(|_| NativeCaptureError::new(NativeCaptureErrorKind::Cursor))?
+            } else {
+                None
+            };
+            (local_authority, local_position)
+        };
         if self.cursor_visible == local_authority {
             return Ok(());
         }
-        if self.backend.set_cursor_visible(local_authority).is_err() {
+        let position_result = if local_authority {
+            local_position.map_or(Ok(()), |position| {
+                self.backend.set_cursor_position(position)
+            })
+        } else {
+            Ok(())
+        };
+        if position_result.is_err() || self.backend.set_cursor_visible(local_authority).is_err() {
             self.callback_armed.store(false, Ordering::Release);
             let _ = self.gate_router(now_ns);
             let _ = self.backend.set_cursor_visible(true);
@@ -555,6 +587,11 @@ mod tests {
             lock(&self.control).cursor_visible = visible;
             Ok(())
         }
+
+        fn set_cursor_position(&mut self, _position: Point) -> Result<(), PlatformError> {
+            lock(&self.events).push("cursor_warp");
+            Ok(())
+        }
     }
 
     struct FakeRouter {
@@ -564,6 +601,7 @@ mod tests {
         fail_rearm: bool,
         last_route_now_ns: Option<u64>,
         local_authority: bool,
+        local_position: Option<Point>,
     }
 
     impl NativeCaptureRouter for FakeRouter {
@@ -600,6 +638,10 @@ mod tests {
 
         fn local_pointer_authority(&self) -> Result<bool, Self::Error> {
             Ok(self.local_authority)
+        }
+
+        fn local_pointer_position(&self) -> Result<Option<Point>, Self::Error> {
+            Ok(self.local_position)
         }
     }
 
@@ -640,6 +682,7 @@ mod tests {
             fail_rearm: false,
             last_route_now_ns: None,
             local_authority: true,
+            local_position: None,
         }));
         let backend = FakeBackend {
             control: Arc::clone(&backend_control),
@@ -719,6 +762,28 @@ mod tests {
         assert_eq!(
             *lock(&events),
             vec!["cursor_hide", "gate", "cursor_show", "stop"]
+        );
+    }
+
+    #[test]
+    fn returning_authority_warps_before_revealing_the_cursor() {
+        let (mut supervisor, backend, router, events) = fixture(CaptureDisposition::AllowLocal);
+        supervisor.start(10).unwrap();
+        lock(&events).clear();
+
+        lock(&router).local_authority = false;
+        supervisor.poll_lifecycle(20).unwrap();
+        {
+            let mut router = lock(&router);
+            router.local_authority = true;
+            router.local_position = Some(Point::new(1922.0, 540.0));
+        }
+        supervisor.poll_lifecycle(30).unwrap();
+
+        assert!(lock(&backend).cursor_visible);
+        assert_eq!(
+            *lock(&events),
+            vec!["cursor_hide", "cursor_warp", "cursor_show"]
         );
     }
 
