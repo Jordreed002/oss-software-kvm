@@ -8,6 +8,7 @@ mod display;
 mod geometry;
 mod host;
 mod id;
+mod keyboard;
 mod workspace;
 
 pub use device::{DeviceCapabilities, DeviceKind, DeviceRoute, InputDevice};
@@ -15,4 +16,5 @@ pub use display::Display;
 pub use geometry::{Edge, Point, Rect, Size};
 pub use host::{Host, Platform};
 pub use id::{DeviceId, DisplayId, HostId, ParseIdError, PeerId};
+pub use keyboard::KeyboardMode;
 pub use workspace::{LogicalPointer, WorkspaceState};

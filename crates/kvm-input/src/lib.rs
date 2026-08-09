@@ -19,9 +19,9 @@ pub use event::{ButtonState, InputEvent, InputPayload, KeyState, PointerButton};
 pub use key::KeyCode;
 pub use pressed::PressedState;
 pub use semantic::{
-    native_binding, resolve, translate, KeyboardMode, ModifierTracker, Modifiers, SemanticCommand,
-    Shortcut,
+    native_binding, resolve, translate, ModifierTracker, Modifiers, SemanticCommand, Shortcut,
 };
+pub use kvm_types::KeyboardMode;
 
 #[cfg(feature = "latency")]
 pub use instrumentation::{LatencyHistory, LatencyStage, LatencyStamps, LatencyStats};
