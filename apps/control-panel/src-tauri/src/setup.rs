@@ -40,6 +40,12 @@ const TRUST_FILE: &str = "selected-peer.der";
 const CONTROL_FILE: &str = "runtime.control";
 const RUNTIME_LOG_FILE: &str = "runtime.log";
 const MAX_RUNTIME_LOG_READ: u64 = 16 * 1024;
+/// Maximum decoded peer-bundle size (matches the import-bundle byte cap).
+const MAX_PEER_BUNDLE_BYTES: usize = 64 * 1024;
+/// Upper bound on the base64 (URL-safe, no-pad) bundle text *before* decoding:
+/// every 3 bytes encode to 4 chars, plus slack for whitespace and rounding. This
+/// lets an oversized paste be rejected without allocating the full decode (F-23).
+const MAX_PEER_BUNDLE_INPUT_CHARS: usize = MAX_PEER_BUNDLE_BYTES * 4 / 3 + 16;
 #[cfg(windows)]
 // Keep credentials separate from WebView2's profile in the app-data root.
 const WINDOWS_SETUP_DIRECTORY: &str = "runtime";
@@ -399,10 +405,16 @@ impl SetupService {
     }
 
     fn validate_peer_bundle(&self, bundle: &str) -> Result<(PairingBundle, Vec<u8>), String> {
+        let trimmed = bundle.trim();
+        // F-23: bound the input text length before base64 allocation so an
+        // oversized paste can't force a large transient allocation.
+        if trimmed.len() > MAX_PEER_BUNDLE_INPUT_CHARS {
+            return Err(coarse_error());
+        }
         let raw = URL_SAFE_NO_PAD
-            .decode(bundle.trim())
+            .decode(trimmed)
             .map_err(|_| coarse_error())?;
-        if raw.len() > 64 * 1024 {
+        if raw.len() > MAX_PEER_BUNDLE_BYTES {
             return Err(coarse_error());
         }
         let peer: PairingBundle = serde_json::from_slice(&raw).map_err(|_| coarse_error())?;

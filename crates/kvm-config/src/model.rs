@@ -120,6 +120,9 @@ impl Config {
             .map(|placement| placement.display_id)
             .collect();
         for placement in &self.topology.displays {
+            if placement.display_id.into_bytes() == [0; 16] {
+                return invalid("display placement display identifier must be non-nil");
+            }
             if !placement.x.is_finite() || !placement.y.is_finite() {
                 return invalid("display placement coordinates must be finite");
             }
@@ -132,6 +135,10 @@ impl Config {
             "topology source display edge",
         )?;
         for link in &self.topology.links {
+            if link.from_display.into_bytes() == [0; 16] || link.to_display.into_bytes() == [0; 16]
+            {
+                return invalid("topology link display identifiers must be non-nil");
+            }
             if link.from_display == link.to_display {
                 return invalid("a topology link cannot connect a display to itself");
             }

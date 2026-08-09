@@ -404,6 +404,8 @@ where
         self.engine.active_generation()
     }
 
+    /// In-flight generation awaiting `confirm_remote_input`, if any.
+    #[must_use]
     pub(crate) const fn pending_generation(&self) -> Option<ConnectionGeneration> {
         self.engine.gate.pending_generation()
     }
