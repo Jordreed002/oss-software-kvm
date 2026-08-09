@@ -129,6 +129,29 @@ pub trait InputCaptureBackend: Send {
     fn capture_lifecycle(&self) -> CaptureLifecycleState {
         CaptureLifecycleState::Unknown
     }
+
+    /// Shows or hides the local system cursor for pointer-authority changes.
+    ///
+    /// Suppressible whole-host backends should override this operation and
+    /// must restore visibility during capture teardown, including failed or
+    /// partial teardown. Observation-only adapters may use the default
+    /// implementation, which supports the safe visible state only.
+    ///
+    /// # Errors
+    ///
+    /// Returns a platform error when the requested visibility cannot be
+    /// established.
+    fn set_cursor_visible(&mut self, visible: bool) -> Result<(), PlatformError> {
+        if visible {
+            Ok(())
+        } else {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "cursor hiding is unavailable",
+            )
+            .into())
+        }
+    }
 }
 
 /// Injects canonical input received from an authenticated remote peer.

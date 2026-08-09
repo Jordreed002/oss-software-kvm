@@ -29,7 +29,7 @@ const INITIAL_DISPLAY_REVISION: u64 = 1;
 const INITIAL_DEVICE_REVISION: u64 = 2;
 const INITIAL_NOW_NS: u64 = 1;
 const POINTER_HANDOFF_TIMEOUT: Duration = Duration::from_secs(2);
-const SERVICE_TICK: Duration = Duration::from_millis(20);
+const SERVICE_TICK: Duration = Duration::from_millis(8);
 const SHUTDOWN_SETTLE_TIMEOUT: Duration = Duration::from_secs(3);
 
 struct PreparedWorkspace {

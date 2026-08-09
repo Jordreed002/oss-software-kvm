@@ -419,6 +419,19 @@ where
             .ok_or(PeerManagerError::InvalidIdentity)
     }
 
+    /// Reports whether this host currently owns visible pointer authority.
+    ///
+    /// This observation is intended for the runtime-owned native cursor
+    /// visibility bridge. It grants no routing or dispatch capability.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error until the selected workspace is attached.
+    pub fn local_pointer_authority(&self) -> Result<bool, PeerManagerError> {
+        let routing = self.selected_routing_handle()?.load();
+        Ok(routing.workspace.active_host == routing.workspace.local_host)
+    }
+
     /// Synchronously routes one trusted capture decision through the sole
     /// selected supervisor and its exact admitted FIFO.
     ///

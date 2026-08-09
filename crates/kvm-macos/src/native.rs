@@ -251,6 +251,10 @@ extern "C" {
     fn CGEventTapEnable(tap: CFMachPortRef, enable: bool);
     fn CGEventTapIsEnabled(tap: CFMachPortRef) -> bool;
 
+    fn CGMainDisplayID() -> u32;
+    fn CGDisplayHideCursor(display: u32) -> i32;
+    fn CGDisplayShowCursor(display: u32) -> i32;
+
     fn CGGetActiveDisplayList(max_displays: u32, displays: *mut u32, count: *mut u32) -> i32;
     fn CGDisplayBounds(display: u32) -> CGRect;
     fn CGDisplayPixelsWide(display: u32) -> usize;
@@ -469,6 +473,7 @@ pub struct MacInputBackend {
     capture: Option<CaptureSession>,
     whole_host_capture: Option<WholeHostCaptureSession>,
     counters: Arc<CaptureCounters>,
+    cursor_hidden: bool,
 }
 
 impl MacInputBackend {
@@ -480,6 +485,7 @@ impl MacInputBackend {
             capture: None,
             whole_host_capture: None,
             counters: Arc::new(CaptureCounters::default()),
+            cursor_hidden: false,
         }
     }
 
@@ -495,6 +501,7 @@ impl MacInputBackend {
             capture: None,
             whole_host_capture: None,
             counters: Arc::new(CaptureCounters::default()),
+            cursor_hidden: false,
         }
     }
 
@@ -787,8 +794,9 @@ impl MacInputBackend {
     }
 
     fn stop_whole_host_alpha(&mut self) -> Result<(), PlatformError> {
+        let cursor_result = self.update_cursor_visibility(true);
         let Some(mut session) = self.whole_host_capture.take() else {
-            return Ok(());
+            return cursor_result;
         };
         if let Some(controller) = &session.controller {
             controller.deactivate();
@@ -818,11 +826,48 @@ impl MacInputBackend {
         if self.counters.health() == CaptureHealth::Running {
             self.counters.set_health(CaptureHealth::Stopped);
         }
-        session
+        let capture_result = session
             .capture_outcome
             .take()
             .unwrap_or(Ok(()))
-            .map_err(Into::into)
+            .map_err(Into::into);
+        cursor_result.and(capture_result)
+    }
+
+    fn update_cursor_visibility(&mut self, visible: bool) -> Result<(), PlatformError> {
+        if visible != self.cursor_hidden {
+            return Ok(());
+        }
+        if self.capture_mode != MacCaptureMode::WholeHostAlpha {
+            return Err(MacBackendError::NotImplemented {
+                feature: "cursor visibility",
+                reason: "requires whole-host capture mode",
+            }
+            .into());
+        }
+        // SAFETY: CoreGraphics cursor visibility calls retain no references.
+        // We issue exactly one matching show for each successful hide.
+        let display = unsafe { CGMainDisplayID() };
+        let status = unsafe {
+            if visible {
+                CGDisplayShowCursor(display)
+            } else {
+                CGDisplayHideCursor(display)
+            }
+        };
+        if status != CG_ERROR_SUCCESS {
+            return Err(MacBackendError::NativeStatus {
+                operation: if visible {
+                    "CGDisplayShowCursor"
+                } else {
+                    "CGDisplayHideCursor"
+                },
+                code: status,
+            }
+            .into());
+        }
+        self.cursor_hidden = !visible;
+        Ok(())
     }
 
     fn lifecycle_state(&self) -> CaptureLifecycleState {
@@ -872,6 +917,10 @@ impl InputCaptureBackend for MacInputBackend {
 
     fn capture_lifecycle(&self) -> CaptureLifecycleState {
         self.lifecycle_state()
+    }
+
+    fn set_cursor_visible(&mut self, visible: bool) -> Result<(), PlatformError> {
+        self.update_cursor_visibility(visible)
     }
 }
 

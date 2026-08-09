@@ -42,6 +42,13 @@ pub trait NativeCaptureRouter: Send {
         lifecycle: CaptureLifecycleState,
         now_ns: u64,
     ) -> Result<(), Self::Error>;
+
+    /// Returns whether the local host owns current pointer authority.
+    ///
+    /// # Errors
+    ///
+    /// Returns an implementation-defined, caller-redacted observation error.
+    fn local_pointer_authority(&self) -> Result<bool, Self::Error>;
 }
 
 impl<I, O> NativeCaptureRouter for PeerManager<I, O>
@@ -65,6 +72,10 @@ where
         _now_ns: u64,
     ) -> Result<(), Self::Error> {
         self.rearm_native_capture(lifecycle)
+    }
+
+    fn local_pointer_authority(&self) -> Result<bool, Self::Error> {
+        self.local_pointer_authority()
     }
 }
 
@@ -90,6 +101,7 @@ pub enum NativeCaptureErrorKind {
     Lifecycle,
     Rearm,
     Stop,
+    Cursor,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -147,6 +159,7 @@ impl fmt::Display for NativeCaptureError {
             NativeCaptureErrorKind::Lifecycle => "native capture lifecycle is not running",
             NativeCaptureErrorKind::Rearm => "native capture routing could not be rearmed",
             NativeCaptureErrorKind::Stop => "native capture could not be stopped",
+            NativeCaptureErrorKind::Cursor => "native cursor visibility could not be updated",
         })
     }
 }
@@ -160,6 +173,7 @@ pub struct NativeCaptureSupervisor<B, R> {
     callback_armed: Arc<AtomicBool>,
     metrics: Arc<SharedCaptureMetrics>,
     state: NativeCaptureState,
+    cursor_visible: bool,
 }
 
 impl<B, R> Drop for NativeCaptureSupervisor<B, R> {
@@ -197,6 +211,7 @@ where
             callback_armed: Arc::new(AtomicBool::new(false)),
             metrics: Arc::new(SharedCaptureMetrics::default()),
             state: NativeCaptureState::LocalOnly,
+            cursor_visible: true,
         }
     }
 
@@ -283,11 +298,16 @@ where
             return Ok(self.state);
         }
         if self.backend.capture_lifecycle() == CaptureLifecycleState::Running {
+            self.sync_cursor_visibility(now_ns)?;
             return Ok(self.state);
         }
 
         self.callback_armed.store(false, Ordering::Release);
         let _ = self.gate_router(now_ns);
+        if !self.cursor_visible {
+            let _ = self.backend.set_cursor_visible(true);
+        }
+        self.cursor_visible = true;
         let _ = self.backend.stop_capture();
         self.state = NativeCaptureState::Degraded;
         Err(NativeCaptureError::new(NativeCaptureErrorKind::Lifecycle))
@@ -308,6 +328,10 @@ where
 
         self.callback_armed.store(false, Ordering::Release);
         let gate_result = self.gate_router(now_ns);
+        if !self.cursor_visible {
+            let _ = self.backend.set_cursor_visible(true);
+        }
+        self.cursor_visible = true;
         let stop_result = self.backend.stop_capture();
         if stop_result.is_err() {
             self.state = NativeCaptureState::Degraded;
@@ -350,6 +374,29 @@ where
         router
             .rearm_capture(lifecycle, now_ns)
             .map_err(|_| NativeCaptureError::new(NativeCaptureErrorKind::Rearm))
+    }
+
+    fn sync_cursor_visibility(&mut self, now_ns: u64) -> Result<(), NativeCaptureError> {
+        let local_authority = self
+            .router
+            .lock()
+            .map_err(|_| NativeCaptureError::new(NativeCaptureErrorKind::Cursor))?
+            .local_pointer_authority()
+            .map_err(|_| NativeCaptureError::new(NativeCaptureErrorKind::Cursor))?;
+        if self.cursor_visible == local_authority {
+            return Ok(());
+        }
+        if self.backend.set_cursor_visible(local_authority).is_err() {
+            self.callback_armed.store(false, Ordering::Release);
+            let _ = self.gate_router(now_ns);
+            let _ = self.backend.set_cursor_visible(true);
+            self.cursor_visible = true;
+            let _ = self.backend.stop_capture();
+            self.state = NativeCaptureState::Degraded;
+            return Err(NativeCaptureError::new(NativeCaptureErrorKind::Cursor));
+        }
+        self.cursor_visible = local_authority;
+        Ok(())
     }
 }
 
@@ -443,6 +490,7 @@ mod tests {
         fail_start: bool,
         fail_stop: bool,
         start_disposition: Option<CaptureDisposition>,
+        cursor_visible: bool,
     }
 
     struct FakeBackend {
@@ -485,6 +533,16 @@ mod tests {
         fn capture_lifecycle(&self) -> CaptureLifecycleState {
             lock(&self.control).lifecycle
         }
+
+        fn set_cursor_visible(&mut self, visible: bool) -> Result<(), PlatformError> {
+            lock(&self.events).push(if visible {
+                "cursor_show"
+            } else {
+                "cursor_hide"
+            });
+            lock(&self.control).cursor_visible = visible;
+            Ok(())
+        }
     }
 
     struct FakeRouter {
@@ -493,6 +551,7 @@ mod tests {
         fail_gate: bool,
         fail_rearm: bool,
         last_route_now_ns: Option<u64>,
+        local_authority: bool,
     }
 
     impl NativeCaptureRouter for FakeRouter {
@@ -526,6 +585,10 @@ mod tests {
                 Ok(())
             }
         }
+
+        fn local_pointer_authority(&self) -> Result<bool, Self::Error> {
+            Ok(self.local_authority)
+        }
     }
 
     fn captured() -> CapturedInput {
@@ -554,6 +617,7 @@ mod tests {
     fn fixture(disposition: CaptureDisposition) -> Fixture {
         let backend_control = Arc::new(Mutex::new(BackendControl {
             lifecycle: CaptureLifecycleState::Running,
+            cursor_visible: true,
             ..BackendControl::default()
         }));
         let router_events = Arc::new(Mutex::new(Vec::new()));
@@ -563,6 +627,7 @@ mod tests {
             fail_gate: false,
             fail_rearm: false,
             last_route_now_ns: None,
+            local_authority: true,
         }));
         let backend = FakeBackend {
             control: Arc::clone(&backend_control),
@@ -624,6 +689,25 @@ mod tests {
         let routed_at = lock(&router).last_route_now_ns.unwrap();
         assert!(routed_at >= 10);
         assert_ne!(routed_at, u64::MAX);
+    }
+
+    #[test]
+    fn cursor_visibility_tracks_pointer_authority_and_restores_on_shutdown() {
+        let (mut supervisor, backend, router, events) = fixture(CaptureDisposition::AllowLocal);
+        supervisor.start(10).unwrap();
+        lock(&events).clear();
+
+        lock(&router).local_authority = false;
+        supervisor.poll_lifecycle(20).unwrap();
+        assert!(!lock(&backend).cursor_visible);
+        assert_eq!(*lock(&events), vec!["cursor_hide"]);
+
+        supervisor.shutdown(30).unwrap();
+        assert!(lock(&backend).cursor_visible);
+        assert_eq!(
+            *lock(&events),
+            vec!["cursor_hide", "gate", "cursor_show", "stop"]
+        );
     }
 
     #[test]
@@ -815,6 +899,10 @@ mod tests {
                 _now_ns: u64,
             ) -> Result<(), Self::Error> {
                 Ok(())
+            }
+
+            fn local_pointer_authority(&self) -> Result<bool, Self::Error> {
+                Ok(true)
             }
         }
 
