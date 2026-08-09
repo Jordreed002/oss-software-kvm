@@ -25,7 +25,7 @@ assignees: ""
 ## Scope check
 
 The first release targets Windows 11 and macOS and explicitly excludes some features. See the
-[Initial scope](../blob/main/README.md#initial-scope) section of the README. The following are
+[Initial scope](https://github.com/Jordreed002/oss-software-kvm/blob/main/README.md#initial-scope) section of the README. The following are
 outside the initial release scope:
 
 - [ ] This request is within the current scope (Windows 11 + macOS, input routing, topology,

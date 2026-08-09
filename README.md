@@ -31,7 +31,7 @@ encrypted over the local network.
 
 ### Repository layout
 
-```
+```text
 .
 ├── crates/                 # Rust workspace members (platform-neutral + native backends)
 │   ├── kvm-input/          #   Platform-neutral input model and state tracking

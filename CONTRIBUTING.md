@@ -36,7 +36,7 @@ toolchain is pinned in [`rust-toolchain.toml`](rust-toolchain.toml).
 
 ```sh
 # Rust workspace
-rustup show          # installs the pinned stable toolchain
+rustup toolchain install stable --profile minimal --component rustfmt --component clippy
 
 # Control panel (apps/control-panel)
 cd apps/control-panel
@@ -101,13 +101,13 @@ maintainer can schedule the physical acceptance pass.
 This project uses [Conventional Commits](https://www.conventionalcommits.org/). Use a lowercase type
 and, where helpful, a scope matching the crate or area:
 
-```
+```text
 <type>(<scope>): <imperative summary>
 ```
 
 Examples from the history of this repo:
 
-```
+```text
 fix(router): fail-closed on a nil workspace host
 feat(control-panel): synchronize paired display maps
 fix(macos): bound whole-host callback with a 100ms tap-dispatch watchdog
