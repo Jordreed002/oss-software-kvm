@@ -363,11 +363,36 @@ impl DisplayInventory {
         if self.active_sessions.get(&binding.remote_host_id) != Some(&binding) {
             return false;
         }
+        let mut records_changed = false;
         if !self.retired_sessions.contains_key(&binding.remote_host_id)
             && self.retired_sessions.len() >= self.config.remote_hosts
         {
-            self.shutdown_remote();
-            return true;
+            // F-05: the retired set is at capacity for a host not already in it.
+            // Evict the oldest retired binding (smallest generation; generations
+            // are process-monotonic and never reused — see activate_remote_binding)
+            // to make room, instead of scorching all remote state via
+            // shutdown_remote(). The previous scorched-earth path set
+            // remote_shutdown = true and dropped every remote record, so a single
+            // reconnect/churn cycle in a small topology permanently disabled
+            // remote inventory until process restart. Eviction only loses the
+            // stale-generation rejection for the oldest host — the bounded LRU
+            // tradeoff — and keeps remote activation available.
+            if let Some(evicted_host) = self
+                .retired_sessions
+                .iter()
+                .min_by_key(|(_, retired)| retired.generation)
+                .map(|(host_id, _)| *host_id)
+            {
+                self.retired_sessions.remove(&evicted_host);
+                if self
+                    .records
+                    .get(&evicted_host)
+                    .is_some_and(|record| matches!(record.source, InventorySource::Remote(_)))
+                {
+                    self.records.remove(&evicted_host);
+                    records_changed = true;
+                }
+            }
         }
         self.active_sessions.remove(&binding.remote_host_id);
         self.retired_sessions
@@ -378,6 +403,9 @@ impl DisplayInventory {
             .is_some_and(|record| record.source == InventorySource::Remote(binding));
         if remove {
             self.records.remove(&binding.remote_host_id);
+            records_changed = true;
+        }
+        if records_changed {
             self.publish();
         }
         true
@@ -1173,7 +1201,7 @@ mod tests {
     }
 
     #[test]
-    fn retired_host_churn_overflow_transitions_to_terminal_shutdown() {
+    fn retired_host_churn_evicts_oldest_instead_of_terminal_shutdown() {
         let local = host(1);
         let config = DisplayInventoryConfig {
             remote_hosts: 1,
@@ -1187,14 +1215,16 @@ mod tests {
         inventory.activate_remote_binding(first).unwrap();
         assert!(inventory.invalidate_remote_binding(first));
         inventory.activate_remote_binding(second).unwrap();
+        // F-05: retired set is full; the oldest retired binding (host2/first)
+        // is evicted rather than scorching all remote state.
         assert!(inventory.invalidate_remote_binding(second));
-        assert!(inventory.remote_shutdown);
-        for session in [first, second, third] {
-            assert_eq!(
-                inventory.activate_remote_binding(session),
-                Err(DisplayInventoryError::SessionMismatch)
-            );
-        }
+        assert!(
+            !inventory.remote_shutdown,
+            "remote inventory must stay available across churn"
+        );
+        // A new distinct host can still activate — previously rejected by the
+        // permanent terminal shutdown.
+        inventory.activate_remote_binding(third).unwrap();
     }
 
     #[test]
