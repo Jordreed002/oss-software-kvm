@@ -1323,9 +1323,9 @@ where
             ));
         }
         let source_display = display_from_wire(message.source_display);
-        if self.workspace_state.active_host != session.remote_host_id()
-            || self.workspace_state.active_display != source_display
-        {
+        let remote_is_authoritative = self.workspace_state.active_host == session.remote_host_id()
+            && self.workspace_state.active_display == source_display;
+        if !remote_is_authoritative && !self.has_local_authority() {
             return Err(PointerHandoffError::new(
                 PointerHandoffErrorKind::NotAuthoritative,
             ));
@@ -1353,9 +1353,9 @@ where
         {
             return Err(PointerHandoffErrorKind::InvalidDisplay);
         }
-        if self.workspace_state.active_host != session.remote_host_id()
-            || self.workspace_state.active_display != source_display
-        {
+        let remote_is_authoritative = self.workspace_state.active_host == session.remote_host_id()
+            && self.workspace_state.active_display == source_display;
+        if !remote_is_authoritative && !self.has_local_authority() {
             return Err(PointerHandoffErrorKind::NotAuthoritative);
         }
         Ok(())
@@ -2504,6 +2504,23 @@ mod tests {
 
         assert_eq!(pair.a.workspace_state.active_host, HOST_B);
         assert_eq!(pair.b.workspace_state.active_host, HOST_B);
+    }
+
+    #[test]
+    fn first_authenticated_handoff_converges_dual_local_startup_authority() {
+        let mut pair = pair();
+        pair.b
+            .workspace_state
+            .set_active_pointer(HOST_B, LogicalPointer::new(DISPLAY_B, 0.0, 75.0));
+        assert!(pair.a.has_local_authority());
+        assert!(pair.b.has_local_authority());
+
+        handoff_a_to_b(&mut pair, 1);
+
+        assert_eq!(pair.a.workspace_state.active_host, HOST_B);
+        assert_eq!(pair.b.workspace_state.active_host, HOST_B);
+        assert!(!pair.a.has_local_authority());
+        assert!(pair.b.has_local_authority());
     }
 
     fn leave_message<B>(effect: &CoreEffect<B>) -> PointerLeaveV1 {
