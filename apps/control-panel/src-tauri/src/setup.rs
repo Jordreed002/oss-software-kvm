@@ -306,8 +306,12 @@ impl SetupService {
             .as_ref()
             .and_then(NearbyDiscovery::take_completed_bundle)
         {
-            self.install_peer_bundle(&bundle).map_err(|_| ())?;
-            setup = self.inner.lock().map_err(|_| ())?.clone();
+            // N-3: a late incoming-pairing completion must not overwrite an
+            // already-configured peer (the victim's own concurrent action).
+            // install_peer_bundle guards atomically under its lock as well.
+            if setup.peer.is_none() && self.install_peer_bundle(&bundle).is_ok() {
+                setup = self.inner.lock().map_err(|_| ())?.clone();
+            }
             if let Some(discovery) = &self.discovery {
                 nearby_machines =
                     discovery.snapshot(setup.peer.as_ref().map(|peer| peer.peer_id.as_str()));
@@ -438,6 +442,13 @@ impl SetupService {
         secure_write(&self.directory.join(TRUST_FILE), &certificate, false)
             .map_err(|()| coarse_error())?;
         let mut setup = self.inner.lock().map_err(|_| coarse_error())?;
+        // N-3: never overwrite an already-configured peer. The command handlers
+        // pre-check this for UX, but the snapshot-driven incoming-completion
+        // path does not; guard atomically under the lock so a late/async
+        // completion cannot silently discard a prior trust decision.
+        if setup.peer.is_some() {
+            return Err(coarse_error());
+        }
         setup.peer = Some(peer);
         setup.configured = false;
         setup.validated = false;

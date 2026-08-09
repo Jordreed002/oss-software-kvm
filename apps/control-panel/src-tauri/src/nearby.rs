@@ -306,7 +306,13 @@ impl NearbyDiscovery {
                             records.insert(record.peer_id.clone(), record);
                         }
                     } else if let Some(packet) = parse_pairing_packet(&buffer[..length]) {
-                        self.handle_pairing_packet(packet, source, &records, now);
+                        self.handle_pairing_packet(
+                            packet,
+                            source,
+                            &records,
+                            now,
+                            paired_peer_id.is_some(),
+                        );
                     }
                 }
                 Err(error) if error.kind() == ErrorKind::WouldBlock => break,
@@ -534,6 +540,7 @@ impl NearbyDiscovery {
         source: SocketAddr,
         records: &BTreeMap<String, NearbyRecord>,
         now: Instant,
+        peer_configured: bool,
     ) {
         if !private_address(source.ip()) || source.port() != DISCOVERY_PORT {
             return;
@@ -552,6 +559,7 @@ impl NearbyDiscovery {
                 source,
                 records,
                 now,
+                peer_configured,
             ),
             PairingPacket::Accept {
                 request_id,
@@ -584,6 +592,7 @@ impl NearbyDiscovery {
         source: SocketAddr,
         records: &BTreeMap<String, NearbyRecord>,
         now: Instant,
+        peer_configured: bool,
     ) {
         let Some(record) = records.get(&from_peer_id) else {
             return;
@@ -593,6 +602,14 @@ impl NearbyDiscovery {
             || !valid_request_id(&request_id)
             || !valid_bundle_shape(&bundle)
         {
+            return;
+        }
+        // N-4: a peer is already configured. Ignore stale or replayed Request
+        // packets so they cannot surface a phantom incoming-pairing prompt
+        // after a completed pairing. Re-pairing clears the configured peer
+        // first, which re-enables incoming requests. The 2-minute request
+        // expiry already bounds this to a UX nuisance; this suppresses it.
+        if peer_configured {
             return;
         }
         let Ok(mut pairing) = self.pairing.lock() else {
