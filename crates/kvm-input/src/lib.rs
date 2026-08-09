@@ -12,6 +12,9 @@ mod semantic;
 #[cfg(feature = "latency")]
 mod instrumentation;
 
+#[cfg(feature = "event-rate")]
+mod event_rate;
+
 pub use event::{ButtonState, InputEvent, InputPayload, KeyState, PointerButton};
 pub use key::KeyCode;
 pub use pressed::PressedState;
@@ -22,3 +25,6 @@ pub use semantic::{
 
 #[cfg(feature = "latency")]
 pub use instrumentation::{LatencyHistory, LatencyStage, LatencyStamps, LatencyStats};
+
+#[cfg(feature = "event-rate")]
+pub use event_rate::{EventRateConfig, EventRateConfigError, EventRateMeter, EventRateSnapshot};

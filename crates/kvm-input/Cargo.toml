@@ -16,6 +16,10 @@ default = []
 ## call sites stamp input events at the five lifecycle stages. It performs no
 ## disk I/O and never touches the real-time input path when disabled.
 latency = []
+## Development-only input-event-rate instrumentation (spec §35 "input event
+## rate"). Off by default: compiles the `event_rate` module with a lock-free
+## sliding-window meter. No disk I/O; a single atomic RMW per recorded event.
+event-rate = []
 
 [dev-dependencies]
 serde_json = "1"
