@@ -404,6 +404,7 @@ where
                     }
                     event = accepted.recv() => {
                         let Some(LanListenerEvent::Accepted { stream }) = event else {
+                            developer_event("transport=listener_events_closed");
                             return Err(RuntimeTransportError::new(RuntimeTransportErrorKind::Task));
                         };
                         developer_event("transport=inbound_tcp_accepted");
@@ -422,9 +423,7 @@ where
                         }
                     }
                     joined = dial_tasks.join_next(), if !dial_tasks.is_empty() => {
-                        let dial = joined
-                            .ok_or_else(|| RuntimeTransportError::new(RuntimeTransportErrorKind::Task))?
-                            .map_err(|_| RuntimeTransportError::new(RuntimeTransportErrorKind::Task))?;
+                        let dial = settled_dial_task(joined)?;
                         if let Some(installed) = finish_dial(
                             &self.manager,
                             &self.admission_factory,
@@ -440,13 +439,14 @@ where
                         }
                     }
                     joined = session_tasks.join_next(), if !session_tasks.is_empty() => {
-                        joined
-                            .ok_or_else(|| RuntimeTransportError::new(RuntimeTransportErrorKind::Task))?
-                            .map_err(|_| RuntimeTransportError::new(RuntimeTransportErrorKind::Task))??;
+                        settle_session_task(joined)?;
                         developer_event("session=task_finished");
                     }
                     _ = tick.tick() => {
-                        service_manager(&self.manager, started)?;
+                        if let Err(error) = service_manager(&self.manager, started) {
+                            developer_event(&format!("transport=manager_tick_failed detail:{error:?}"));
+                            return Err(error);
+                        }
                         report_manager_snapshot(&self.manager, &mut last_manager_snapshot)?;
                         if dial_tasks.is_empty() {
                             if let Some(task) = poll_dial(&self.manager, now_duration(started))? {
@@ -464,6 +464,8 @@ where
             }
         }
         .await;
+
+        report_transport_failure(run_result);
 
         let cleanup_result = finish_transport_tasks(
             &self.manager,
@@ -537,6 +539,46 @@ where
 struct DialResult {
     task: OutboundDialTask,
     result: std::io::Result<RustlsPeerStream>,
+}
+
+fn settled_dial_task(
+    joined: Option<Result<DialResult, tokio::task::JoinError>>,
+) -> Result<DialResult, RuntimeTransportError> {
+    let Some(joined) = joined else {
+        developer_event("transport=dial_set_closed");
+        return Err(RuntimeTransportError::new(RuntimeTransportErrorKind::Task));
+    };
+    let Ok(dial) = joined else {
+        developer_event("transport=dial_task_failed");
+        return Err(RuntimeTransportError::new(RuntimeTransportErrorKind::Task));
+    };
+    Ok(dial)
+}
+
+fn report_transport_failure(result: Result<(), RuntimeTransportError>) {
+    if let Err(error) = result {
+        developer_event(&format!("transport=loop_failed detail:{error:?}"));
+    }
+}
+
+fn settle_session_task(
+    joined: Option<Result<Result<(), RuntimeTransportError>, tokio::task::JoinError>>,
+) -> Result<(), RuntimeTransportError> {
+    let Some(joined) = joined else {
+        developer_event("transport=session_set_closed");
+        return Err(RuntimeTransportError::new(RuntimeTransportErrorKind::Task));
+    };
+    match joined {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(error)) => {
+            developer_event(&format!("transport=session_task_failed detail:{error:?}"));
+            Err(error)
+        }
+        Err(_) => {
+            developer_event("transport=session_task_panicked");
+            Err(RuntimeTransportError::new(RuntimeTransportErrorKind::Task))
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -618,9 +660,13 @@ where
         session_tasks.abort_all();
         while session_tasks.join_next().await.is_some() {}
     }
-    let _ = tokio::time::timeout(SHUTDOWN_SETTLE_TIMEOUT, &mut listener_task).await;
-    if !listener_task.is_finished() {
-        listener_task.abort();
+    match tokio::time::timeout(SHUTDOWN_SETTLE_TIMEOUT, &mut listener_task).await {
+        Ok(Ok(report)) => developer_event(&format!("listener=stopped report:{report:?}")),
+        Ok(Err(_)) => developer_event("listener=task_failed"),
+        Err(_) => {
+            developer_event("listener=shutdown_timed_out");
+            listener_task.abort();
+        }
     }
     settle_result.and(if sessions_drained {
         Ok(())
