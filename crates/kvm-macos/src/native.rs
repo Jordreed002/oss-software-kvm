@@ -983,9 +983,18 @@ impl MacOutputBackend {
             } => {
                 let vertical = rounded_i32(vertical);
                 let horizontal = rounded_i32(horizontal);
-                // SAFETY: CoreGraphics defines the non-variadic `...Event2`
-                // entry point with three fixed wheel values. `wheel_count`
-                // selects the two populated pixel-unit axes; the third is zero.
+                // SAFETY (F-27): the C prototype of CGEventCreateScrollWheelEvent2
+                // is variadic (`...`), but it is declared here with fixed
+                // arguments. This is sound on every supported macOS target:
+                // x86-64 SysV and arm64 AAPCS64 pass leading integer/pointer
+                // arguments in registers identically whether the callee is
+                // variadic or not, and all six arguments here are integers or
+                // pointers (the upstream `core-graphics` crate binds this same
+                // fixed-arg shape for the same reason). A divergence would only
+                // matter on an ABI whose variadic and non-variadic conventions
+                // differ before the `...`, which no macOS target has.
+                // `wheel_count` is 2 and selects the two populated pixel-unit
+                // axes; the third wheel value is zero.
                 let event = unsafe {
                     CGEventCreateScrollWheelEvent2(
                         ptr::null(),
@@ -1392,9 +1401,7 @@ fn dispatch_quartz_event(
             .counters
             .callback_overruns
             .fetch_add(1, Ordering::Relaxed);
-        context
-            .counters
-            .set_health(CaptureHealth::CallbackOverran);
+        context.counters.set_health(CaptureHealth::CallbackOverran);
         terminally_deactivate_whole_host(context);
     }
     if disposition == CaptureDisposition::SuppressLocal

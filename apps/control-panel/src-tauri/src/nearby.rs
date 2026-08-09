@@ -83,7 +83,10 @@ impl fmt::Debug for NearbyPairingDto {
             .field("platform", &self.platform)
             .field("address", &self.address)
             .field("status", &self.status)
-            .field("verification_code_present", &self.verification_code.is_some())
+            .field(
+                "verification_code_present",
+                &self.verification_code.is_some(),
+            )
             .finish_non_exhaustive()
     }
 }
@@ -944,6 +947,31 @@ fn encode_beacon(peer_id: &str, state: &AdvertisementState) -> String {
     )
 }
 
+/// Sends one pairing handshake packet over the shared discovery socket.
+///
+/// # N-2: cleartext UDP pairing is accepted, documented here
+///
+/// Pairing packets (request / accept / confirm / decline) travel as cleartext
+/// JSON over UDP on the LAN discovery port. This is deliberate and bounded:
+///
+/// - The transport is scoped: `target` must be on `DISCOVERY_PORT` and a
+///   private/RFC1918 address, and packets are size-capped. A remote attacker
+///   off-LAN cannot reach it.
+/// - The handshake is mutual-consent: each side's operator must approve, and a
+///   request carries an opaque peer bundle (identity/cert material) that is
+///   *not* trusted on receipt — it becomes a credential only after the operator
+///   confirms.
+/// - Confidentiality of the actual session is not at stake: the data channel
+///   is TLS 1.3 with TOFU leaf-cert pinning (exact SHA-256 `ct_eq`). An on-LAN
+///   observer or active MITM can read or tamper with the *pairing* flow, but
+///   cannot derive the pinned cert and therefore cannot intercept the session.
+///   The worst realistic outcome is a denial/spoof of the pairing UX, which the
+///   operator notices and re-runs.
+///
+/// Moving pairing behind TLS would be circular (TLS is what pairing bootstraps)
+/// unless a separate authenticated channel existed; on a trusted LAN the
+/// cleartext handshake plus operator confirmation plus cert pinning is the
+/// proportionate control.
 fn send_pairing_packet(
     socket: &UdpSocket,
     target: SocketAddr,

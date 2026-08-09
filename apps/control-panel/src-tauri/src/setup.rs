@@ -321,8 +321,8 @@ impl SetupService {
             .discovery
             .as_ref()
             .and_then(NearbyDiscovery::pairing_snapshot);
-        let developer_diagnostics = cfg!(debug_assertions)
-            .then(|| self.developer_diagnostics(&setup));
+        let developer_diagnostics =
+            cfg!(debug_assertions).then(|| self.developer_diagnostics(&setup));
         let host_id = setup
             .local
             .as_ref()
