@@ -112,6 +112,55 @@ struct Advertisement {
     last_sent: Option<Instant>,
 }
 
+#[derive(Clone, Eq, PartialEq)]
+struct WorkspaceAdvertisement {
+    peer_id: String,
+    revision: u64,
+    payload: String,
+    signature: String,
+    last_sent: Option<Instant>,
+}
+
+#[derive(Clone, Eq, PartialEq)]
+struct WorkspaceAcknowledgementAdvertisement {
+    peer_id: String,
+    revision: u64,
+    signature: String,
+    last_sent: Option<Instant>,
+}
+
+pub(crate) struct IncomingWorkspaceLayout {
+    pub(crate) from_peer_id: String,
+    pub(crate) revision: u64,
+    pub(crate) payload: String,
+    pub(crate) signature: String,
+}
+
+impl fmt::Debug for IncomingWorkspaceLayout {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("IncomingWorkspaceLayout")
+            .field("payload_bytes", &self.payload.len())
+            .field("signature_bytes", &self.signature.len())
+            .finish_non_exhaustive()
+    }
+}
+
+pub(crate) struct IncomingWorkspaceAcknowledgement {
+    pub(crate) from_peer_id: String,
+    pub(crate) revision: u64,
+    pub(crate) signature: String,
+}
+
+impl fmt::Debug for IncomingWorkspaceAcknowledgement {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("IncomingWorkspaceAcknowledgement")
+            .field("signature_bytes", &self.signature.len())
+            .finish_non_exhaustive()
+    }
+}
+
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 enum PairingPacket {
@@ -136,6 +185,19 @@ enum PairingPacket {
         request_id: String,
         from_peer_id: String,
         to_peer_id: String,
+    },
+    WorkspaceLayout {
+        from_peer_id: String,
+        to_peer_id: String,
+        revision: u64,
+        payload: String,
+        signature: String,
+    },
+    WorkspaceLayoutAck {
+        from_peer_id: String,
+        to_peer_id: String,
+        revision: u64,
+        signature: String,
     },
 }
 
@@ -205,6 +267,10 @@ pub(crate) struct NearbyDiscovery {
     records: Mutex<BTreeMap<String, NearbyRecord>>,
     pairing: Mutex<Option<PairingSession>>,
     completed_bundle: Mutex<Option<String>>,
+    workspace_advertised: Mutex<Option<WorkspaceAdvertisement>>,
+    incoming_workspace: Mutex<Option<IncomingWorkspaceLayout>>,
+    workspace_ack_advertised: Mutex<Option<WorkspaceAcknowledgementAdvertisement>>,
+    incoming_workspace_ack: Mutex<Option<IncomingWorkspaceAcknowledgement>>,
 }
 
 impl NearbyDiscovery {
@@ -240,6 +306,10 @@ impl NearbyDiscovery {
             records: Mutex::new(BTreeMap::new()),
             pairing: Mutex::new(None),
             completed_bundle: Mutex::new(None),
+            workspace_advertised: Mutex::new(None),
+            incoming_workspace: Mutex::new(None),
+            workspace_ack_advertised: Mutex::new(None),
+            incoming_workspace_ack: Mutex::new(None),
         })
     }
 
@@ -285,6 +355,8 @@ impl NearbyDiscovery {
         }
         drop(advertised);
         self.retry_pairing_packet(now);
+        self.retry_workspace_packet(now);
+        self.retry_workspace_ack_packet(now);
     }
 
     pub(crate) fn snapshot(&self, paired_peer_id: Option<&str>) -> Vec<NearbyMachineDto> {
@@ -353,6 +425,81 @@ impl NearbyDiscovery {
             .ok()?
             .get(peer_id)
             .map(|record| record.address)
+    }
+
+    pub(crate) fn publish_workspace_layout(
+        &self,
+        peer_id: &str,
+        revision: u64,
+        payload: &str,
+        signature: &str,
+    ) -> Result<(), ()> {
+        if !valid_peer_id(peer_id)
+            || peer_id == self.peer_id
+            || revision == 0
+            || !valid_workspace_field(payload)
+            || !valid_workspace_field(signature)
+        {
+            return Err(());
+        }
+        let mut advertised = self.workspace_advertised.lock().map_err(|_| ())?;
+        let changed = advertised.as_ref().is_none_or(|current| {
+            current.peer_id != peer_id
+                || current.revision != revision
+                || current.payload != payload
+        });
+        if changed {
+            *advertised = Some(WorkspaceAdvertisement {
+                peer_id: peer_id.to_owned(),
+                revision,
+                payload: payload.to_owned(),
+                signature: signature.to_owned(),
+                last_sent: None,
+            });
+        }
+        drop(advertised);
+        self.retry_workspace_packet(Instant::now());
+        Ok(())
+    }
+
+    pub(crate) fn take_workspace_layout(&self) -> Option<IncomingWorkspaceLayout> {
+        self.incoming_workspace.lock().ok()?.take()
+    }
+
+    pub(crate) fn publish_workspace_ack(
+        &self,
+        peer_id: &str,
+        revision: u64,
+        signature: &str,
+    ) -> Result<(), ()> {
+        if !valid_peer_id(peer_id)
+            || peer_id == self.peer_id
+            || revision == 0
+            || !valid_workspace_field(signature)
+        {
+            return Err(());
+        }
+        let mut advertised = self.workspace_ack_advertised.lock().map_err(|_| ())?;
+        let changed = advertised.as_ref().is_none_or(|current| {
+            current.peer_id != peer_id
+                || current.revision != revision
+                || current.signature != signature
+        });
+        if changed {
+            *advertised = Some(WorkspaceAcknowledgementAdvertisement {
+                peer_id: peer_id.to_owned(),
+                revision,
+                signature: signature.to_owned(),
+                last_sent: None,
+            });
+        }
+        drop(advertised);
+        self.retry_workspace_ack_packet(Instant::now());
+        Ok(())
+    }
+
+    pub(crate) fn take_workspace_ack(&self) -> Option<IncomingWorkspaceAcknowledgement> {
+        self.incoming_workspace_ack.lock().ok()?.take()
     }
 
     pub(crate) fn request_pairing(&self, peer_id: &str, local_bundle: &str) -> Result<(), ()> {
@@ -535,6 +682,18 @@ impl NearbyDiscovery {
         if let Ok(mut completed) = self.completed_bundle.lock() {
             *completed = None;
         }
+        if let Ok(mut workspace) = self.workspace_advertised.lock() {
+            *workspace = None;
+        }
+        if let Ok(mut workspace) = self.incoming_workspace.lock() {
+            *workspace = None;
+        }
+        if let Ok(mut acknowledgement) = self.workspace_ack_advertised.lock() {
+            *acknowledgement = None;
+        }
+        if let Ok(mut acknowledgement) = self.incoming_workspace_ack.lock() {
+            *acknowledgement = None;
+        }
     }
 
     fn handle_pairing_packet(
@@ -582,6 +741,106 @@ impl NearbyDiscovery {
                 from_peer_id,
                 to_peer_id,
             } => self.handle_pairing_decline(&request_id, &from_peer_id, &to_peer_id, source),
+            PairingPacket::WorkspaceLayout {
+                from_peer_id,
+                to_peer_id,
+                revision,
+                payload,
+                signature,
+            } => self.handle_workspace_layout(
+                from_peer_id,
+                &to_peer_id,
+                revision,
+                payload,
+                signature,
+                source,
+                records,
+            ),
+            PairingPacket::WorkspaceLayoutAck {
+                from_peer_id,
+                to_peer_id,
+                revision,
+                signature,
+            } => self.handle_workspace_ack(
+                from_peer_id,
+                &to_peer_id,
+                revision,
+                signature,
+                source,
+                records,
+            ),
+        }
+    }
+
+    fn handle_workspace_ack(
+        &self,
+        from_peer_id: String,
+        to_peer_id: &str,
+        revision: u64,
+        signature: String,
+        source: SocketAddr,
+        records: &BTreeMap<String, NearbyRecord>,
+    ) {
+        let Some(record) = records.get(&from_peer_id) else {
+            return;
+        };
+        if to_peer_id != self.peer_id
+            || record.address.ip() != source.ip()
+            || revision == 0
+            || !valid_workspace_field(&signature)
+        {
+            return;
+        }
+        let Ok(mut incoming) = self.incoming_workspace_ack.lock() else {
+            return;
+        };
+        if incoming
+            .as_ref()
+            .is_none_or(|current| revision >= current.revision)
+        {
+            *incoming = Some(IncomingWorkspaceAcknowledgement {
+                from_peer_id,
+                revision,
+                signature,
+            });
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn handle_workspace_layout(
+        &self,
+        from_peer_id: String,
+        to_peer_id: &str,
+        revision: u64,
+        payload: String,
+        signature: String,
+        source: SocketAddr,
+        records: &BTreeMap<String, NearbyRecord>,
+    ) {
+        let Some(record) = records.get(&from_peer_id) else {
+            return;
+        };
+        if to_peer_id != self.peer_id
+            || record.address.ip() != source.ip()
+            || revision == 0
+            || !valid_workspace_field(&payload)
+            || !valid_workspace_field(&signature)
+        {
+            return;
+        }
+        let Ok(mut incoming) = self.incoming_workspace.lock() else {
+            return;
+        };
+        if incoming
+            .as_ref()
+            .is_none_or(|current| revision > current.revision)
+        {
+            *incoming = Some(IncomingWorkspaceLayout {
+                from_peer_id,
+                revision,
+                payload,
+                signature,
+            });
         }
     }
 
@@ -804,6 +1063,68 @@ impl NearbyDiscovery {
             }
         }
     }
+
+    fn retry_workspace_packet(&self, now: Instant) {
+        let Ok(records) = self.records.lock() else {
+            return;
+        };
+        let Ok(mut advertised) = self.workspace_advertised.lock() else {
+            return;
+        };
+        let Some(workspace) = advertised.as_mut() else {
+            return;
+        };
+        if workspace.last_sent.is_some_and(|last_sent| {
+            now.duration_since(last_sent) < BEACON_INTERVAL
+        }) {
+            return;
+        }
+        let Some(record) = records.get(&workspace.peer_id) else {
+            return;
+        };
+        let packet = PairingPacket::WorkspaceLayout {
+            from_peer_id: self.peer_id.clone(),
+            to_peer_id: workspace.peer_id.clone(),
+            revision: workspace.revision,
+            payload: workspace.payload.clone(),
+            signature: workspace.signature.clone(),
+        };
+        let target = SocketAddr::new(record.address.ip(), DISCOVERY_PORT);
+        if send_pairing_packet(&self.socket, target, &packet).is_ok() {
+            workspace.last_sent = Some(now);
+        }
+    }
+
+    fn retry_workspace_ack_packet(&self, now: Instant) {
+        let Ok(records) = self.records.lock() else {
+            return;
+        };
+        let Ok(mut advertised) = self.workspace_ack_advertised.lock() else {
+            return;
+        };
+        let Some(acknowledgement) = advertised.as_mut() else {
+            return;
+        };
+        if acknowledgement
+            .last_sent
+            .is_some_and(|last_sent| now.duration_since(last_sent) < BEACON_INTERVAL)
+        {
+            return;
+        }
+        let Some(record) = records.get(&acknowledgement.peer_id) else {
+            return;
+        };
+        let packet = PairingPacket::WorkspaceLayoutAck {
+            from_peer_id: self.peer_id.clone(),
+            to_peer_id: acknowledgement.peer_id.clone(),
+            revision: acknowledgement.revision,
+            signature: acknowledgement.signature.clone(),
+        };
+        let target = SocketAddr::new(record.address.ip(), DISCOVERY_PORT);
+        if send_pairing_packet(&self.socket, target, &packet).is_ok() {
+            acknowledgement.last_sent = Some(now);
+        }
+    }
 }
 
 impl PairingSession {
@@ -934,6 +1255,20 @@ impl fmt::Debug for NearbyDiscovery {
                 "pairing_pending",
                 &self.pairing.lock().is_ok_and(|pairing| pairing.is_some()),
             )
+            .field(
+                "workspace_advertised",
+                &self
+                    .workspace_advertised
+                    .lock()
+                    .is_ok_and(|workspace| workspace.is_some()),
+            )
+            .field(
+                "workspace_ack_advertised",
+                &self
+                    .workspace_ack_advertised
+                    .lock()
+                    .is_ok_and(|acknowledgement| acknowledgement.is_some()),
+            )
             .finish_non_exhaustive()
     }
 }
@@ -1001,6 +1336,37 @@ fn parse_pairing_packet(bytes: &[u8]) -> Option<PairingPacket> {
         .strip_prefix(PAIRING_MAGIC.as_bytes())?
         .strip_prefix(b"\n")?;
     let packet: PairingPacket = serde_json::from_slice(body).ok()?;
+    match &packet {
+        PairingPacket::WorkspaceLayout {
+            from_peer_id,
+            to_peer_id,
+            revision,
+            payload,
+            signature,
+        } => {
+            return (valid_peer_id(from_peer_id)
+                && valid_peer_id(to_peer_id)
+                && from_peer_id != to_peer_id
+                && *revision > 0
+                && valid_workspace_field(payload)
+                && valid_workspace_field(signature))
+            .then_some(packet);
+        }
+        PairingPacket::WorkspaceLayoutAck {
+            from_peer_id,
+            to_peer_id,
+            revision,
+            signature,
+        } => {
+            return (valid_peer_id(from_peer_id)
+                && valid_peer_id(to_peer_id)
+                && from_peer_id != to_peer_id
+                && *revision > 0
+                && valid_workspace_field(signature))
+            .then_some(packet);
+        }
+        _ => {}
+    }
     let (request_id, from_peer_id, to_peer_id, bundle) = match &packet {
         PairingPacket::Request {
             request_id,
@@ -1024,6 +1390,9 @@ fn parse_pairing_packet(bytes: &[u8]) -> Option<PairingPacket> {
             from_peer_id,
             to_peer_id,
         } => (request_id, from_peer_id, to_peer_id, None),
+        PairingPacket::WorkspaceLayout { .. } | PairingPacket::WorkspaceLayoutAck { .. } => {
+            unreachable!("handled above")
+        }
     };
     if !valid_request_id(request_id)
         || !valid_peer_id(from_peer_id)
@@ -1034,6 +1403,14 @@ fn parse_pairing_packet(bytes: &[u8]) -> Option<PairingPacket> {
         return None;
     }
     Some(packet)
+}
+
+fn valid_workspace_field(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= MAX_PAIRING_PACKET_BYTES / 2
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'='))
 }
 
 fn valid_request_id(request_id: &str) -> bool {
@@ -1215,6 +1592,35 @@ mod tests {
         let mut encoded = format!("{PAIRING_MAGIC}\n").into_bytes();
         encoded.extend_from_slice(&body);
         assert!(parse_pairing_packet(&encoded).is_none());
+
+        let workspace = PairingPacket::WorkspaceLayout {
+            from_peer_id: "11111111-1111-4111-8111-111111111111".to_owned(),
+            to_peer_id: "22222222-2222-4222-8222-222222222222".to_owned(),
+            revision: 3,
+            payload: "signed-layout_payload".to_owned(),
+            signature: "signature_payload".to_owned(),
+        };
+        let body = serde_json::to_vec(&workspace).unwrap();
+        let mut encoded = format!("{PAIRING_MAGIC}\n").into_bytes();
+        encoded.extend_from_slice(&body);
+        assert!(matches!(
+            parse_pairing_packet(&encoded),
+            Some(PairingPacket::WorkspaceLayout { revision: 3, .. })
+        ));
+
+        let acknowledgement = PairingPacket::WorkspaceLayoutAck {
+            from_peer_id: "22222222-2222-4222-8222-222222222222".to_owned(),
+            to_peer_id: "11111111-1111-4111-8111-111111111111".to_owned(),
+            revision: 3,
+            signature: "ack_signature_payload".to_owned(),
+        };
+        let body = serde_json::to_vec(&acknowledgement).unwrap();
+        let mut encoded = format!("{PAIRING_MAGIC}\n").into_bytes();
+        encoded.extend_from_slice(&body);
+        assert!(matches!(
+            parse_pairing_packet(&encoded),
+            Some(PairingPacket::WorkspaceLayoutAck { revision: 3, .. })
+        ));
     }
 
     #[test]

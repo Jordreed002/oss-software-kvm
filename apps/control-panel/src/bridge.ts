@@ -14,6 +14,9 @@ const mock: SetupSnapshot = {
   ],
   placement: "local_left",
   displayLayout: [],
+  workspaceRole: "unassigned",
+  workspaceRevision: 0,
+  workspaceSync: "not_configured",
   configured: false,
   validated: false,
   runtime: "stopped",
@@ -60,6 +63,8 @@ const invokeOrPreview = async <T>(command: string, args?: Record<string, unknown
         { id: "preview-peer-display-2", name: "Second monitor", width: 1920, height: 1080, scaleFactor: 1, primary: false, nativeBounds: { x: 2560, y: 0, width: 1920, height: 1080 } },
       ],
     };
+    previewState.workspaceRole = "unassigned";
+    previewState.workspaceSync = "not_configured";
     return structuredClone(previewState) as T;
   }
   if (command === "request_nearby_pairing") {
@@ -89,6 +94,8 @@ const invokeOrPreview = async <T>(command: string, args?: Record<string, unknown
         { id: "preview-peer-display-2", name: "Second monitor", width: 1920, height: 1080, scaleFactor: 1, primary: false, nativeBounds: { x: 2560, y: 0, width: 1920, height: 1080 } },
       ],
     };
+    previewState.workspaceRole = "leader";
+    previewState.workspaceSync = "not_configured";
     previewState.nearbyPairing = null;
     return structuredClone(previewState) as T;
   }
@@ -103,6 +110,10 @@ const invokeOrPreview = async <T>(command: string, args?: Record<string, unknown
     previewState.runtime = "stopped";
     previewState.inputAuthority = { owner: "unavailable", linkReady: false, sessionActive: false };
     previewState.nearbyPairing = null;
+    previewState.workspaceRole = "unassigned";
+    previewState.workspaceRevision = 0;
+    previewState.workspaceSync = "not_configured";
+    previewState.displayLayout = [];
     return structuredClone(previewState) as T;
   }
   if (command === "repair_lan_binding" && previewState.developerDiagnostics) {
@@ -116,6 +127,8 @@ const invokeOrPreview = async <T>(command: string, args?: Record<string, unknown
     previewState.configured = true;
     previewState.placement = args?.placement as Placement;
     previewState.displayLayout = args?.layout as DisplayPlacement[];
+    previewState.workspaceRevision += 1;
+    previewState.workspaceSync = previewState.workspaceRole === "unassigned" ? "manual" : "confirmed";
     previewState.setupDirectory = "/Users/demo/Library/Application Support/software-kvm";
     previewState.profilePath = `${previewState.setupDirectory}/runtime.toml`;
     return structuredClone(previewState) as T;

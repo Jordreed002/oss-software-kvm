@@ -36,7 +36,7 @@ function App() {
   }, []);
 
   useEffect(() => {
-    if (step !== 1 && step !== 3) return;
+    if (step !== 1 && step !== 2 && step !== 3) return;
     const timer = window.setInterval(() => {
       if (!busy) api.status().then(setSnapshot).catch(() => undefined);
     }, snapshot?.runtime === "running" ? 400 : 1200);
@@ -46,6 +46,10 @@ function App() {
   useEffect(() => {
     if (step === 1 && snapshot?.peer) setStep(2);
   }, [snapshot?.peer, step]);
+
+  useEffect(() => {
+    if (step === 2 && snapshot?.configured && snapshot.workspaceRole === "follower") setStep(3);
+  }, [snapshot?.configured, snapshot?.workspaceRole, step]);
 
   const perform = async (label: string, operation: () => Promise<SetupSnapshot>, next?: number) => {
     setBusy(label); setError(null);
@@ -93,7 +97,14 @@ function App() {
           <p>The console handles identity, trusted pairing, display placement, and the native runtime without exposing private keys.</p>
           <nav aria-label="Setup progress">
             {steps.map((label, index) => (
-              <button key={label} className={index === step ? "active" : index < step ? "done" : ""} onClick={() => index <= step && setStep(index)} disabled={index > step}>
+              <button key={label} className={index === step ? "active" : index < step ? "done" : ""} onClick={() => {
+                if (index > step) return;
+                if (index === 2 && snapshot.runtime === "running") {
+                  void perform("stop-for-arrange", api.stop, 2);
+                } else {
+                  setStep(index);
+                }
+              }} disabled={index > step || busy === "stop-for-arrange"}>
                 <span>{index < step ? <Check size={15} /> : String(index + 1).padStart(2, "0")}</span>{label}
               </button>
             ))}
@@ -105,7 +116,10 @@ function App() {
           {error && <div className="error-banner"><CircleAlert size={18} />{error}</div>}
           {step === 0 && <LocalStep snapshot={snapshot} name={name} setName={setName} address={address} setAddress={setAddress} busy={busy} onContinue={() => perform("identity", () => api.createIdentity(name, address), 1)} />}
           {step === 1 && <PairStep snapshot={snapshot} bundle={bundle} setBundle={setBundle} copied={copied} onCopy={async () => { await navigator.clipboard.writeText(snapshot.local?.publicBundle ?? ""); setCopied(true); window.setTimeout(() => setCopied(false), 1800); }} busy={busy} onImport={() => perform("pair", () => api.importPeer(bundle), 2)} onRequest={(peerId) => perform("pair-request", () => api.requestNearbyPairing(peerId))} onAccept={(requestId) => perform("pair-accept", () => api.acceptNearbyPairing(requestId))} onConfirm={(requestId) => perform("pair-confirm", () => api.confirmNearbyPairing(requestId), 2)} onDecline={(requestId) => perform("pair-decline", () => api.declineNearbyPairing(requestId))} onForget={() => perform("forget-pair", api.forgetPairedComputer)} />}
-          {step === 2 && <ArrangeStep snapshot={snapshot} busy={busy} onContinue={(nextPlacement, layout) => perform("arrange", () => api.finalize(nextPlacement, layout), 3)} />}
+          {step === 2 && <ArrangeStep snapshot={snapshot} busy={busy} onContinue={(nextPlacement, layout) => perform("arrange", async () => {
+            if (snapshot.runtime === "running") await api.stop();
+            return api.finalize(nextPlacement, layout);
+          }, 3)} />}
           {step === 3 && <ReadyStep snapshot={snapshot} busy={busy} onValidate={() => perform("validate", api.validate)} onStart={() => perform("start", api.start)} onStop={() => perform("stop", api.stop)} onReplace={() => perform("forget-pair", async () => { if (snapshot.runtime === "running") await api.stop(); return api.forgetPairedComputer(); }, 1)} onRepair={() => perform("repair-lan", async () => { const restart = snapshot.runtime === "running"; if (restart) await api.stop(); const repaired = await api.repairLanBinding(); return restart ? api.start() : repaired; })} />}
         </section>
       </section>
@@ -267,7 +281,12 @@ function snapDisplay(layout: DisplayPlacement[], movingId: string, displays: Map
 function ArrangeStep({ snapshot, busy, onContinue }: { snapshot: SetupSnapshot; busy: string | null; onContinue: (placement: Placement, layout: DisplayPlacement[]) => void }) {
   const displays = useMemo(() => mappedDisplays(snapshot), [snapshot]);
   const [layout, setLayout] = useState(() => defaultDisplayLayout(snapshot, displays));
+  const followsPeer = snapshot.workspaceRole === "follower";
+  const leadsPeer = snapshot.workspaceRole === "leader";
   const [drag, setDrag] = useState<{ displayId: string; pointerId: number; clientX: number; clientY: number; x: number; y: number } | null>(null);
+  useEffect(() => {
+    if (followsPeer) setLayout(defaultDisplayLayout(snapshot, displays));
+  }, [displays, followsPeer, snapshot]);
   const scale = useMemo(() => {
     const totalWidth = displays.reduce((sum, display) => sum + display.width, 0);
     const tallest = Math.max(...displays.map((display) => display.height), 1);
@@ -288,8 +307,8 @@ function ArrangeStep({ snapshot, busy, onContinue }: { snapshot: SetupSnapshot; 
   return <div className="step-content enter arrange-content">
     <SectionHeading number="03" kicker="WORKSPACE MAP" title="Build the desk you actually have." copy="Drag every screen into its physical position. Touch one Mac edge to one Windows edge to choose where the pointer crosses." />
     <div className="display-map-toolbar">
-      <div className="map-legend"><span className="local"><i/>This computer</span><span className="peer"><i/>Paired computer</span></div>
-      <button onClick={() => setLayout(defaultDisplayLayout(snapshot, displays))}><RotateCcw size={13}/>Reset arrangement</button>
+      <div className="map-legend"><span className="local"><i/>This computer</span><span className="peer"><i/>Paired computer</span><em className={`map-role ${snapshot.workspaceRole}`}>{followsPeer ? `${snapshot.peer?.displayName ?? "Peer"} leads` : snapshot.workspaceRole === "leader" ? "This computer leads" : "Local map"}</em></div>
+      <button disabled={followsPeer} onClick={() => setLayout(defaultDisplayLayout(snapshot, displays))}><RotateCcw size={13}/>Reset arrangement</button>
     </div>
     <div className="display-map-viewport">
       <div className="display-map-grid" style={{ width: canvasWidth, height: canvasHeight }}>
@@ -302,6 +321,7 @@ function ArrangeStep({ snapshot, busy, onContinue }: { snapshot: SetupSnapshot; 
             className={`mapped-display ${display.owner} ${display.primary ? "primary" : ""} ${drag?.displayId === display.id ? "dragging" : ""}`}
             style={{ left: MAP_PADDING + position.x * scale, top: MAP_PADDING + position.y * scale, width: display.width * scale, height: display.height * scale }}
             onPointerDown={(event) => {
+              if (followsPeer) return;
               event.currentTarget.setPointerCapture(event.pointerId);
               setDrag({ displayId: display.id, pointerId: event.pointerId, clientX: event.clientX, clientY: event.clientY, x: position.x, y: position.y });
             }}
@@ -326,16 +346,17 @@ function ArrangeStep({ snapshot, busy, onContinue }: { snapshot: SetupSnapshot; 
         })}
       </div>
     </div>
-    <div className={`map-validation ${valid ? "ready" : "needs-edge"}`}>
-      <span><i/>{overlapping ? "SCREENS CANNOT OVERLAP" : linked ? "HANDOFF EDGE READY" : "CONNECT THE TWO COMPUTERS"}</span>
-      <p>{overlapping ? "Separate the overlapping screens, then join one Mac edge to one Windows edge." : linked ? "The touching boundary becomes the bidirectional input handoff." : "Drag a screen from each computer together until their edges snap."}</p>
+    <div className={`map-validation ${valid && !followsPeer ? "ready" : "needs-edge"}`}>
+      <span><i/>{followsPeer ? "FOLLOWING THE PAIRING LEADER" : overlapping ? "SCREENS CANNOT OVERLAP" : linked ? "HANDOFF EDGE READY" : "CONNECT THE TWO COMPUTERS"}</span>
+      <p>{followsPeer ? `Save the arrangement on ${snapshot.peer?.displayName ?? "the paired computer"}. Its signed map will appear here automatically.` : overlapping ? "Separate the overlapping screens, then join one Mac edge to one Windows edge." : linked && leadsPeer ? "The signed map will be synchronized to the paired computer." : linked ? "This older or manual pairing cannot sync maps; save the same arrangement on both computers." : "Drag a screen from each computer together until their edges snap."}</p>
     </div>
-    <PrimaryButton busy={busy === "arrange"} disabled={!valid} onClick={() => onContinue(placement, layout)}>Save display map</PrimaryButton>
+    <PrimaryButton busy={busy === "arrange"} disabled={!valid || followsPeer} onClick={() => onContinue(placement, layout)}>{followsPeer ? "Waiting for leader map" : leadsPeer ? "Save and sync display map" : "Save display map"}</PrimaryButton>
   </div>;
 }
 
 function ReadyStep({ snapshot, busy, onValidate, onStart, onStop, onReplace, onRepair }: { snapshot: SetupSnapshot; busy: string | null; onValidate: () => void; onStart: () => void; onStop: () => void; onReplace: () => void; onRepair: () => void }) {
   const running = snapshot.runtime === "running";
+  const workspaceSynchronized = snapshot.workspaceSync === "confirmed" || snapshot.workspaceSync === "manual";
   const runtimeFault = snapshot.runtime === "faulted" ? runtimeFaultMessage(snapshot.runtimeFault) : null;
   const [confirmReplace, setConfirmReplace] = useState(false);
   return <div className="step-content enter">
@@ -346,6 +367,11 @@ function ReadyStep({ snapshot, busy, onValidate, onStart, onStop, onReplace, onR
       <CheckRow label="Local identity" detail="Private credential is protected" good={!!snapshot.local}/>
       <CheckRow label="Selected peer" detail="Public certificate is pinned" good={!!snapshot.peer}/>
       <CheckRow label="Display topology" detail="Bidirectional edge link configured" good={snapshot.configured}/>
+      <CheckRow
+        label="Display map sync"
+        detail={snapshot.workspaceSync === "confirmed" ? "Both computers confirmed the same map" : snapshot.workspaceSync === "manual" ? "Manual pairing uses this computer's map" : "Waiting for the paired computer to confirm this revision"}
+        good={workspaceSynchronized}
+      />
       <CheckRow label="Runtime validation" detail={snapshot.validated ? "All safety checks passed" : "Not checked yet"} good={snapshot.validated}/>
       {snapshot.developerDiagnostics && (
         <CheckRow
@@ -365,7 +391,7 @@ function ReadyStep({ snapshot, busy, onValidate, onStart, onStop, onReplace, onR
     {runtimeFault && <div className="error-banner"><CircleAlert size={18}/><div><strong>{runtimeFault.title}</strong><br/><span>{runtimeFault.detail}</span></div></div>}
     {snapshot.setupDirectory && <div className="path-note"><span>Setup stored securely</span><code>{snapshot.setupDirectory}</code></div>}
     {runtimeFault && snapshot.runtimeLogPath && <div className="path-note"><span>Private diagnostic log</span><code>{snapshot.runtimeLogPath}</code></div>}
-    {running ? <button className="stop-button" disabled={!!busy} onClick={onStop}><Square size={16} fill="currentColor"/> Stop routing safely</button> : !snapshot.validated ? <PrimaryButton busy={busy === "validate"} onClick={onValidate}>Validate this setup</PrimaryButton> : <PrimaryButton busy={busy === "start"} onClick={onStart}><Play size={17} fill="currentColor"/> Start Software KVM</PrimaryButton>}
+    {running ? <button className="stop-button" disabled={!!busy} onClick={onStop}><Square size={16} fill="currentColor"/> Stop routing safely</button> : !snapshot.validated ? <PrimaryButton busy={busy === "validate"} onClick={onValidate}>Validate this setup</PrimaryButton> : <PrimaryButton busy={busy === "start"} disabled={!workspaceSynchronized} onClick={onStart}><Play size={17} fill="currentColor"/> {workspaceSynchronized ? "Start Software KVM" : "Waiting for display-map sync"}</PrimaryButton>}
   </div>;
 }
 

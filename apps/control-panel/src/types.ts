@@ -4,6 +4,8 @@ export type RuntimeFault = "native_capture" | "authenticated_transport" | "runti
 export type NearbyPresence = "setting_up" | "runtime_active";
 export type NearbyPairingStatus = "incoming_request" | "waiting_for_acceptance" | "verify_code" | "waiting_for_confirmation";
 export type Placement = "local_left" | "local_right";
+export type WorkspaceRole = "unassigned" | "leader" | "follower";
+export type WorkspaceSyncState = "not_configured" | "manual" | "waiting" | "confirmed";
 export type LanBindingState = "healthy" | "mismatch" | "waiting_for_peer" | "not_configured";
 export type InputOwnerState = "local" | "peer" | "transitioning" | "unavailable";
 
@@ -64,6 +66,9 @@ export interface SetupSnapshot {
   displays: DisplayInfo[];
   placement: Placement;
   displayLayout: DisplayPlacement[];
+  workspaceRole: WorkspaceRole;
+  workspaceRevision: number;
+  workspaceSync: WorkspaceSyncState;
   configured: boolean;
   validated: boolean;
   runtime: RuntimeState;

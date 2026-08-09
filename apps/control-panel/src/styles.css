@@ -80,10 +80,14 @@ select { appearance: none; background-image: linear-gradient(45deg, transparent 
 .display-map-toolbar { min-height: 44px; padding: 0 13px; display: flex; align-items: center; justify-content: space-between; border: 1px solid var(--line); border-bottom: 0; background: rgba(8,13,11,.72); }
 .map-legend { display: flex; align-items: center; gap: 18px; color: #7c8981; font-size: 8px; font-weight: 750; letter-spacing: .11em; text-transform: uppercase; }
 .map-legend span { display: flex; align-items: center; gap: 7px; }
+.map-role { margin-left: 6px; padding: 4px 7px; border: 1px solid rgba(255,255,255,.08); color: #89958e; font-size: 7px; font-style: normal; font-weight: 800; letter-spacing: .08em; text-transform: uppercase; }
+.map-role.leader { border-color: rgba(255,107,53,.28); color: #ff9a73; background: rgba(255,107,53,.07); }
+.map-role.follower { border-color: rgba(169,229,200,.22); color: var(--mint); background: rgba(169,229,200,.06); }
 .map-legend i { width: 8px; height: 8px; background: var(--signal); box-shadow: 0 0 0 4px rgba(255,107,53,.08); }
 .map-legend .peer i { background: var(--mint); box-shadow: 0 0 0 4px rgba(169,229,200,.07); }
 .display-map-toolbar button { min-height: 29px; padding: 0 9px; display: inline-flex; align-items: center; gap: 6px; border: 1px solid rgba(255,255,255,.09); background: transparent; color: #7b8780; font-size: 8px; letter-spacing: .06em; cursor: pointer; }
 .display-map-toolbar button:hover { border-color: rgba(255,107,53,.32); color: #d4d8d2; }
+.display-map-toolbar button:disabled { opacity: .34; cursor: not-allowed; }
 .display-map-viewport { width: 100%; min-height: 332px; overflow: auto; border: 1px solid var(--line); background: #080d0b; scrollbar-color: #344139 #0a0f0d; }
 .display-map-grid { position: relative; overflow: hidden; background-image: linear-gradient(rgba(157,171,163,.075) 1px, transparent 1px), linear-gradient(90deg, rgba(157,171,163,.075) 1px, transparent 1px), radial-gradient(circle at 72% 18%, rgba(169,229,200,.055), transparent 38%); background-size: 24px 24px, 24px 24px, auto; }
 .display-map-grid::after { content: "VIRTUAL DESK PLANE"; position: absolute; right: 14px; bottom: 11px; color: #344039; font-size: 7px; letter-spacing: .18em; pointer-events: none; }

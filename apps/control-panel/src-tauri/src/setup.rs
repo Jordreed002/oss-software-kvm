@@ -19,16 +19,21 @@ use kvm_config::{
 #[cfg(any(target_os = "macos", windows))]
 use kvm_daemon::DisplayBackend;
 use kvm_types::{Display, DisplayId, Edge, HostId, PeerId, Platform};
-use rcgen::{CertificateParams, ExtendedKeyUsagePurpose, IsCa, KeyPair};
+use rcgen::{CertificateParams, ExtendedKeyUsagePurpose, IsCa, KeyPair, SigningKey};
+use ring::signature::{UnparsedPublicKey, ECDSA_P256_SHA256_ASN1};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tauri::{AppHandle, Manager, State};
 use uuid::Uuid;
+use zeroize::Zeroizing;
 
-use crate::nearby::{NearbyDiscovery, NearbyMachineDto, NearbyPairingDto, NearbyPresence};
+use crate::nearby::{
+    IncomingWorkspaceAcknowledgement, IncomingWorkspaceLayout, NearbyDiscovery, NearbyMachineDto,
+    NearbyPairingDto, NearbyPresence,
+};
 
 const KVM_PORT: u16 = 24_800;
-const PAIRING_VERSION: u16 = 2;
+const PAIRING_VERSION: u16 = 3;
 const CREDENTIAL_VERSION: u16 = 2;
 const STATE_FILE: &str = "setup-state.json";
 const LEGACY_STATE_BACKUP_FILE: &str = "setup-state.pre-tls-v2.json";
@@ -57,6 +62,7 @@ pub(crate) struct SetupService {
     inner: Mutex<StoredSetup>,
     runtime: Mutex<Option<Child>>,
     last_runtime_fault: Mutex<Option<RuntimeFault>>,
+    pending_workspace: Mutex<Option<IncomingWorkspaceLayout>>,
     discovery: Option<NearbyDiscovery>,
 }
 
@@ -77,6 +83,12 @@ struct StoredSetup {
     placement: Placement,
     #[serde(default)]
     display_layout: Vec<DisplayLayoutDto>,
+    #[serde(default)]
+    workspace_role: WorkspaceRole,
+    #[serde(default)]
+    workspace_revision: u64,
+    #[serde(default)]
+    workspace_acknowledged_revision: u64,
     configured: bool,
     validated: bool,
 }
@@ -104,7 +116,27 @@ struct PairingBundle {
     certificate_fingerprint: String,
     address: String,
     certificate_der: String,
+    #[serde(default)]
+    signing_public_key: String,
     displays: Vec<DisplayDto>,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum WorkspaceRole {
+    #[default]
+    Unassigned,
+    Leader,
+    Follower,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum WorkspaceSyncState {
+    NotConfigured,
+    Manual,
+    Waiting,
+    Confirmed,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -127,7 +159,7 @@ struct DisplayDto {
     native_bounds: Option<NativeBoundsDto>,
 }
 
-#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct NativeBoundsDto {
     x: f64,
@@ -136,12 +168,19 @@ struct NativeBoundsDto {
     height: f64,
 }
 
-#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct DisplayLayoutDto {
     display_id: DisplayId,
     x: f64,
     y: f64,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+struct SignedWorkspaceLayout {
+    schema_version: u16,
+    revision: u64,
+    layout: Vec<DisplayLayoutDto>,
 }
 
 #[derive(Debug, Serialize)]
@@ -268,6 +307,9 @@ pub(crate) struct SetupSnapshot {
     displays: Vec<DisplayDto>,
     placement: Placement,
     display_layout: Vec<DisplayLayoutDto>,
+    workspace_role: WorkspaceRole,
+    workspace_revision: u64,
+    workspace_sync: WorkspaceSyncState,
     configured: bool,
     validated: bool,
     runtime: RuntimeState,
@@ -330,6 +372,7 @@ impl SetupService {
             inner: Mutex::new(stored),
             runtime: Mutex::new(None),
             last_runtime_fault: Mutex::new(None),
+            pending_workspace: Mutex::new(None),
             discovery,
         })
     }
@@ -340,26 +383,7 @@ impl SetupService {
     }
 
     fn snapshot(&self) -> Result<SetupSnapshot, ()> {
-        let mut runtime = self.runtime.lock().map_err(|_| ())?;
-        let mut last_fault = self.last_runtime_fault.lock().map_err(|_| ())?;
-        let runtime_state = match runtime.as_mut() {
-            Some(child) => match child.try_wait().map_err(|_| ())? {
-                None => RuntimeState::Running,
-                Some(status) if status.success() => {
-                    *runtime = None;
-                    *last_fault = None;
-                    RuntimeState::Stopped
-                }
-                Some(_) => {
-                    *runtime = None;
-                    *last_fault = Some(read_runtime_fault(&self.directory));
-                    RuntimeState::Faulted
-                }
-            },
-            None if runtime_lock_held(&self.directory) => RuntimeState::Running,
-            None if last_fault.is_some() => RuntimeState::Faulted,
-            None => RuntimeState::Stopped,
-        };
+        let (runtime_state, runtime_fault) = self.poll_runtime_state()?;
         let mut setup = self.inner.lock().map_err(|_| ())?.clone();
         let presence = if matches!(runtime_state, RuntimeState::Running) {
             NearbyPresence::RuntimeActive
@@ -384,7 +408,11 @@ impl SetupService {
             // N-3: a late incoming-pairing completion must not overwrite an
             // already-configured peer (the victim's own concurrent action).
             // install_peer_bundle guards atomically under its lock as well.
-            if setup.peer.is_none() && self.install_peer_bundle(&bundle).is_ok() {
+            if setup.peer.is_none()
+                && self
+                    .install_peer_bundle(&bundle, WorkspaceRole::Follower)
+                    .is_ok()
+            {
                 setup = self.inner.lock().map_err(|_| ())?.clone();
             }
             if let Some(discovery) = &self.discovery {
@@ -403,6 +431,7 @@ impl SetupService {
             .as_ref()
             .map_or(setup.draft_host_id.as_str(), |local| local.host_id.as_str());
         let displays = native_displays(parse_host_id(host_id).map_err(|_| ())?).map_err(|_| ())?;
+        self.synchronize_workspace(runtime_state, &displays, &mut setup)?;
         let local = setup
             .local
             .as_ref()
@@ -410,6 +439,7 @@ impl SetupService {
             .transpose()?;
         let peer = setup.peer.clone().map(peer_dto);
         let input_authority = snapshot_input_authority(runtime_state, &self.directory);
+        let workspace_sync = workspace_sync_state(&setup);
         Ok(SetupSnapshot {
             platform: current_platform(),
             suggested_name: suggested_name(),
@@ -419,10 +449,13 @@ impl SetupService {
             displays,
             placement: setup.placement,
             display_layout: setup.display_layout,
+            workspace_role: setup.workspace_role,
+            workspace_revision: setup.workspace_revision,
+            workspace_sync,
             configured: setup.configured,
             validated: setup.validated,
             runtime: runtime_state,
-            runtime_fault: *last_fault,
+            runtime_fault,
             input_authority,
             runtime_log_path: setup.configured.then(|| {
                 self.directory
@@ -446,12 +479,38 @@ impl SetupService {
         })
     }
 
+    fn poll_runtime_state(&self) -> Result<(RuntimeState, Option<RuntimeFault>), ()> {
+        let mut runtime = self.runtime.lock().map_err(|_| ())?;
+        let mut last_fault = self.last_runtime_fault.lock().map_err(|_| ())?;
+        let runtime_state = match runtime.as_mut() {
+            Some(child) => match child.try_wait().map_err(|_| ())? {
+                None => RuntimeState::Running,
+                Some(status) if status.success() => {
+                    *runtime = None;
+                    *last_fault = None;
+                    RuntimeState::Stopped
+                }
+                Some(_) => {
+                    *runtime = None;
+                    *last_fault = Some(read_runtime_fault(&self.directory));
+                    RuntimeState::Faulted
+                }
+            },
+            None if runtime_lock_held(&self.directory) => RuntimeState::Running,
+            None if last_fault.is_some() => RuntimeState::Faulted,
+            None => RuntimeState::Stopped,
+        };
+        Ok((runtime_state, *last_fault))
+    }
+
     fn local_dto(
         &self,
         local: &StoredLocal,
         displays: &[DisplayDto],
     ) -> Result<LocalIdentityDto, ()> {
         let certificate = fs::read(self.directory.join(CERT_FILE)).map_err(|_| ())?;
+        let private_key = Zeroizing::new(fs::read(self.directory.join(KEY_FILE)).map_err(|_| ())?);
+        let key_pair = KeyPair::try_from(private_key.as_slice()).map_err(|_| ())?;
         let bundle = PairingBundle {
             software_kvm_pairing: PAIRING_VERSION,
             host_id: local.host_id.clone(),
@@ -462,6 +521,7 @@ impl SetupService {
             certificate_fingerprint: local.certificate_fingerprint.clone(),
             address: local.address.clone(),
             certificate_der: URL_SAFE_NO_PAD.encode(certificate),
+            signing_public_key: URL_SAFE_NO_PAD.encode(key_pair.public_key_raw()),
             displays: displays.to_vec(),
         };
         let encoded = serde_json::to_vec(&bundle).map_err(|_| ())?;
@@ -515,7 +575,7 @@ impl SetupService {
         Ok((peer, certificate))
     }
 
-    fn install_peer_bundle(&self, bundle: &str) -> Result<(), String> {
+    fn install_peer_bundle(&self, bundle: &str, role: WorkspaceRole) -> Result<(), String> {
         let (peer, certificate) = self.validate_peer_bundle(bundle)?;
         secure_write(&self.directory.join(TRUST_FILE), &certificate, false)
             .map_err(|()| coarse_error())?;
@@ -529,9 +589,212 @@ impl SetupService {
         }
         setup.peer = Some(peer);
         setup.display_layout.clear();
+        setup.workspace_role = role;
+        setup.workspace_revision = 0;
+        setup.workspace_acknowledged_revision = 0;
         setup.configured = false;
         setup.validated = false;
         self.save(&setup).map_err(|()| coarse_error())
+    }
+
+    fn sign_workspace_layout(&self, setup: &StoredSetup) -> Result<(String, String), String> {
+        let local = setup.local.as_ref().ok_or_else(coarse_error)?;
+        let peer = setup.peer.as_ref().ok_or_else(coarse_error)?;
+        let workspace = SignedWorkspaceLayout {
+            schema_version: 1,
+            revision: setup.workspace_revision,
+            layout: canonical_layout(&setup.display_layout),
+        };
+        let encoded = serde_json::to_vec(&workspace).map_err(|_| coarse_error())?;
+        let payload = URL_SAFE_NO_PAD.encode(encoded);
+        let message = workspace_signature_message(
+            &local.peer_id,
+            &peer.peer_id,
+            setup.workspace_revision,
+            &payload,
+        );
+        let private_key = Zeroizing::new(
+            fs::read(self.directory.join(KEY_FILE)).map_err(|_| coarse_error())?,
+        );
+        let key_pair = KeyPair::try_from(private_key.as_slice()).map_err(|_| coarse_error())?;
+        let signature = key_pair.sign(&message).map_err(|_| coarse_error())?;
+        Ok((payload, URL_SAFE_NO_PAD.encode(signature)))
+    }
+
+    fn sign_workspace_ack(&self, setup: &StoredSetup) -> Result<String, String> {
+        let local = setup.local.as_ref().ok_or_else(coarse_error)?;
+        let peer = setup.peer.as_ref().ok_or_else(coarse_error)?;
+        let message = workspace_ack_signature_message(
+            &local.peer_id,
+            &peer.peer_id,
+            setup.workspace_revision,
+        );
+        let private_key = Zeroizing::new(
+            fs::read(self.directory.join(KEY_FILE)).map_err(|_| coarse_error())?,
+        );
+        let key_pair = KeyPair::try_from(private_key.as_slice()).map_err(|_| coarse_error())?;
+        let signature = key_pair.sign(&message).map_err(|_| coarse_error())?;
+        Ok(URL_SAFE_NO_PAD.encode(signature))
+    }
+
+    fn synchronize_workspace(
+        &self,
+        runtime_state: RuntimeState,
+        displays: &[DisplayDto],
+        setup: &mut StoredSetup,
+    ) -> Result<(), ()> {
+        if let Some(acknowledgement) = self
+            .discovery
+            .as_ref()
+            .and_then(NearbyDiscovery::take_workspace_ack)
+        {
+            self.apply_workspace_ack(acknowledgement, setup)?;
+        }
+        if let Some(update) = self
+            .discovery
+            .as_ref()
+            .and_then(NearbyDiscovery::take_workspace_layout)
+        {
+            if Self::verify_incoming_workspace(setup, &update).is_ok() {
+                *self.pending_workspace.lock().map_err(|_| ())? = Some(update);
+            }
+        }
+        if self.pending_workspace.lock().map_err(|_| ())?.is_some()
+            && matches!(runtime_state, RuntimeState::Running)
+        {
+            let _ = secure_write(&self.directory.join(CONTROL_FILE), b"stop\n", true);
+        } else if let Some(update) = self.pending_workspace.lock().map_err(|_| ())?.take() {
+            let _ = self.apply_workspace_layout(update, displays);
+            *setup = self.inner.lock().map_err(|_| ())?.clone();
+        }
+        if setup.workspace_role == WorkspaceRole::Leader
+            && setup.configured
+            && setup.workspace_revision > 0
+        {
+            if let (Some(discovery), Some(peer), Ok((payload, signature))) = (
+                self.discovery.as_ref(),
+                setup.peer.as_ref(),
+                self.sign_workspace_layout(setup),
+            ) {
+                let _ = discovery.publish_workspace_layout(
+                    &peer.peer_id,
+                    setup.workspace_revision,
+                    &payload,
+                    &signature,
+                );
+            }
+        }
+        if setup.workspace_role == WorkspaceRole::Follower
+            && setup.configured
+            && setup.workspace_revision > 0
+        {
+            if let (Some(discovery), Some(peer), Ok(signature)) = (
+                self.discovery.as_ref(),
+                setup.peer.as_ref(),
+                self.sign_workspace_ack(setup),
+            ) {
+                let _ = discovery.publish_workspace_ack(
+                    &peer.peer_id,
+                    setup.workspace_revision,
+                    &signature,
+                );
+            }
+        }
+        Ok(())
+    }
+
+    fn apply_workspace_ack(
+        &self,
+        acknowledgement: IncomingWorkspaceAcknowledgement,
+        setup: &mut StoredSetup,
+    ) -> Result<(), ()> {
+        let peer = setup.peer.as_ref().ok_or(())?;
+        let local = setup.local.as_ref().ok_or(())?;
+        if setup.workspace_role != WorkspaceRole::Leader
+            || acknowledgement.from_peer_id != peer.peer_id
+            || acknowledgement.revision != setup.workspace_revision
+            || acknowledgement.revision == 0
+        {
+            return Ok(());
+        }
+        if verify_workspace_ack_signature(
+            &peer.signing_public_key,
+            &acknowledgement.signature,
+            &peer.peer_id,
+            &local.peer_id,
+            acknowledgement.revision,
+        )
+        .is_err()
+        {
+            return Ok(());
+        }
+        if setup.workspace_acknowledged_revision != acknowledgement.revision {
+            let mut current = self.inner.lock().map_err(|_| ())?;
+            if current.workspace_role != WorkspaceRole::Leader
+                || current.workspace_revision != acknowledgement.revision
+            {
+                return Ok(());
+            }
+            current.workspace_acknowledged_revision = acknowledgement.revision;
+            self.save(&current)?;
+            *setup = current.clone();
+        }
+        Ok(())
+    }
+
+    fn verify_incoming_workspace(
+        setup: &StoredSetup,
+        update: &IncomingWorkspaceLayout,
+    ) -> Result<(), String> {
+        let peer = setup.peer.as_ref().ok_or_else(coarse_error)?;
+        let local = setup.local.as_ref().ok_or_else(coarse_error)?;
+        if setup.workspace_role != WorkspaceRole::Follower
+            || update.from_peer_id != peer.peer_id
+            || update.revision <= setup.workspace_revision
+        {
+            return Err(coarse_error());
+        }
+        verify_workspace_signature(
+            &peer.signing_public_key,
+            &update.signature,
+            &peer.peer_id,
+            &local.peer_id,
+            update.revision,
+            &update.payload,
+        )
+    }
+
+    fn apply_workspace_layout(
+        &self,
+        update: IncomingWorkspaceLayout,
+        local_displays: &[DisplayDto],
+    ) -> Result<(), String> {
+        let mut setup = self.inner.lock().map_err(|_| coarse_error())?;
+        Self::verify_incoming_workspace(&setup, &update)?;
+        let peer = setup.peer.as_ref().ok_or_else(coarse_error)?;
+        let encoded = URL_SAFE_NO_PAD
+            .decode(&update.payload)
+            .map_err(|_| coarse_error())?;
+        if encoded.len() > 16 * 1024 {
+            return Err(coarse_error());
+        }
+        let workspace: SignedWorkspaceLayout =
+            serde_json::from_slice(&encoded).map_err(|_| coarse_error())?;
+        if workspace.schema_version != 1 || workspace.revision != update.revision {
+            return Err(coarse_error());
+        }
+        validate_display_layout(&workspace.layout, local_displays, &peer.displays)?;
+        let mut candidate = setup.clone();
+        candidate.display_layout = canonical_layout(&workspace.layout);
+        candidate.workspace_revision = workspace.revision;
+        candidate.placement = placement_from_layout(
+            &candidate.display_layout,
+            local_displays,
+            &peer.displays,
+        )?;
+        write_setup_configuration(self, &mut candidate)?;
+        *setup = candidate;
+        Ok(())
     }
 
     fn developer_diagnostics(&self, setup: &StoredSetup) -> DeveloperDiagnosticsDto {
@@ -599,6 +862,9 @@ fn reset_legacy_credentials(
     setup.local = None;
     setup.peer = None;
     setup.display_layout.clear();
+    setup.workspace_role = WorkspaceRole::Unassigned;
+    setup.workspace_revision = 0;
+    setup.workspace_acknowledged_revision = 0;
     setup.configured = false;
     setup.validated = false;
     Ok(true)
@@ -753,7 +1019,7 @@ pub(crate) fn import_peer_bundle(
     service: State<'_, SetupService>,
 ) -> Result<SetupSnapshot, String> {
     ensure_runtime_stopped(&service)?;
-    service.install_peer_bundle(&bundle)?;
+    service.install_peer_bundle(&bundle, WorkspaceRole::Unassigned)?;
     service.snapshot().map_err(|()| coarse_error())
 }
 
@@ -823,7 +1089,7 @@ pub(crate) fn confirm_nearby_pairing(
     discovery
         .confirm_pairing(&request_id)
         .map_err(|()| coarse_error())?;
-    service.install_peer_bundle(&bundle)?;
+    service.install_peer_bundle(&bundle, WorkspaceRole::Leader)?;
     service.snapshot().map_err(|()| coarse_error())
 }
 
@@ -852,6 +1118,10 @@ pub(crate) fn forget_paired_computer(
         return Err(coarse_error());
     }
     setup.peer = None;
+    setup.display_layout.clear();
+    setup.workspace_role = WorkspaceRole::Unassigned;
+    setup.workspace_revision = 0;
+    setup.workspace_acknowledged_revision = 0;
     setup.configured = false;
     setup.validated = false;
     service.save(&setup).map_err(|()| coarse_error())?;
@@ -880,9 +1150,23 @@ pub(crate) fn finalize_setup(
 ) -> Result<SetupSnapshot, String> {
     ensure_runtime_stopped(&service)?;
     let mut setup = service.inner.lock().map_err(|_| coarse_error())?;
-    setup.placement = placement;
-    setup.display_layout = layout;
-    write_setup_configuration(&service, &mut setup)?;
+    if setup.workspace_role == WorkspaceRole::Follower {
+        return Err("The paired computer controls this display map. Change it there and this computer will follow automatically.".to_owned());
+    }
+    let canonical = canonical_layout(&layout);
+    let changed = canonical != canonical_layout(&setup.display_layout);
+    let mut candidate = setup.clone();
+    candidate.placement = placement;
+    candidate.display_layout = canonical;
+    if candidate.workspace_role == WorkspaceRole::Leader && changed {
+        candidate.workspace_revision = candidate
+            .workspace_revision
+            .checked_add(1)
+            .ok_or_else(coarse_error)?;
+        candidate.workspace_acknowledged_revision = 0;
+    }
+    write_setup_configuration(&service, &mut candidate)?;
+    *setup = candidate;
     drop(setup);
     service.snapshot().map_err(|()| coarse_error())
 }
@@ -926,6 +1210,9 @@ pub(crate) fn start_runtime(service: State<'_, SetupService>) -> Result<SetupSna
         let mut setup = service.inner.lock().map_err(|_| coarse_error())?;
         if !setup.validated {
             return Err(coarse_error());
+        }
+        if !workspace_is_synchronized(&setup) {
+            return Err("The paired computer has not confirmed this display map yet. Keep both setup consoles open and wait for display-map sync.".to_owned());
         }
         // Re-enumerate displays on every start. Docking, undocking, or moving
         // a secondary monitor must not leave the cross-host edge attached to
@@ -1066,9 +1353,14 @@ fn validate_bundle(peer: &PairingBundle) -> Result<(), String> {
     let certificate = URL_SAFE_NO_PAD
         .decode(&peer.certificate_der)
         .map_err(|_| coarse_error())?;
+    let signing_public_key = URL_SAFE_NO_PAD
+        .decode(&peer.signing_public_key)
+        .map_err(|_| coarse_error())?;
     if certificate.is_empty()
         || certificate.len() > kvm_runtime::MAX_CERTIFICATE_DER_BYTES
         || hex::encode(Sha256::digest(&certificate)) != peer.certificate_fingerprint
+        || signing_public_key.len() != 65
+        || signing_public_key.first() != Some(&4)
     {
         return Err(coarse_error());
     }
@@ -1218,6 +1510,139 @@ fn default_display_layout(
         x += display.width;
     }
     Ok(layout)
+}
+
+fn canonical_layout(layout: &[DisplayLayoutDto]) -> Vec<DisplayLayoutDto> {
+    let mut canonical = layout.to_vec();
+    canonical.sort_by_key(|display| display.display_id);
+    canonical
+}
+
+fn workspace_signature_message(
+    from_peer_id: &str,
+    to_peer_id: &str,
+    revision: u64,
+    payload: &str,
+) -> Vec<u8> {
+    let mut message = Vec::with_capacity(
+        64 + from_peer_id.len() + to_peer_id.len() + payload.len(),
+    );
+    message.extend_from_slice(b"software-kvm-workspace-layout-v1\0");
+    message.extend_from_slice(from_peer_id.as_bytes());
+    message.push(0);
+    message.extend_from_slice(to_peer_id.as_bytes());
+    message.push(0);
+    message.extend_from_slice(&revision.to_be_bytes());
+    message.extend_from_slice(payload.as_bytes());
+    message
+}
+
+fn workspace_ack_signature_message(
+    from_peer_id: &str,
+    to_peer_id: &str,
+    revision: u64,
+) -> Vec<u8> {
+    let mut message = Vec::with_capacity(64 + from_peer_id.len() + to_peer_id.len());
+    message.extend_from_slice(b"software-kvm-workspace-layout-ack-v1\0");
+    message.extend_from_slice(from_peer_id.as_bytes());
+    message.push(0);
+    message.extend_from_slice(to_peer_id.as_bytes());
+    message.push(0);
+    message.extend_from_slice(&revision.to_be_bytes());
+    message
+}
+
+fn verify_workspace_signature(
+    encoded_public_key: &str,
+    encoded_signature: &str,
+    from_peer_id: &str,
+    to_peer_id: &str,
+    revision: u64,
+    payload: &str,
+) -> Result<(), String> {
+    let public_key = URL_SAFE_NO_PAD
+        .decode(encoded_public_key)
+        .map_err(|_| coarse_error())?;
+    let signature = URL_SAFE_NO_PAD
+        .decode(encoded_signature)
+        .map_err(|_| coarse_error())?;
+    let message = workspace_signature_message(
+        from_peer_id,
+        to_peer_id,
+        revision,
+        payload,
+    );
+    UnparsedPublicKey::new(&ECDSA_P256_SHA256_ASN1, public_key)
+        .verify(&message, &signature)
+        .map_err(|_| coarse_error())
+}
+
+fn verify_workspace_ack_signature(
+    encoded_public_key: &str,
+    encoded_signature: &str,
+    from_peer_id: &str,
+    to_peer_id: &str,
+    revision: u64,
+) -> Result<(), String> {
+    let public_key = URL_SAFE_NO_PAD
+        .decode(encoded_public_key)
+        .map_err(|_| coarse_error())?;
+    let signature = URL_SAFE_NO_PAD
+        .decode(encoded_signature)
+        .map_err(|_| coarse_error())?;
+    let message = workspace_ack_signature_message(from_peer_id, to_peer_id, revision);
+    UnparsedPublicKey::new(&ECDSA_P256_SHA256_ASN1, public_key)
+        .verify(&message, &signature)
+        .map_err(|_| coarse_error())
+}
+
+fn workspace_is_synchronized(setup: &StoredSetup) -> bool {
+    matches!(
+        workspace_sync_state(setup),
+        WorkspaceSyncState::Manual | WorkspaceSyncState::Confirmed
+    )
+}
+
+fn workspace_sync_state(setup: &StoredSetup) -> WorkspaceSyncState {
+    if !setup.configured {
+        return WorkspaceSyncState::NotConfigured;
+    }
+    match setup.workspace_role {
+        WorkspaceRole::Unassigned => WorkspaceSyncState::Manual,
+        WorkspaceRole::Follower if setup.workspace_revision > 0 => WorkspaceSyncState::Confirmed,
+        WorkspaceRole::Leader
+            if setup.workspace_revision > 0
+                && setup.workspace_acknowledged_revision == setup.workspace_revision =>
+        {
+            WorkspaceSyncState::Confirmed
+        }
+        WorkspaceRole::Leader | WorkspaceRole::Follower => WorkspaceSyncState::Waiting,
+    }
+}
+
+fn placement_from_layout(
+    layout: &[DisplayLayoutDto],
+    local_displays: &[DisplayDto],
+    peer_displays: &[DisplayDto],
+) -> Result<Placement, String> {
+    let positions = layout
+        .iter()
+        .map(|position| (position.display_id, position))
+        .collect::<HashMap<_, _>>();
+    let center = |displays: &[DisplayDto]| -> Result<f64, String> {
+        let sum = displays.iter().try_fold(0.0, |sum, display| {
+            let id = display.id.parse::<DisplayId>().map_err(|_| coarse_error())?;
+            let position = positions.get(&id).ok_or_else(coarse_error)?;
+            Ok::<_, String>(sum + position.x + display.width / 2.0)
+        })?;
+        let count = u32::try_from(displays.len()).map_err(|_| coarse_error())?;
+        Ok(sum / f64::from(count))
+    };
+    Ok(if center(local_displays)? <= center(peer_displays)? {
+        Placement::LocalLeft
+    } else {
+        Placement::LocalRight
+    })
 }
 
 fn validate_display_layout(
@@ -1790,16 +2215,17 @@ fn runtime_lock_held(directory: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_config, read_input_authority, validate_bundle, DisplayDto, DisplayLayoutDto,
-        InputOwnerState, NativeBoundsDto, PairingBundle, Placement, PlatformDto, PAIRING_VERSION,
-        RUNTIME_STATUS_FILE,
+        build_config, read_input_authority, validate_bundle, verify_workspace_ack_signature,
+        verify_workspace_signature, workspace_ack_signature_message, workspace_signature_message,
+        DisplayDto, DisplayLayoutDto, InputOwnerState, NativeBoundsDto, PairingBundle, Placement,
+        PlatformDto, PAIRING_VERSION, RUNTIME_STATUS_FILE,
     };
     #[cfg(windows)]
     use super::{rewrite_windows_profile_paths, CONFIG_FILE, KEY_FILE};
     use base64::engine::general_purpose::URL_SAFE_NO_PAD;
     use base64::Engine;
     use kvm_types::Edge;
-    use rcgen::{CertificateParams, KeyPair};
+    use rcgen::{CertificateParams, KeyPair, SigningKey};
     use sha2::{Digest, Sha256};
     use std::fs;
     #[cfg(windows)]
@@ -1840,6 +2266,7 @@ mod tests {
             certificate_fingerprint: hex::encode(Sha256::digest(&certificate)),
             address: "192.168.1.22:24800".to_owned(),
             certificate_der: URL_SAFE_NO_PAD.encode(certificate),
+            signing_public_key: URL_SAFE_NO_PAD.encode(key.public_key_raw()),
             displays: vec![display("00000000-0000-4000-8000-000000000003", true)],
         }
     }
@@ -1848,6 +2275,9 @@ mod tests {
     fn pairing_bundle_is_bounded_and_rejects_duplicate_displays() {
         let mut peer = bundle();
         assert!(validate_bundle(&peer).is_ok());
+        let mut invalid_signer = peer.clone();
+        invalid_signer.signing_public_key = URL_SAFE_NO_PAD.encode([0_u8; 65]);
+        assert!(validate_bundle(&invalid_signer).is_err());
         peer.displays.push(peer.displays[0].clone());
         assert!(validate_bundle(&peer).is_err());
     }
@@ -1980,6 +2410,34 @@ mod tests {
         ];
 
         assert!(build_config(&peer, &local, &Placement::LocalLeft, &layout).is_err());
+    }
+
+    #[test]
+    fn workspace_signature_binds_both_peers_revision_and_payload() {
+        let key = KeyPair::generate().unwrap();
+        let from = "00000000-0000-4000-8000-000000000001";
+        let to = "00000000-0000-4000-8000-000000000002";
+        let payload = "eyJzY2hlbWFfdmVyc2lvbiI6MX0";
+        let message = workspace_signature_message(from, to, 7, payload);
+        let signature = key.sign(&message).unwrap();
+        let public_key = URL_SAFE_NO_PAD.encode(key.public_key_raw());
+        let signature = URL_SAFE_NO_PAD.encode(signature);
+
+        assert!(verify_workspace_signature(&public_key, &signature, from, to, 7, payload).is_ok());
+        assert!(verify_workspace_signature(&public_key, &signature, from, to, 8, payload).is_err());
+        assert!(verify_workspace_signature(&public_key, &signature, to, from, 7, payload).is_err());
+
+        let acknowledgement = workspace_ack_signature_message(to, from, 7);
+        let acknowledgement = URL_SAFE_NO_PAD.encode(key.sign(&acknowledgement).unwrap());
+        assert!(
+            verify_workspace_ack_signature(&public_key, &acknowledgement, to, from, 7).is_ok()
+        );
+        assert!(
+            verify_workspace_ack_signature(&public_key, &acknowledgement, to, from, 8).is_err()
+        );
+        assert!(
+            verify_workspace_ack_signature(&public_key, &acknowledgement, from, to, 7).is_err()
+        );
     }
 
     #[test]
