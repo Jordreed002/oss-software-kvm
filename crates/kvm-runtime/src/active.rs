@@ -767,7 +767,15 @@ where
         }
     };
     let generation = prepared.generation();
-    match lock_manager(manager)?.install_prepared_session(prepared) {
+    // Bind the manager guard to a block scope so it is dropped at the block's
+    // closing brace, *before* the `match` runs. Otherwise the match-scrutinee
+    // temporary keeps the non-reentrant std Mutex locked for the whole match,
+    // and the `Err` arm's `lock_manager(manager)?` would self-deadlock (F-01).
+    let install_outcome = {
+        let mut manager_guard = lock_manager(manager)?;
+        manager_guard.install_prepared_session(prepared)
+    };
+    match install_outcome {
         Ok(installed) => {
             developer_event("session=installed");
             Ok(installed)

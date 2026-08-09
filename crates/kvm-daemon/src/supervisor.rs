@@ -1549,6 +1549,18 @@ where
             self.workspace_reconciliation = Some(WorkspaceReconciliationPhase::GracefulSettled);
             return self.reconcile_gracefully_settled_with_workspace(generation, workspace, now_ns);
         }
+        // F-03: release locally-injected inbound keys BEFORE the workspace retire,
+        // so an in-flight affine capture decision (pending_remote.is_some()) cannot
+        // skip the inbound release. retire()->clear_workspace_routing_ready returns
+        // Err(Unavailable) in that case — normal during active input — and the old
+        // retire-then-? ordering let that propagate and skip session_fatal_cleanup,
+        // leaking pressed inbound keys. The inbound release is independent of the
+        // outbound queue/drain, so the original retire-then-cleanup ordering (and
+        // its retry semantics) is preserved unchanged.
+        self.engine
+            .coordinator
+            .release_all_inbound_keys(now_ns)
+            .map_err(PeerSessionSupervisorError::Coordinator)?;
         {
             let mut routing =
                 SessionRoutingContext::new(&mut self.engine.coordinator, current.endpoint())?;
@@ -1614,6 +1626,13 @@ where
             self.workspace_reconciliation = Some(WorkspaceReconciliationPhase::GracefulSettled);
             return self.reconcile_gracefully_settled_with_workspace(generation, workspace, now_ns);
         }
+        // F-03: same invariant as the fatal path — release locally-injected inbound
+        // keys before the workspace retire so an in-flight affine capture decision
+        // cannot skip it. The original retire-then-shutdown ordering is preserved.
+        self.engine
+            .coordinator
+            .release_all_inbound_keys(now_ns)
+            .map_err(PeerSessionSupervisorError::Coordinator)?;
         {
             let mut routing =
                 SessionRoutingContext::new(&mut self.engine.coordinator, current.endpoint())?;
