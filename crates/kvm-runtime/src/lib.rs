@@ -390,12 +390,24 @@ fn valid_absolute_path(path: &Path) -> bool {
 mod tests {
     use super::*;
 
+    // Forward-slash paths are valid in a TOML basic string (no backslash
+    // escaping) and `Path::is_absolute` accepts them on both Unix (`/...`) and
+    // Windows (`C:/...` carries a drive prefix plus root), so one fixture
+    // validates `valid_absolute_path` on every target. `Path::is_absolute` is
+    // host-aware, so the prefix must be selected per platform.
+    const TEST_PATH_BASE: &str = if cfg!(windows) {
+        "C:/software-kvm"
+    } else {
+        "/etc/software-kvm"
+    };
+
     fn valid_source() -> String {
-        r#"
+        format!(
+            r#"
 version = 2
 enabled = false
 whole_host_alpha = false
-kvm_config_path = "/etc/software-kvm/config.toml"
+kvm_config_path = "{TEST_PATH_BASE}/config.toml"
 topology = "selected_only"
 routing = "selected_only"
 listen_addresses = ["192.168.1.10:24800"]
@@ -413,11 +425,11 @@ socket_address = "192.168.1.20:24800"
 server_name = "selected-peer.kvm.test"
 
 [tls]
-certificate = "/etc/software-kvm/tls/local.crt"
-private_key = "/etc/software-kvm/tls/local.key"
-peer_trust = "/etc/software-kvm/tls/selected-peer.crt"
+certificate = "{TEST_PATH_BASE}/tls/local.crt"
+private_key = "{TEST_PATH_BASE}/tls/local.key"
+peer_trust = "{TEST_PATH_BASE}/tls/selected-peer.crt"
 "#
-        .into()
+        )
     }
 
     #[test]
@@ -486,8 +498,11 @@ peer_trust = "/etc/software-kvm/tls/selected-peer.crt"
     #[test]
     fn rejects_relative_or_empty_paths_and_unsafe_endpoint() {
         for source in [
-            valid_source().replace("/etc/software-kvm/config.toml", "relative/config.toml"),
-            valid_source().replace("/etc/software-kvm/tls/local.key", ""),
+            valid_source().replace(
+                &format!("{TEST_PATH_BASE}/config.toml"),
+                "relative/config.toml",
+            ),
+            valid_source().replace(&format!("{TEST_PATH_BASE}/tls/local.key"), ""),
             valid_source().replace("192.168.1.20:24800", "0.0.0.0:24800"),
             valid_source().replace("192.168.1.20:24800", "192.168.1.20:0"),
         ] {
@@ -569,7 +584,7 @@ peer_trust = "/etc/software-kvm/tls/selected-peer.crt"
         for rendered in [format!("{error}"), format!("{error:?}")] {
             assert!(!rendered.contains("SECRET"));
             assert!(!rendered.contains("192.168.1.20"));
-            assert!(!rendered.contains("/etc/software-kvm"));
+            assert!(!rendered.contains(TEST_PATH_BASE));
             assert!(!rendered.contains("11111111"));
         }
 

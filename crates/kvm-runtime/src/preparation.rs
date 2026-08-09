@@ -967,7 +967,11 @@ peer_trust = "{}"
     }
 }
 
-#[cfg(all(test, not(unix)))]
+// `prepare` only returns `UnsupportedPlatform` on targets with neither Unix nor
+// Windows file security (see the dispatch in `prepare`). Windows now does real
+// work via `prepare_windows`, so this assertion must run on truly-unsupported
+// targets only — otherwise it would assert the wrong error kind on Windows.
+#[cfg(all(test, not(any(unix, windows))))]
 mod non_unix_tests {
     use super::*;
 
