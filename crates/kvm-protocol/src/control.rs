@@ -280,6 +280,105 @@ impl ControlFrame {
     }
 }
 
+// --- Local transport abstraction -------------------------------------------
+//
+// The control panel and daemon exchange [`ControlFrame`]s over a local channel
+// (named pipe on Windows, Unix domain socket on macOS). This trait captures the
+// contract both ends program against so the daemon, the panel, and integration
+// tests can be written before a specific OS-backed implementation exists. The
+// loopback below carries frames through the real codec so it also exercises
+// [`encode_control`]/[`decode_control`].
+
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{self, RecvTimeoutError, Sender};
+use std::sync::Arc;
+use std::time::Duration;
+
+/// One end of a daemon↔control-panel local channel.
+///
+/// The channel is reliable, ordered, and carries whole [`ControlFrame`]s.
+/// Implementations wrap a platform transport (named pipe / Unix socket) and
+/// serialise through [`encode_control`]/[`decode_control`].
+pub trait LocalControlTransport: Send {
+    /// Send a frame to the peer.
+    ///
+    /// # Errors
+    /// Returns [`ControlCodecError::Oversized`] when the frame exceeds
+    /// [`MAX_CONTROL_FRAME_BYTES`], or [`ControlCodecError::Malformed`] when the
+    /// peer's end has gone away.
+    fn send(&mut self, frame: ControlFrame) -> Result<(), ControlCodecError>;
+
+    /// Receive the next pending frame without blocking.
+    ///
+    /// # Errors
+    /// Returns [`ControlCodecError::Malformed`] on a decode failure or when the
+    /// peer's end has gone away.
+    fn try_recv(&mut self) -> Result<Option<ControlFrame>, ControlCodecError>;
+
+    /// Whether the peer has closed its end of the channel.
+    #[must_use]
+    fn is_closed(&self) -> bool;
+}
+
+/// In-process loopback transport for tests and the control panel's dev harness.
+///
+/// Create a connected pair with [`LoopbackControlTransport::pair`]. Frames pass
+/// through the real codec so the loopback doubles as an end-to-end codec test.
+#[derive(Debug)]
+pub struct LoopbackControlTransport {
+    tx: Sender<Vec<u8>>,
+    rx: mpsc::Receiver<Vec<u8>>,
+    peer_closed: Arc<AtomicBool>,
+}
+
+impl LoopbackControlTransport {
+    /// Creates two ends connected to each other.
+    #[must_use]
+    pub fn pair() -> (Self, Self) {
+        let (tx_a, rx_a) = mpsc::channel();
+        let (tx_b, rx_b) = mpsc::channel();
+        let peer_closed_a = Arc::new(AtomicBool::new(false));
+        let peer_closed_b = Arc::new(AtomicBool::new(false));
+        (
+            Self {
+                tx: tx_a,
+                rx: rx_b,
+                peer_closed: peer_closed_a,
+            },
+            Self {
+                tx: tx_b,
+                rx: rx_a,
+                peer_closed: peer_closed_b,
+            },
+        )
+    }
+}
+
+impl LocalControlTransport for LoopbackControlTransport {
+    fn send(&mut self, frame: ControlFrame) -> Result<(), ControlCodecError> {
+        let bytes = encode_control(&frame)?;
+        // A send error means the peer dropped its receiver: surface as closed.
+        self.tx
+            .send(bytes)
+            .map_err(|_| ControlCodecError::Malformed)
+    }
+
+    fn try_recv(&mut self) -> Result<Option<ControlFrame>, ControlCodecError> {
+        match self.rx.recv_timeout(Duration::ZERO) {
+            Ok(bytes) => decode_control(&bytes).map(Some),
+            Err(RecvTimeoutError::Timeout) => Ok(None),
+            Err(RecvTimeoutError::Disconnected) => {
+                self.peer_closed.store(true, Ordering::Release);
+                Err(ControlCodecError::Malformed)
+            }
+        }
+    }
+
+    fn is_closed(&self) -> bool {
+        self.peer_closed.load(Ordering::Acquire)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -452,5 +551,56 @@ mod tests {
             decode_control(&[]).unwrap_err(),
             ControlCodecError::Malformed
         );
+    }
+
+    #[test]
+    fn loopback_round_trips_request_and_response_in_order() {
+        let (mut panel, mut daemon) = LoopbackControlTransport::pair();
+
+        // Panel -> daemon: a request. Daemon starts with nothing pending.
+        assert_eq!(daemon.try_recv().unwrap(), None);
+        panel
+            .send(ControlFrame::Request(ControlRequest::GetStatus))
+            .unwrap();
+
+        let received = daemon.try_recv().unwrap().unwrap();
+        assert_eq!(
+            received,
+            ControlFrame::Request(ControlRequest::GetStatus)
+        );
+
+        // Daemon -> panel: the response, through the same codec.
+        daemon
+            .send(ControlFrame::Response(ControlResponse::Status(ControlStatus {
+                active_host: host(1),
+                active_display: display(2),
+                kvm_enabled: true,
+                clipboard_enabled: true,
+                protocol_version: 2,
+                round_trip_time_ms: Some(4),
+                peer_state: ControlPeerState::Connected,
+            })))
+            .unwrap();
+        let response = panel.try_recv().unwrap().unwrap();
+        let ControlFrame::Response(ControlResponse::Status(status)) = response else {
+            panic!("expected status response, got {response:?}");
+        };
+        assert!(status.kvm_enabled);
+        assert_eq!(status.round_trip_time_ms, Some(4));
+
+        // No further frames pending on either end, and neither is closed.
+        assert_eq!(panel.try_recv().unwrap(), None);
+        assert!(!panel.is_closed());
+        assert!(!daemon.is_closed());
+    }
+
+    #[test]
+    fn dropping_one_end_observes_closure_on_the_other() {
+        let (mut panel, daemon) = LoopbackControlTransport::pair();
+        drop(daemon);
+        // A send after the peer is gone fails; the panel learns it is closed.
+        assert!(panel
+            .send(ControlFrame::Request(ControlRequest::TriggerFailsafe))
+            .is_err());
     }
 }
