@@ -534,6 +534,16 @@ impl MacInputBackend {
         if self.capture.is_some() || self.whole_host_capture.is_some() {
             return Err(MacBackendError::CaptureAlreadyRunning.into());
         }
+        // F-18: preflight permissions before IOHIDManagerOpen, mirroring
+        // start_whole_host_alpha. Without this, a denied Input Monitoring grant
+        // surfaces as a healthy-looking but silently dead capture (zero events).
+        let permissions = probe_permissions()?;
+        if !permissions.input_monitoring {
+            return Err(MacBackendError::PermissionDenied("Input Monitoring").into());
+        }
+        if !permissions.accessibility {
+            return Err(MacBackendError::PermissionDenied("Accessibility").into());
+        }
 
         let counters = Arc::new(CaptureCounters::default());
         let (event_sender, event_receiver) = sync_channel(CAPTURE_QUEUE_CAPACITY);
