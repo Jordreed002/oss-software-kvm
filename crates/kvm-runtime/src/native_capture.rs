@@ -59,6 +59,20 @@ pub trait NativeCaptureRouter: Send {
     fn local_pointer_position(&self) -> Result<Option<Point>, Self::Error> {
         Ok(None)
     }
+
+    /// Observes a native cursor coordinate for destination-side portal
+    /// detection without routing or suppressing an input event.
+    ///
+    /// # Errors
+    ///
+    /// Returns an implementation-defined coordination error.
+    fn observe_pointer_position(
+        &mut self,
+        _position: Point,
+        _now_ns: u64,
+    ) -> Result<bool, Self::Error> {
+        Ok(false)
+    }
 }
 
 impl<I, O> NativeCaptureRouter for PeerManager<I, O>
@@ -90,6 +104,14 @@ where
 
     fn local_pointer_position(&self) -> Result<Option<Point>, Self::Error> {
         self.local_pointer_position()
+    }
+
+    fn observe_pointer_position(
+        &mut self,
+        position: Point,
+        now_ns: u64,
+    ) -> Result<bool, Self::Error> {
+        self.observe_native_pointer(position, now_ns)
     }
 }
 
@@ -125,6 +147,12 @@ pub(crate) struct NativeCaptureMetrics {
     pub(crate) allowed_local: u64,
     pub(crate) lock_contention: u64,
     pub(crate) callback_panics: u64,
+    pub(crate) pointer_observations: u64,
+    pub(crate) pointer_transitions: u64,
+    pub(crate) pointer_observation_failures: u64,
+    pub(crate) cursor_hides: u64,
+    pub(crate) cursor_shows: u64,
+    pub(crate) cursor_warps: u64,
 }
 
 #[derive(Default)]
@@ -188,6 +216,12 @@ pub struct NativeCaptureSupervisor<B: InputCaptureBackend, R> {
     metrics: Arc<SharedCaptureMetrics>,
     state: NativeCaptureState,
     cursor_visible: bool,
+    pointer_observations: u64,
+    pointer_transitions: u64,
+    pointer_observation_failures: u64,
+    cursor_hides: u64,
+    cursor_shows: u64,
+    cursor_warps: u64,
 }
 
 impl<B: InputCaptureBackend, R> Drop for NativeCaptureSupervisor<B, R> {
@@ -238,6 +272,12 @@ where
             metrics: Arc::new(SharedCaptureMetrics::default()),
             state: NativeCaptureState::LocalOnly,
             cursor_visible: true,
+            pointer_observations: 0,
+            pointer_transitions: 0,
+            pointer_observation_failures: 0,
+            cursor_hides: 0,
+            cursor_shows: 0,
+            cursor_warps: 0,
         }
     }
 
@@ -254,6 +294,12 @@ where
             allowed_local: self.metrics.allowed_local.load(Ordering::Relaxed),
             lock_contention: self.metrics.lock_contention.load(Ordering::Relaxed),
             callback_panics: self.metrics.callback_panics.load(Ordering::Relaxed),
+            pointer_observations: self.pointer_observations,
+            pointer_transitions: self.pointer_transitions,
+            pointer_observation_failures: self.pointer_observation_failures,
+            cursor_hides: self.cursor_hides,
+            cursor_shows: self.cursor_shows,
+            cursor_warps: self.cursor_warps,
         }
     }
 
@@ -324,6 +370,7 @@ where
             return Ok(self.state);
         }
         if self.backend.capture_lifecycle() == CaptureLifecycleState::Running {
+            self.observe_cursor_position(now_ns);
             self.sync_cursor_visibility(now_ns)?;
             return Ok(self.state);
         }
@@ -337,6 +384,32 @@ where
         let _ = self.backend.stop_capture();
         self.state = NativeCaptureState::Degraded;
         Err(NativeCaptureError::new(NativeCaptureErrorKind::Lifecycle))
+    }
+
+    fn observe_cursor_position(&mut self, now_ns: u64) {
+        let position = match self.backend.cursor_position() {
+            Ok(Some(position)) => position,
+            Ok(None) => return,
+            Err(_) => {
+                self.pointer_observation_failures =
+                    self.pointer_observation_failures.saturating_add(1);
+                return;
+            }
+        };
+        self.pointer_observations = self.pointer_observations.saturating_add(1);
+        let Ok(mut router) = self.router.try_lock() else {
+            return;
+        };
+        match router.observe_pointer_position(position, now_ns) {
+            Ok(true) => {
+                self.pointer_transitions = self.pointer_transitions.saturating_add(1);
+            }
+            Ok(false) => {}
+            Err(_) => {
+                self.pointer_observation_failures =
+                    self.pointer_observation_failures.saturating_add(1);
+            }
+        }
     }
 
     /// Gates routing before attempting native teardown.
@@ -430,7 +503,15 @@ where
         } else {
             Ok(())
         };
-        if position_result.is_err() || self.backend.set_cursor_visible(local_authority).is_err() {
+        if position_result.is_ok() && local_authority && local_position.is_some() {
+            self.cursor_warps = self.cursor_warps.saturating_add(1);
+        }
+        let visibility_result = if position_result.is_ok() {
+            self.backend.set_cursor_visible(local_authority)
+        } else {
+            position_result
+        };
+        if visibility_result.is_err() {
             self.callback_armed.store(false, Ordering::Release);
             let _ = self.gate_router(now_ns);
             let _ = self.backend.set_cursor_visible(true);
@@ -438,6 +519,11 @@ where
             let _ = self.backend.stop_capture();
             self.state = NativeCaptureState::Degraded;
             return Err(NativeCaptureError::new(NativeCaptureErrorKind::Cursor));
+        }
+        if local_authority {
+            self.cursor_shows = self.cursor_shows.saturating_add(1);
+        } else {
+            self.cursor_hides = self.cursor_hides.saturating_add(1);
         }
         self.cursor_visible = local_authority;
         Ok(())
@@ -535,6 +621,7 @@ mod tests {
         fail_stop: bool,
         start_disposition: Option<CaptureDisposition>,
         cursor_visible: bool,
+        cursor_position: Option<Point>,
     }
 
     struct FakeBackend {
@@ -592,6 +679,10 @@ mod tests {
             lock(&self.events).push("cursor_warp");
             Ok(())
         }
+
+        fn cursor_position(&self) -> Result<Option<Point>, PlatformError> {
+            Ok(lock(&self.control).cursor_position)
+        }
     }
 
     struct FakeRouter {
@@ -602,6 +693,7 @@ mod tests {
         last_route_now_ns: Option<u64>,
         local_authority: bool,
         local_position: Option<Point>,
+        observed_position: Option<Point>,
     }
 
     impl NativeCaptureRouter for FakeRouter {
@@ -643,6 +735,15 @@ mod tests {
         fn local_pointer_position(&self) -> Result<Option<Point>, Self::Error> {
             Ok(self.local_position)
         }
+
+        fn observe_pointer_position(
+            &mut self,
+            position: Point,
+            _now_ns: u64,
+        ) -> Result<bool, Self::Error> {
+            self.observed_position = Some(position);
+            Ok(false)
+        }
     }
 
     fn captured() -> CapturedInput {
@@ -683,6 +784,7 @@ mod tests {
             last_route_now_ns: None,
             local_authority: true,
             local_position: None,
+            observed_position: None,
         }));
         let backend = FakeBackend {
             control: Arc::clone(&backend_control),
@@ -784,6 +886,20 @@ mod tests {
         assert_eq!(
             *lock(&events),
             vec!["cursor_hide", "cursor_warp", "cursor_show"]
+        );
+    }
+
+    #[test]
+    fn lifecycle_poll_observes_injected_destination_cursor_motion() {
+        let (mut supervisor, backend, router, _) = fixture(CaptureDisposition::AllowLocal);
+        supervisor.start(10).unwrap();
+        lock(&backend).cursor_position = Some(Point::new(1919.0, 540.0));
+
+        supervisor.poll_lifecycle(20).unwrap();
+
+        assert_eq!(
+            lock(&router).observed_position,
+            Some(Point::new(1919.0, 540.0))
         );
     }
 

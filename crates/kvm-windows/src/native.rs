@@ -305,9 +305,11 @@ impl WholeHostCallbackState {
     }
 
     fn pointer_delta(&self, x: i32, y: i32) -> Option<InputPayload> {
-        let old_x = self.pointer_x.swap(x, Ordering::Relaxed);
-        let old_y = self.pointer_y.swap(y, Ordering::Relaxed);
+        let old_x = self.pointer_x.load(Ordering::Relaxed);
+        let old_y = self.pointer_y.load(Ordering::Relaxed);
         if !self.pointer_initialized.swap(true, Ordering::Relaxed) {
+            self.pointer_x.store(x, Ordering::Relaxed);
+            self.pointer_y.store(y, Ordering::Relaxed);
             return None;
         }
         let dx = x.saturating_sub(old_x);
@@ -320,6 +322,12 @@ impl WholeHostCallbackState {
                 dy: f64::from(dy),
             })
         }
+    }
+
+    fn commit_pointer_position(&self, x: i32, y: i32) {
+        self.pointer_x.store(x, Ordering::Relaxed);
+        self.pointer_y.store(y, Ordering::Relaxed);
+        self.pointer_initialized.store(true, Ordering::Release);
     }
 
     fn seed_pointer(&self, x: i32, y: i32) {
@@ -1365,6 +1373,16 @@ impl InputCaptureBackend for WindowsInputBackend {
         unsafe { SetCursorPos(x, y) }
             .map_err(|error| Box::new(binding_error("SetCursorPos", &error)) as PlatformError)
     }
+
+    fn cursor_position(&self) -> Result<Option<Point>, PlatformError> {
+        let mut position = POINT::default();
+        unsafe { GetCursorPos(&raw mut position) }
+            .map_err(|error| Box::new(binding_error("GetCursorPos", &error)) as PlatformError)?;
+        Ok(Some(Point::new(
+            f64::from(position.x),
+            f64::from(position.y),
+        )))
+    }
 }
 
 impl OutputInjectionBackend for WindowsOutputBackend {
@@ -1588,12 +1606,19 @@ unsafe extern "system" fn low_level_mouse_hook(
             state.track_button(button, value);
         }
     }
-    if state.dispatch(
+    let suppressed = state.dispatch(
         payload,
         classification,
         state.pointer_device,
         Some(Point::new(f64::from(record.pt.x), f64::from(record.pt.y))),
-    ) {
+    );
+    if message == WM_MOUSEMOVE && !suppressed {
+        // A suppressed low-level movement never advances the Windows cursor.
+        // Keep the baseline at the last OS-applied position so successive
+        // physical packets continue producing relative movement remotely.
+        state.commit_pointer_position(record.pt.x, record.pt.y);
+    }
+    if suppressed {
         LRESULT(1)
     } else {
         // SAFETY: all non-suppressed paths must remain in the local hook chain.
@@ -2569,6 +2594,28 @@ fn binding_error(operation: &'static str, error: &windows::core::Error) -> Windo
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn suppressed_pointer_motion_keeps_the_os_applied_baseline() {
+        let state = WholeHostCallbackState::new(
+            HostId::from_bytes([1; 16]),
+            Arc::new(|_| CaptureDisposition::SuppressLocal),
+            Arc::new(CaptureCounters::default()),
+        );
+        state.seed_pointer(100, 100);
+
+        assert_eq!(
+            state.pointer_delta(105, 100),
+            Some(InputPayload::PointerMove { dx: 5.0, dy: 0.0 })
+        );
+        assert_eq!(
+            state.pointer_delta(105, 100),
+            Some(InputPayload::PointerMove { dx: 5.0, dy: 0.0 })
+        );
+
+        state.commit_pointer_position(105, 100);
+        assert_eq!(state.pointer_delta(105, 100), None);
+    }
 
     #[test]
     fn fractional_pointer_delta_is_carried_forward() {

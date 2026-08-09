@@ -982,6 +982,12 @@ impl InputCaptureBackend for MacInputBackend {
             .into())
         }
     }
+
+    fn cursor_position(&self) -> Result<Option<Point>, PlatformError> {
+        let position =
+            current_pointer_location().map_err(|error| Box::new(error) as PlatformError)?;
+        Ok(Some(Point::new(position.x, position.y)))
+    }
 }
 
 /// Quartz output injector with button state needed to emit drag events.

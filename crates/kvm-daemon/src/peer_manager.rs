@@ -465,6 +465,36 @@ where
             .map(crate::workspace_control::WorkspaceControlPlane::local_pointer_native_position)
     }
 
+    /// Observes a trusted native cursor coordinate and initiates its configured
+    /// cross-host transition when it reaches a portal.
+    ///
+    /// This path carries no input payload and grants no suppression authority.
+    /// It lets destination-side cursor movement produced by authenticated
+    /// injection trigger the same exact handoff as a physical native packet.
+    ///
+    /// # Errors
+    ///
+    /// Returns a coarse error when a detected transition cannot be proposed
+    /// through the exact selected session.
+    pub fn observe_native_pointer(
+        &mut self,
+        position: Point,
+        now_ns: u64,
+    ) -> Result<bool, PeerManagerError> {
+        if self.shutting_down || !self.selected_capture_available {
+            return Ok(false);
+        }
+        let boundary = self
+            .workspace
+            .as_mut()
+            .and_then(|workspace| workspace.native_pointer_boundary(position));
+        let Some((edge, normalized_position)) = boundary else {
+            return Ok(false);
+        };
+        self.propose_pointer_handoff(edge, normalized_position, now_ns)?;
+        Ok(true)
+    }
+
     /// Synchronously routes one trusted capture decision through the sole
     /// selected supervisor and its exact admitted FIFO.
     ///
@@ -480,23 +510,21 @@ where
         if self.shutting_down || !self.selected_capture_available {
             return SelectedCaptureOutcome::rejected(SelectedCaptureState::Rejected);
         }
-        let boundary = if captured.classification == crate::EventClassification::Physical
+        let boundary_result = if captured.classification == crate::EventClassification::Physical
             && matches!(captured.event.payload, InputPayload::PointerMove { .. })
         {
-            captured.native_pointer_position().and_then(|position| {
-                self.workspace
-                    .as_mut()
-                    .and_then(|workspace| workspace.native_pointer_boundary(position))
-            })
+            captured
+                .native_pointer_position()
+                .map(|position| self.observe_native_pointer(position, now_ns))
         } else {
             None
         };
-        if let Some((edge, normalized_position)) = boundary {
-            if self
-                .propose_pointer_handoff(edge, normalized_position, now_ns)
-                .is_err()
-            {
-                return SelectedCaptureOutcome::rejected(SelectedCaptureState::Gated);
+        if let Some(result) = boundary_result {
+            match result {
+                Ok(_) => {}
+                Err(_) => {
+                    return SelectedCaptureOutcome::rejected(SelectedCaptureState::Gated);
+                }
             }
         }
         let Some(workspace) = self.workspace.as_mut() else {
@@ -3352,6 +3380,28 @@ mod tests {
             })
             .expect("the configured edge must enqueue one pointer proposal");
         assert!((enter.normalized_position - 0.25).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn injected_destination_cursor_observation_starts_the_configured_handoff() {
+        let outbound = TestOutbound::default();
+        let mut manager = manager_with_outbound(DIAL_PEER, outbound.clone());
+        activate_selected(&mut manager);
+        outbound.clear();
+
+        assert!(manager
+            .observe_native_pointer(Point::new(99.0, 75.0), 10)
+            .unwrap());
+
+        let enter = outbound
+            .messages()
+            .into_iter()
+            .find_map(|message| match message {
+                WireMessage::PointerEnter(enter) => Some(enter),
+                _ => None,
+            })
+            .expect("the polled destination coordinate must enqueue one pointer proposal");
+        assert!((enter.normalized_position - 0.75).abs() < f64::EPSILON);
     }
 
     fn snapshot(peer_id: PeerId, addresses: Vec<IpAddr>) -> DiscoverySnapshot {

@@ -606,12 +606,18 @@ fn report_capture_metrics(
 ) {
     if metrics != *previous {
         developer_event(&format!(
-            "capture=activity observed:{} suppressed:{} local:{} contention:{} panics:{}",
+            "capture=activity observed:{} suppressed:{} local:{} contention:{} panics:{} pointer_polls:{} portal_transitions:{} pointer_failures:{} cursor_hide:{} cursor_show:{} cursor_warp:{}",
             metrics.observed,
             metrics.suppressed,
             metrics.allowed_local,
             metrics.lock_contention,
             metrics.callback_panics,
+            metrics.pointer_observations,
+            metrics.pointer_transitions,
+            metrics.pointer_observation_failures,
+            metrics.cursor_hides,
+            metrics.cursor_shows,
+            metrics.cursor_warps,
         ));
         *previous = metrics;
     }

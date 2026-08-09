@@ -166,6 +166,20 @@ pub trait InputCaptureBackend: Send {
         )
         .into())
     }
+
+    /// Observes the current trusted native cursor coordinate without changing
+    /// capture or suppression state.
+    ///
+    /// Backends which cannot provide a coherent desktop coordinate return
+    /// `Ok(None)`. The runtime uses this observation to detect a return portal
+    /// after authenticated remote input has moved the destination cursor.
+    ///
+    /// # Errors
+    ///
+    /// Returns a platform error when an otherwise supported observation fails.
+    fn cursor_position(&self) -> Result<Option<Point>, PlatformError> {
+        Ok(None)
+    }
 }
 
 /// Injects canonical input received from an authenticated remote peer.
