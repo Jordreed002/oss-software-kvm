@@ -178,7 +178,7 @@ async fn terminate_signal() {
 
 #[cfg(not(unix))]
 async fn terminate_signal() {
-    std::future::pending::<()>().await
+    std::future::pending::<()>().await;
 }
 
 #[cfg(test)]

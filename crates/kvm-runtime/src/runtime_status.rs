@@ -7,6 +7,10 @@ use std::sync::{Arc, Mutex};
 
 use serde::Serialize;
 
+// Only the macOS/Windows platform binaries construct a publisher and write the
+// status file; on other targets these would be dead code (clippy `-D warnings`
+// under `dead-code`). Gate them to the platforms that actually use them.
+#[cfg(any(target_os = "macos", windows))]
 pub(crate) const RUNTIME_STATUS_FILE: &str = "runtime.status";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
@@ -101,6 +105,7 @@ struct RuntimeStatusPublisherInner {
 }
 
 impl RuntimeStatusPublisher {
+    #[cfg(any(target_os = "macos", windows))]
     pub(crate) fn for_profile(profile_path: &Path) -> Self {
         Self {
             inner: Arc::new(RuntimeStatusPublisherInner {
@@ -157,7 +162,7 @@ fn write_status(path: &Path, contents: &[u8]) -> std::io::Result<()> {
     Ok(())
 }
 
-#[cfg(test)]
+#[cfg(all(test, any(target_os = "macos", windows)))]
 mod tests {
     use super::*;
 
