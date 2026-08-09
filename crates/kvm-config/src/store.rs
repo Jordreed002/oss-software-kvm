@@ -2,7 +2,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, PoisonError, RwLock};
 
 use crate::{decode_config, encode_config, Config, ConfigError, MAX_CONFIG_FILE_BYTES};
 
@@ -105,9 +105,11 @@ impl FileConfigStore {
                 });
             }
         };
+        // F-13: MAX_CONFIG_FILE_BYTES fits in u64 for every sane const, but use
+        // panic-free/overflow-safe arithmetic so an outsized const can't crash.
         let limit = u64::try_from(MAX_CONFIG_FILE_BYTES)
-            .expect("maximum configuration size fits in u64")
-            + 1;
+            .unwrap_or(u64::MAX)
+            .saturating_add(1);
         let mut contents = String::new();
         file.take(limit)
             .read_to_string(&mut contents)
@@ -254,7 +256,13 @@ impl ConfigStore for MemoryConfigStore {
     }
 
     fn load(&self) -> Result<Option<Config>, ConfigError> {
-        let value = self.value.read().expect("config lock poisoned").clone();
+        // F-13: recover the guarded value even on lock poison (a prior panic under
+        // the lock) instead of crashing the daemon; the config is still readable.
+        let value = self
+            .value
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
         if let Some(config) = &value {
             config.validate()?;
         }
@@ -263,7 +271,7 @@ impl ConfigStore for MemoryConfigStore {
 
     fn save(&self, config: &Config) -> Result<(), ConfigError> {
         config.validate()?;
-        *self.value.write().expect("config lock poisoned") = Some(config.clone());
+        *self.value.write().unwrap_or_else(PoisonError::into_inner) = Some(config.clone());
         Ok(())
     }
 }

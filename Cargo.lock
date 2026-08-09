@@ -573,6 +573,7 @@ dependencies = [
  "kvm-network",
  "kvm-protocol",
  "kvm-types",
+ "subtle",
  "thiserror",
  "zeroize",
 ]

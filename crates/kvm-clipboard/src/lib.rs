@@ -285,11 +285,11 @@ impl RecentUpdateIds {
 
         self.order.push_back(id);
         if self.order.len() > self.capacity {
-            let evicted = self
-                .order
-                .pop_front()
-                .expect("an over-capacity queue cannot be empty");
-            self.members.remove(&evicted);
+            // F-32: pop_front is Some whenever len() > capacity (capacity >= 1),
+            // but handle None defensively rather than .expect() — panic-free goal.
+            if let Some(evicted) = self.order.pop_front() {
+                self.members.remove(&evicted);
+            }
         }
     }
 
@@ -298,12 +298,11 @@ impl RecentUpdateIds {
             return false;
         }
 
-        let position = self
-            .order
-            .iter()
-            .position(|candidate| candidate == id)
-            .expect("the update ID set and queue must remain consistent");
-        self.order.remove(position);
+        // F-32: the invariant guarantees the id is present, but handle None
+        // defensively rather than .expect() — panic-free goal.
+        if let Some(position) = self.order.iter().position(|candidate| candidate == id) {
+            self.order.remove(position);
+        }
         true
     }
 

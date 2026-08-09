@@ -182,8 +182,15 @@ impl PairingSession {
         self.state = match self.state {
             PairingState::AwaitingBothApprovals => PairingState::AwaitingLocalApproval,
             PairingState::AwaitingRemoteApproval => PairingState::Complete,
-            PairingState::AwaitingLocalApproval | PairingState::Complete => self.state,
-            PairingState::Cancelled | PairingState::VerificationFailed => unreachable!(),
+            // F-12/F-25: every remaining state is a no-op. AwaitingLocalApproval
+            // and Complete are legitimate idempotent re-approvals; Cancelled and
+            // VerificationFailed are structurally guarded by the early return
+            // above, but use `self.state` instead of unreachable!() so a future
+            // enum change can't panic the daemon via a peer-driven call.
+            PairingState::AwaitingLocalApproval
+            | PairingState::Complete
+            | PairingState::Cancelled
+            | PairingState::VerificationFailed => self.state,
         };
         Ok(())
     }

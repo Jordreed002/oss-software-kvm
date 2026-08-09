@@ -223,14 +223,19 @@ impl ObservationCounters {
         }
         .fetch_add(1, Ordering::Relaxed);
 
-        match payload_category(captured.event.payload) {
-            "key" => &self.key,
-            "pointer_move" => &self.pointer_move,
-            "pointer_button" => &self.pointer_button,
-            "scroll" => &self.scroll,
-            _ => unreachable!("payload_category covers every InputPayload variant"),
+        // F-12: payload_category covers every InputPayload variant today, but a
+        // future variant must not crash the diagnostics tool. Unknown categories
+        // are still counted in `total`; only the per-category bucket is skipped.
+        let category_counter = match payload_category(captured.event.payload) {
+            "key" => Some(&self.key),
+            "pointer_move" => Some(&self.pointer_move),
+            "pointer_button" => Some(&self.pointer_button),
+            "scroll" => Some(&self.scroll),
+            _ => None,
+        };
+        if let Some(counter) = category_counter {
+            counter.fetch_add(1, Ordering::Relaxed);
         }
-        .fetch_add(1, Ordering::Relaxed);
 
         self.total.fetch_add(1, Ordering::Relaxed) + 1
     }
