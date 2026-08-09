@@ -9,6 +9,9 @@ mod key;
 mod pressed;
 mod semantic;
 
+#[cfg(feature = "latency")]
+mod instrumentation;
+
 pub use event::{ButtonState, InputEvent, InputPayload, KeyState, PointerButton};
 pub use key::KeyCode;
 pub use pressed::PressedState;
@@ -16,3 +19,6 @@ pub use semantic::{
     native_binding, resolve, translate, KeyboardMode, ModifierTracker, Modifiers, SemanticCommand,
     Shortcut,
 };
+
+#[cfg(feature = "latency")]
+pub use instrumentation::{LatencyHistory, LatencyStage, LatencyStamps, LatencyStats};
