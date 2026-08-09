@@ -2,6 +2,7 @@
 name = "kvm-discovery"
 version = "0.1.0"
 edition = "2021"
+license.workspace = true
 description = "Bounded untrusted LAN reachability discovery for Software KVM"
 
 [dependencies]

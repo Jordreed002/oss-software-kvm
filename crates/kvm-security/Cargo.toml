@@ -2,6 +2,7 @@
 name = "kvm-security"
 version = "0.1.0"
 edition = "2021"
+license.workspace = true
 description = "Pairing, peer identity, authorization, and credential boundaries for Software KVM"
 
 [dependencies]

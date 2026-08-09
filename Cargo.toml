@@ -6,6 +6,7 @@ exclude = ["apps/control-panel"]
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
+license = "MIT OR Apache-2.0"
 repository = "https://github.com/Jordreed002/oss-software-kvm"
 
 [workspace.lints.rust]

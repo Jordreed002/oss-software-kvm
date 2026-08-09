@@ -1,0 +1,18 @@
+# GitHub issue template configuration
+# https://docs.github.com/communities/using-templates-to-encourage-useful-issues-and-pull-requests/configuring-issue-templates-for-your-repository
+
+blank_issues_enabled: false
+
+contact_links:
+  - name: Security report (private)
+    url: https://github.com/Jordreed002/oss-software-kvm/security/advisories/new
+    about: |
+      Software KVM captures and injects keyboard and pointer input. Report vulnerabilities that could
+      leak input, bypass authentication, or escape suppression via a private security advisory rather
+      than a public issue.
+  - name: Security model & docs
+    url: https://github.com/Jordreed002/oss-software-kvm/blob/main/docs/security.md
+    about: Read the threat model and trust boundary before opening a security-related issue.
+  - name: Contributing guide
+    url: https://github.com/Jordreed002/oss-software-kvm/blob/main/CONTRIBUTING.md
+    about: Read the contributing guide before opening a pull request.

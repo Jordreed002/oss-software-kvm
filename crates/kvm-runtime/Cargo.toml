@@ -3,6 +3,7 @@ name = "kvm-runtime"
 version.workspace = true
 edition.workspace = true
 repository.workspace = true
+license.workspace = true
 description = "Fail-closed runtime composition boundary for Software KVM"
 
 [dependencies]

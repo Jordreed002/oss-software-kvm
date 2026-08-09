@@ -1,6 +1,13 @@
 # OSS Software KVM
 
-OSS Software KVM is a planned open-source, bidirectional software KVM for Windows 11 and macOS. Its goal is to make computers and their displays feel like one logical workspace: move the pointer across a configured display boundary and keyboard focus follows automatically.
+[![CI](https://github.com/Jordreed002/oss-software-kvm/actions/workflows/ci.yml/badge.svg)](https://github.com/Jordreed002/oss-software-kvm/actions/workflows/ci.yml)
+[![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](#license)
+[![Rust: stable](https://img.shields.io/badge/rust-stable-orange.svg)](https://www.rust-lang.org/)
+[![Platform: macOS · Windows](https://img.shields.io/badge/platform-macOS%20%C2%B7%20Windows-lightgrey.svg)](#initial-scope)
+
+OSS Software KVM is a planned open-source, bidirectional software KVM for Windows 11 and macOS. Its
+goal is to make computers and their displays feel like one logical workspace: move the pointer across
+a configured display boundary and keyboard focus follows automatically.
 
 ## Intended experience
 
@@ -12,12 +19,40 @@ OSS Software KVM is a planned open-source, bidirectional software KVM for Window
 
 ## Architecture
 
-The core is a Rust Cargo workspace with platform-neutral domain, protocol, routing, topology, networking, security, configuration, clipboard, and daemon crates. Native Windows and macOS crates currently provide device and display discovery, input injection, capability reporting, and safe unsupported-platform stubs.
+The core is a Rust Cargo workspace with platform-neutral domain, protocol, routing, topology,
+networking, security, configuration, clipboard, and daemon crates. Native Windows and macOS crates
+currently provide device and display discovery, input injection, capability reporting, and safe
+unsupported-platform stubs.
 
 A separate Tauri, React, and TypeScript control panel configures and monitors the two-host runtime.
-It provides native identity creation, public pairing-card exchange, visual display placement,
-secure profile validation, and gate-first start/stop controls. Peer communication is authenticated
-and encrypted over the local network.
+It provides native identity creation, public pairing-card exchange, visual display placement, secure
+profile validation, and gate-first start/stop controls. Peer communication is authenticated and
+encrypted over the local network.
+
+### Repository layout
+
+```
+.
+├── crates/                 # Rust workspace members (platform-neutral + native backends)
+│   ├── kvm-input/          #   Platform-neutral input model and state tracking
+│   ├── kvm-protocol/       #   Versioned wire protocol and framing
+│   ├── kvm-router/         #   Deterministic per-device input routing
+│   ├── kvm-topology/       #   Logical display workspace topology
+│   ├── kvm-network/        #   Authenticated-stream transport primitives
+│   ├── kvm-security/       #   Pairing, peer identity, authorization, credentials
+│   ├── kvm-config/         #   Versioned persistent configuration
+│   ├── kvm-clipboard/      #   Bounded plain-text clipboard synchronization
+│   ├── kvm-daemon/         #   Production daemon lifecycle and safety coordinator
+│   ├── kvm-runtime/        #   Fail-closed runtime composition boundary
+│   ├── kvm-discovery/      #   Bounded untrusted LAN reachability discovery
+│   ├── kvm-diagnostics/    #   Read-only physical-host validation runner
+│   ├── kvm-types/          #   Platform-neutral domain types
+│   ├── kvm-macos/          #   macOS native backend (input, display, permissions)
+│   └── kvm-windows/        #   Windows native backend (input, injection, display)
+├── apps/control-panel/     # Tauri + React + TypeScript Link Console UI
+├── docs/                   # Evolving engineering decisions
+└── .spec/                  # Product, technical, and milestone specifications
+```
 
 ## Status
 
@@ -27,8 +62,8 @@ pairing and authorization state, bounded LAN discovery/peer scheduling, daemon s
 logical-workspace pointer handoff, authenticated Follow Active Host keyboard routing, clipboard
 synchronization, and native enumeration, observation, and injection surfaces.
 
-An explicit aggregate whole-host alpha capture path now exists for Windows and macOS, together
-with exact-session routing, native lifecycle gating, and a fail-closed two-host runtime preparation
+An explicit aggregate whole-host alpha capture path now exists for Windows and macOS, together with
+exact-session routing, native lifecycle gating, and a fail-closed two-host runtime preparation
 boundary. The foreground runtime now composes secure listener/dialer ownership, exact session
 pumps, native inventory, synchronous capture/suppression, configured edge handoff, and gate-first
 shutdown. It is runnable as a manually provisioned two-host engineering alpha, but physical
@@ -63,14 +98,37 @@ The evolving engineering decisions live in:
 
 ## Initial scope
 
-The first release targets Windows 11 and macOS. It focuses on reliable low-latency keyboard and pointer routing, display-boundary transitions, reconnection, failsafe behavior, per-device routing, and plain-text clipboard synchronization.
+The first release targets Windows 11 and macOS. It focuses on reliable low-latency keyboard and
+pointer routing, display-boundary transitions, reconnection, failsafe behavior, per-device routing,
+and plain-text clipboard synchronization.
 
-Linux support, display streaming, WAN remote control, advanced trackpad gestures, and audio forwarding are outside the initial release scope.
+Linux support, display streaming, WAN remote control, advanced trackpad gestures, and audio
+forwarding are outside the initial release scope.
+
+## Getting started (development)
+
+Install the current stable Rust toolchain with the `rustfmt` and `clippy` components, then build the
+workspace:
+
+```sh
+cargo build --locked --workspace
+```
+
+To run the Link Console alpha end-to-end (including the `kvm-runtime` sidecar), see the
+[Link Console setup guide](apps/control-panel/README.md). macOS requires Accessibility and Input
+Monitoring permissions for the runtime; Windows requires the C++ build tools and allows the runtime
+on Private networks (TCP port 24800).
+
+The emergency escape is **Ctrl + Alt + Shift + Backspace**. Routing is fail-open: if a callback,
+session, or native capture path cannot prove that an event was queued safely, that event stays on the
+local computer.
 
 ## Contributing
 
-Install the current stable Rust toolchain with the `rustfmt` and `clippy` components. The standard
-checks are:
+Contributions are welcome! Please read the [contributing guide](CONTRIBUTING.md) before opening a
+pull request, and note that this project follows the [Code of Conduct](CODE_OF_CONDUCT.md).
+
+The standard checks are:
 
 ```sh
 cargo fmt --all --check
@@ -79,5 +137,23 @@ cargo test --workspace --all-targets
 ```
 
 The same checks run on Linux, Windows, and macOS in CI. Native KVM behavior must additionally be
-tested on physical Windows and macOS systems; platform-neutral CI cannot validate input
-suppression, injection, permissions, or end-to-end latency.
+tested on physical Windows and macOS systems; platform-neutral CI cannot validate input suppression,
+injection, permissions, or end-to-end latency.
+
+## Security
+
+Software KVM captures and injects keyboard and pointer input and authenticates peers over your local
+network. Please review [docs/security.md](docs/security.md) for the threat model and trust boundary.
+Report security-sensitive vulnerabilities privately rather than in a public issue — see
+[Reporting a vulnerability](https://github.com/Jordreed002/oss-software-kvm/security/advisories/new).
+
+## License
+
+Licensed under either of
+
+- [Apache License, Version 2.0](LICENSE-APACHE)
+- [MIT License](LICENSE-MIT)
+
+at your option. Unless you explicitly state otherwise, any contribution intentionally submitted for
+inclusion in this project by you, as defined in the Apache-2.0 license, shall be dual licensed as
+above, without any additional terms or conditions.
