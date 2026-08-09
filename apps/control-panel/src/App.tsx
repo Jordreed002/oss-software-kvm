@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useState } from "react";
 import {
   ArrowLeftRight, Check, ChevronRight, CircleAlert, Copy, KeyRound,
-  Handshake, Laptop, Link2, LoaderCircle, Monitor, Play, Radio, ShieldCheck, Square, Unplug, X,
+  Handshake, Laptop, Link2, LoaderCircle, Monitor, MousePointer2, Play, Radio, ShieldCheck, Square, Unplug, X,
 } from "lucide-react";
 import { api } from "./bridge";
 import type { Placement, SetupSnapshot } from "./types";
@@ -41,9 +41,9 @@ function App() {
     if (step !== 1 && step !== 3) return;
     const timer = window.setInterval(() => {
       if (!busy) api.status().then(setSnapshot).catch(() => undefined);
-    }, 1200);
+    }, snapshot?.runtime === "running" ? 400 : 1200);
     return () => window.clearInterval(timer);
-  }, [step, busy]);
+  }, [step, busy, snapshot?.runtime]);
 
   useEffect(() => {
     if (step === 1 && snapshot?.peer) setStep(2);
@@ -69,7 +69,11 @@ function App() {
     if (!snapshot?.local) return "Identity needed";
     if (!snapshot.peer) return "Waiting for peer";
     if (!snapshot.validated) return "Needs validation";
-    if (snapshot.runtime === "running") return "Connected mode";
+    if (snapshot.runtime === "running") {
+      if (snapshot.inputAuthority.owner === "peer") return `Input · ${snapshot.peer?.displayName ?? "Peer"}`;
+      if (snapshot.inputAuthority.owner === "local") return `Input · ${snapshot.local?.displayName ?? "This computer"}`;
+      return "Synchronizing input";
+    }
     if (snapshot.runtime === "faulted") return "Needs attention";
     return "Ready to start";
   }, [snapshot]);
@@ -185,6 +189,7 @@ function ReadyStep({ snapshot, busy, onValidate, onStart, onStop, onReplace, onR
   const [confirmReplace, setConfirmReplace] = useState(false);
   return <div className="step-content enter">
     <SectionHeading number="04" kicker="ACTIVATE" title={running ? "Your desk is linked." : "One last safety check."} copy={running ? "Pointer and keyboard routing are active. Closing this console does not terminate the runtime." : "Validate identities, certificates, network addresses, topology, and file protections before capture can start."} />
+    {running && <InputAuthorityPanel snapshot={snapshot}/>}
     <NearbyPanel snapshot={snapshot}/>
     <div className="checklist">
       <CheckRow label="Local identity" detail="Private credential is protected" good={!!snapshot.local}/>
@@ -211,6 +216,52 @@ function ReadyStep({ snapshot, busy, onValidate, onStart, onStop, onReplace, onR
     {runtimeFault && snapshot.runtimeLogPath && <div className="path-note"><span>Private diagnostic log</span><code>{snapshot.runtimeLogPath}</code></div>}
     {running ? <button className="stop-button" disabled={!!busy} onClick={onStop}><Square size={16} fill="currentColor"/> Stop routing safely</button> : !snapshot.validated ? <PrimaryButton busy={busy === "validate"} onClick={onValidate}>Validate this setup</PrimaryButton> : <PrimaryButton busy={busy === "start"} onClick={onStart}><Play size={17} fill="currentColor"/> Start Software KVM</PrimaryButton>}
   </div>;
+}
+
+function InputAuthorityPanel({ snapshot }: { snapshot: SetupSnapshot }) {
+  const { owner, linkReady, sessionActive } = snapshot.inputAuthority;
+  const localName = snapshot.local?.displayName ?? "This computer";
+  const peerName = snapshot.peer?.displayName ?? "Paired computer";
+  const activeName = owner === "peer" ? peerName : owner === "local" ? localName : null;
+  const headline = activeName ? `${activeName} is receiving input` : owner === "transitioning" ? "Switching input destination…" : "Confirming input destination…";
+  const detail = owner === "peer"
+    ? `Keyboard, trackpad, and mouse input from either computer is locked to ${peerName}. The cursor on ${localName} is parked and hidden.`
+    : owner === "local"
+      ? linkReady
+        ? `Keyboard, trackpad, and mouse input from either computer is locked to ${localName}. The cursor on ${peerName} is parked and hidden.`
+        : `Input remains safely on ${localName} until the authenticated workspace is ready.`
+      : owner === "transitioning"
+        ? "New input is briefly held while both computers commit the same destination."
+        : "The runtime has not published a trusted input destination yet. Input is not routed remotely.";
+  const connection = linkReady ? "LINKED" : sessionActive ? "PREPARING" : "LOCAL SAFE";
+  const localFirst = snapshot.placement === "local_left";
+  const machines = [
+    { key: "local", name: localName, platform: snapshot.platform, active: owner === "local" },
+    { key: "peer", name: peerName, platform: snapshot.peer?.platform ?? "windows", active: owner === "peer" },
+  ];
+  if (!localFirst) machines.reverse();
+
+  return <section className={`input-authority ${owner}`} aria-live="polite" aria-label="Current input destination">
+    <div className="input-authority-heading">
+      <span><MousePointer2 size={14}/>Active input destination</span>
+      <em><i/>{connection}</em>
+    </div>
+    <div className="input-authority-summary">
+      <div className="authority-pulse"><MousePointer2 size={20}/></div>
+      <div><small>{activeName ? "INPUT IS ON" : "AUTHORITY STATUS"}</small><strong>{headline}</strong><p>{detail}</p></div>
+    </div>
+    <div className="authority-machines">
+      {machines.map((machine, index) => <div className="authority-machine-slot" key={machine.key}>
+        <div className={`authority-machine ${machine.active ? "active" : "parked"}`}>
+          {machine.platform === "macos" ? <Laptop size={18}/> : <Monitor size={18}/>}
+          <span><small>{machine.key === "local" ? "THIS COMPUTER" : "PAIRED COMPUTER"}</small><strong>{machine.name}</strong></span>
+          <em>{machine.active ? "RECEIVING" : owner === "transitioning" || owner === "unavailable" ? "WAITING" : "CURSOR PARKED"}</em>
+        </div>
+        {index === 0 && <div className={`authority-bridge ${owner === "transitioning" ? "switching" : ""}`}><span/><ArrowLeftRight size={15}/><span/></div>}
+      </div>)}
+    </div>
+    <div className="authority-foot"><ShieldCheck size={13}/>Exactly one destination can receive routed input at a time. Move through the configured screen edge to switch.</div>
+  </section>;
 }
 
 function DeveloperDiagnosticsPanel({ diagnostics, busy, onRepair }: { diagnostics: NonNullable<SetupSnapshot["developerDiagnostics"]>; busy: string | null; onRepair: () => void }) {

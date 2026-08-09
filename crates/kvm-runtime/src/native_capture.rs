@@ -4,6 +4,7 @@ use std::fmt;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 use kvm_daemon::{
     CaptureCallback, CaptureDisposition, CaptureLifecycleState, CapturedInput, InputCaptureBackend,
@@ -41,6 +42,13 @@ pub trait NativeCaptureRouter: Send {
         lifecycle: CaptureLifecycleState,
         now_ns: u64,
     ) -> Result<(), Self::Error>;
+
+    /// Returns whether the local host owns current pointer authority.
+    ///
+    /// # Errors
+    ///
+    /// Returns an implementation-defined, caller-redacted observation error.
+    fn local_pointer_authority(&self) -> Result<bool, Self::Error>;
 }
 
 impl<I, O> NativeCaptureRouter for PeerManager<I, O>
@@ -64,6 +72,10 @@ where
         _now_ns: u64,
     ) -> Result<(), Self::Error> {
         self.rearm_native_capture(lifecycle)
+    }
+
+    fn local_pointer_authority(&self) -> Result<bool, Self::Error> {
+        self.local_pointer_authority()
     }
 }
 
@@ -89,6 +101,7 @@ pub enum NativeCaptureErrorKind {
     Lifecycle,
     Rearm,
     Stop,
+    Cursor,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -146,6 +159,7 @@ impl fmt::Display for NativeCaptureError {
             NativeCaptureErrorKind::Lifecycle => "native capture lifecycle is not running",
             NativeCaptureErrorKind::Rearm => "native capture routing could not be rearmed",
             NativeCaptureErrorKind::Stop => "native capture could not be stopped",
+            NativeCaptureErrorKind::Cursor => "native cursor visibility could not be updated",
         })
     }
 }
@@ -159,6 +173,7 @@ pub struct NativeCaptureSupervisor<B: InputCaptureBackend, R> {
     callback_armed: Arc<AtomicBool>,
     metrics: Arc<SharedCaptureMetrics>,
     state: NativeCaptureState,
+    cursor_visible: bool,
 }
 
 impl<B: InputCaptureBackend, R> Drop for NativeCaptureSupervisor<B, R> {
@@ -208,6 +223,7 @@ where
             callback_armed: Arc::new(AtomicBool::new(false)),
             metrics: Arc::new(SharedCaptureMetrics::default()),
             state: NativeCaptureState::LocalOnly,
+            cursor_visible: true,
         }
     }
 
@@ -250,6 +266,8 @@ where
             Arc::clone(&self.router),
             Arc::clone(&self.callback_armed),
             Arc::clone(&self.metrics),
+            now_ns,
+            Instant::now(),
         );
         if self.backend.start_capture(callback).is_err() {
             self.state = if self.backend.stop_capture().is_ok() {
@@ -292,11 +310,16 @@ where
             return Ok(self.state);
         }
         if self.backend.capture_lifecycle() == CaptureLifecycleState::Running {
+            self.sync_cursor_visibility(now_ns)?;
             return Ok(self.state);
         }
 
         self.callback_armed.store(false, Ordering::Release);
         let _ = self.gate_router(now_ns);
+        if !self.cursor_visible {
+            let _ = self.backend.set_cursor_visible(true);
+        }
+        self.cursor_visible = true;
         let _ = self.backend.stop_capture();
         self.state = NativeCaptureState::Degraded;
         Err(NativeCaptureError::new(NativeCaptureErrorKind::Lifecycle))
@@ -317,6 +340,10 @@ where
 
         self.callback_armed.store(false, Ordering::Release);
         let gate_result = self.gate_router(now_ns);
+        if !self.cursor_visible {
+            let _ = self.backend.set_cursor_visible(true);
+        }
+        self.cursor_visible = true;
         let stop_result = self.backend.stop_capture();
         if stop_result.is_err() {
             self.state = NativeCaptureState::Degraded;
@@ -360,12 +387,37 @@ where
             .rearm_capture(lifecycle, now_ns)
             .map_err(|_| NativeCaptureError::new(NativeCaptureErrorKind::Rearm))
     }
+
+    fn sync_cursor_visibility(&mut self, now_ns: u64) -> Result<(), NativeCaptureError> {
+        let local_authority = self
+            .router
+            .lock()
+            .map_err(|_| NativeCaptureError::new(NativeCaptureErrorKind::Cursor))?
+            .local_pointer_authority()
+            .map_err(|_| NativeCaptureError::new(NativeCaptureErrorKind::Cursor))?;
+        if self.cursor_visible == local_authority {
+            return Ok(());
+        }
+        if self.backend.set_cursor_visible(local_authority).is_err() {
+            self.callback_armed.store(false, Ordering::Release);
+            let _ = self.gate_router(now_ns);
+            let _ = self.backend.set_cursor_visible(true);
+            self.cursor_visible = true;
+            let _ = self.backend.stop_capture();
+            self.state = NativeCaptureState::Degraded;
+            return Err(NativeCaptureError::new(NativeCaptureErrorKind::Cursor));
+        }
+        self.cursor_visible = local_authority;
+        Ok(())
+    }
 }
 
 fn capture_callback<R>(
     router: Arc<Mutex<R>>,
     armed: Arc<AtomicBool>,
     metrics: Arc<SharedCaptureMetrics>,
+    clock_base_ns: u64,
+    clock_started: Instant,
 ) -> CaptureCallback
 where
     R: NativeCaptureRouter + 'static,
@@ -386,8 +438,16 @@ where
             return CaptureDisposition::AllowLocal;
         }
 
+        // Native event timestamps are not portable clock values: macOS uses
+        // mach-absolute time since boot while the service lifecycle uses time
+        // since this runtime started. Sampling the runtime-owned clock only
+        // after acquiring serialized authority keeps capture and lifecycle
+        // operations in one monotonic domain and prevents a later service tick
+        // from appearing to move backwards.
+        let elapsed_ns = u64::try_from(clock_started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+        let route_now_ns = clock_base_ns.saturating_add(elapsed_ns);
         let disposition = catch_unwind(AssertUnwindSafe(|| {
-            router.route_capture(captured, captured.event.timestamp_ns)
+            router.route_capture(captured, route_now_ns)
         }));
         match disposition {
             Ok(CaptureDisposition::SuppressLocal) => {
@@ -442,6 +502,7 @@ mod tests {
         fail_start: bool,
         fail_stop: bool,
         start_disposition: Option<CaptureDisposition>,
+        cursor_visible: bool,
     }
 
     struct FakeBackend {
@@ -484,6 +545,16 @@ mod tests {
         fn capture_lifecycle(&self) -> CaptureLifecycleState {
             lock(&self.control).lifecycle
         }
+
+        fn set_cursor_visible(&mut self, visible: bool) -> Result<(), PlatformError> {
+            lock(&self.events).push(if visible {
+                "cursor_show"
+            } else {
+                "cursor_hide"
+            });
+            lock(&self.control).cursor_visible = visible;
+            Ok(())
+        }
     }
 
     struct FakeRouter {
@@ -491,13 +562,16 @@ mod tests {
         disposition: CaptureDisposition,
         fail_gate: bool,
         fail_rearm: bool,
+        last_route_now_ns: Option<u64>,
+        local_authority: bool,
     }
 
     impl NativeCaptureRouter for FakeRouter {
         type Error = FakeError;
 
-        fn route_capture(&mut self, _captured: CapturedInput, _now_ns: u64) -> CaptureDisposition {
+        fn route_capture(&mut self, _captured: CapturedInput, now_ns: u64) -> CaptureDisposition {
             self.events.lock().unwrap().push("route");
+            self.last_route_now_ns = Some(now_ns);
             self.disposition
         }
 
@@ -522,6 +596,10 @@ mod tests {
             } else {
                 Ok(())
             }
+        }
+
+        fn local_pointer_authority(&self) -> Result<bool, Self::Error> {
+            Ok(self.local_authority)
         }
     }
 
@@ -551,6 +629,7 @@ mod tests {
     fn fixture(disposition: CaptureDisposition) -> Fixture {
         let backend_control = Arc::new(Mutex::new(BackendControl {
             lifecycle: CaptureLifecycleState::Running,
+            cursor_visible: true,
             ..BackendControl::default()
         }));
         let router_events = Arc::new(Mutex::new(Vec::new()));
@@ -559,6 +638,8 @@ mod tests {
             disposition,
             fail_gate: false,
             fail_rearm: false,
+            last_route_now_ns: None,
+            local_authority: true,
         }));
         let backend = FakeBackend {
             control: Arc::clone(&backend_control),
@@ -607,6 +688,38 @@ mod tests {
             supervisor.start(10).unwrap();
             assert_eq!(callback(&backend)(captured()), disposition);
         }
+    }
+
+    #[test]
+    fn native_timestamp_never_becomes_the_routing_clock() {
+        let (mut supervisor, backend, router, _) = fixture(CaptureDisposition::AllowLocal);
+        supervisor.start(10).unwrap();
+        let mut event = captured();
+        event.event.timestamp_ns = u64::MAX;
+
+        assert_eq!(callback(&backend)(event), CaptureDisposition::AllowLocal);
+        let routed_at = lock(&router).last_route_now_ns.unwrap();
+        assert!(routed_at >= 10);
+        assert_ne!(routed_at, u64::MAX);
+    }
+
+    #[test]
+    fn cursor_visibility_tracks_pointer_authority_and_restores_on_shutdown() {
+        let (mut supervisor, backend, router, events) = fixture(CaptureDisposition::AllowLocal);
+        supervisor.start(10).unwrap();
+        lock(&events).clear();
+
+        lock(&router).local_authority = false;
+        supervisor.poll_lifecycle(20).unwrap();
+        assert!(!lock(&backend).cursor_visible);
+        assert_eq!(*lock(&events), vec!["cursor_hide"]);
+
+        supervisor.shutdown(30).unwrap();
+        assert!(lock(&backend).cursor_visible);
+        assert_eq!(
+            *lock(&events),
+            vec!["cursor_hide", "gate", "cursor_show", "stop"]
+        );
     }
 
     #[test]
@@ -799,6 +912,10 @@ mod tests {
             ) -> Result<(), Self::Error> {
                 Ok(())
             }
+
+            fn local_pointer_authority(&self) -> Result<bool, Self::Error> {
+                Ok(true)
+            }
         }
 
         let armed = Arc::new(AtomicBool::new(true));
@@ -806,6 +923,8 @@ mod tests {
             Arc::new(Mutex::new(PanickingRouter)),
             Arc::clone(&armed),
             Arc::new(SharedCaptureMetrics::default()),
+            10,
+            Instant::now(),
         );
         assert_eq!(callback(captured()), CaptureDisposition::AllowLocal);
     }

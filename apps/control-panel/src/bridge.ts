@@ -10,13 +10,14 @@ const mock: SetupSnapshot = {
   local: null,
   peer: null,
   displays: [
-    { id: "preview-local-display", name: "Built-in display", width: 1512, height: 982, scaleFactor: 2, primary: true },
+    { id: "preview-local-display", name: "Built-in display", width: 1512, height: 982, scaleFactor: 2, primary: true, nativeBounds: { x: 0, y: 0, width: 3024, height: 1964 } },
   ],
   placement: "local_left",
   configured: false,
   validated: false,
   runtime: "stopped",
   runtimeFault: null,
+  inputAuthority: { owner: "unavailable", linkReady: false, sessionActive: false },
   runtimeLogPath: null,
   discoveryAvailable: true,
   nearbyMachines: [],
@@ -53,7 +54,7 @@ const invokeOrPreview = async <T>(command: string, args?: Record<string, unknown
       platform: previewState.platform === "macos" ? "windows" : "macos",
       serverName: "office-windows.kvm.test", certificateFingerprint: "3a".repeat(32),
       address: "192.168.1.31:24800",
-      displays: [{ id: "preview-peer-display", name: "Studio monitor", width: 2560, height: 1440, scaleFactor: 1, primary: true }],
+      displays: [{ id: "preview-peer-display", name: "Studio monitor", width: 2560, height: 1440, scaleFactor: 1, primary: true, nativeBounds: { x: 0, y: 0, width: 2560, height: 1440 } }],
     };
     return structuredClone(previewState) as T;
   }
@@ -79,7 +80,7 @@ const invokeOrPreview = async <T>(command: string, args?: Record<string, unknown
       displayName: previewState.nearbyPairing.name, platform: previewState.nearbyPairing.platform,
       serverName: "nearby-peer.kvm.test", certificateFingerprint: "3a".repeat(32),
       address: previewState.nearbyPairing.address,
-      displays: [{ id: "preview-peer-display", name: "Studio monitor", width: 2560, height: 1440, scaleFactor: 1, primary: true }],
+      displays: [{ id: "preview-peer-display", name: "Studio monitor", width: 2560, height: 1440, scaleFactor: 1, primary: true, nativeBounds: { x: 0, y: 0, width: 2560, height: 1440 } }],
     };
     previewState.nearbyPairing = null;
     return structuredClone(previewState) as T;
@@ -93,6 +94,7 @@ const invokeOrPreview = async <T>(command: string, args?: Record<string, unknown
     previewState.configured = false;
     previewState.validated = false;
     previewState.runtime = "stopped";
+    previewState.inputAuthority = { owner: "unavailable", linkReady: false, sessionActive: false };
     previewState.nearbyPairing = null;
     return structuredClone(previewState) as T;
   }
@@ -117,10 +119,12 @@ const invokeOrPreview = async <T>(command: string, args?: Record<string, unknown
   if (command === "start_runtime") {
     previewState.runtime = "running";
     previewState.runtimeFault = null;
+    previewState.inputAuthority = { owner: "local", linkReady: true, sessionActive: true };
   }
   if (command === "stop_runtime") {
     previewState.runtime = "stopped";
     previewState.runtimeFault = null;
+    previewState.inputAuthority = { owner: "unavailable", linkReady: false, sessionActive: false };
   }
   return structuredClone(previewState) as T;
 };

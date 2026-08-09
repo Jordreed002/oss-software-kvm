@@ -41,8 +41,8 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
     SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, INPUT_MOUSE, KEYBDINPUT, KEYEVENTF_EXTENDEDKEY,
     KEYEVENTF_KEYUP, KEYEVENTF_SCANCODE, MOUSEEVENTF_HWHEEL, MOUSEEVENTF_LEFTDOWN,
     MOUSEEVENTF_LEFTUP, MOUSEEVENTF_MIDDLEDOWN, MOUSEEVENTF_MIDDLEUP, MOUSEEVENTF_MOVE,
-    MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP, MOUSEEVENTF_WHEEL, MOUSEEVENTF_XDOWN,
-    MOUSEEVENTF_XUP, MOUSEINPUT, VIRTUAL_KEY,
+    MOUSEEVENTF_MOVE_NOCOALESCE, MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP, MOUSEEVENTF_WHEEL,
+    MOUSEEVENTF_XDOWN, MOUSEEVENTF_XUP, MOUSEINPUT, VIRTUAL_KEY,
 };
 use windows::Win32::UI::Input::{
     GetCurrentInputMessageSource, GetRawInputData, GetRawInputDeviceInfoW, GetRawInputDeviceList,
@@ -54,13 +54,13 @@ use windows::Win32::UI::Input::{
 use windows::Win32::UI::WindowsAndMessaging::{
     CallNextHookEx, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetCursorPos,
     GetMessageW, GetWindowThreadProcessId, PeekMessageW, PostMessageW, PostThreadMessageW,
-    SetWindowsHookExW, TranslateMessage, UnhookWindowsHookEx, HHOOK, HWND_MESSAGE, KBDLLHOOKSTRUCT,
-    LLKHF_EXTENDED, LLKHF_INJECTED, LLKHF_UP, MONITORINFOF_PRIMARY, MSG, MSLLHOOKSTRUCT,
-    PM_NOREMOVE, WH_KEYBOARD_LL, WH_MOUSE_LL, WINDOW_EX_STYLE, WINDOW_STYLE, WM_APP, WM_INPUT,
-    WM_INPUT_DEVICE_CHANGE, WM_KEYDOWN, WM_KEYUP, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP,
-    WM_MBUTTONDBLCLK, WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEHWHEEL, WM_MOUSEMOVE, WM_MOUSEWHEEL,
-    WM_QUIT, WM_RBUTTONDBLCLK, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SYSKEYDOWN, WM_SYSKEYUP,
-    WM_XBUTTONDBLCLK, WM_XBUTTONDOWN, WM_XBUTTONUP,
+    SetWindowsHookExW, ShowCursor, TranslateMessage, UnhookWindowsHookEx, HHOOK, HWND_MESSAGE,
+    KBDLLHOOKSTRUCT, LLKHF_EXTENDED, LLKHF_INJECTED, LLKHF_UP, MONITORINFOF_PRIMARY, MSG,
+    MSLLHOOKSTRUCT, PM_NOREMOVE, WH_KEYBOARD_LL, WH_MOUSE_LL, WINDOW_EX_STYLE, WINDOW_STYLE,
+    WM_APP, WM_INPUT, WM_INPUT_DEVICE_CHANGE, WM_KEYDOWN, WM_KEYUP, WM_LBUTTONDBLCLK,
+    WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDBLCLK, WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEHWHEEL,
+    WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_QUIT, WM_RBUTTONDBLCLK, WM_RBUTTONDOWN, WM_RBUTTONUP,
+    WM_SYSKEYDOWN, WM_SYSKEYUP, WM_XBUTTONDBLCLK, WM_XBUTTONDOWN, WM_XBUTTONUP,
 };
 
 use crate::capture::{
@@ -81,6 +81,8 @@ use crate::{
 const UINT_ERROR: u32 = u32::MAX;
 const CAPTURE_STOP_MESSAGE: u32 = WM_APP + 0x4b;
 const WHOLE_HOST_STOP_MESSAGE: u32 = WM_APP + 0x4c;
+const WHOLE_HOST_HIDE_CURSOR_MESSAGE: u32 = WM_APP + 0x4d;
+const WHOLE_HOST_SHOW_CURSOR_MESSAGE: u32 = WM_APP + 0x4e;
 const CAPTURE_START_TIMEOUT: Duration = Duration::from_secs(5);
 const CAPTURE_STOP_TIMEOUT: Duration = Duration::from_secs(2);
 const WHOLE_HOST_CALLBACK_DEADLINE: Duration = Duration::from_millis(100);
@@ -937,6 +939,16 @@ impl WindowsInputBackend {
             return Ok(());
         };
         session.state.stop();
+        // Queue restoration ahead of stop on the same native message thread.
+        // The message loop also restores visibility unconditionally on exit.
+        let _ = unsafe {
+            PostThreadMessageW(
+                session.thread_id,
+                WHOLE_HOST_SHOW_CURSOR_MESSAGE,
+                WPARAM(session.generation as usize),
+                LPARAM(0),
+            )
+        };
         // A private generation-checked message cannot terminate a replacement
         // or unrelated thread if Windows has already reused the numeric ID.
         let signal_result = unsafe {
@@ -988,6 +1000,35 @@ impl WindowsInputBackend {
         } else {
             self.stop_observing()
         }
+    }
+
+    fn update_cursor_visibility(&mut self, visible: bool) -> Result<(), WindowsBackendError> {
+        let Some(session) = self.whole_host_capture.as_ref() else {
+            return if visible {
+                Ok(())
+            } else {
+                Err(WindowsBackendError::NotImplemented {
+                    feature: "cursor visibility",
+                    reason: "requires active whole-host capture",
+                })
+            };
+        };
+        let message = if visible {
+            WHOLE_HOST_SHOW_CURSOR_MESSAGE
+        } else {
+            WHOLE_HOST_HIDE_CURSOR_MESSAGE
+        };
+        // SAFETY: The private message is generation-checked by the exact hook
+        // thread and carries no pointer-valued payload.
+        unsafe {
+            PostThreadMessageW(
+                session.thread_id,
+                message,
+                WPARAM(session.generation as usize),
+                LPARAM(0),
+            )
+        }
+        .map_err(|error| binding_error("PostThreadMessageW(cursor visibility)", &error))
     }
 }
 
@@ -1115,7 +1156,12 @@ impl WindowsOutputBackend {
                 if x == 0 && y == 0 {
                     return Ok(());
                 }
-                send_inputs(&[mouse_input(x, y, 0, MOUSEEVENTF_MOVE)])
+                send_inputs(&[mouse_input(
+                    x,
+                    y,
+                    0,
+                    MOUSEEVENTF_MOVE | MOUSEEVENTF_MOVE_NOCOALESCE,
+                )])
             }
             InputPayload::PointerButton { button, state } => {
                 let action = mouse_action(button, state).ok_or_else(|| {
@@ -1295,6 +1341,11 @@ impl InputCaptureBackend for WindowsInputBackend {
                 }
             }
         }
+    }
+
+    fn set_cursor_visible(&mut self, visible: bool) -> Result<(), PlatformError> {
+        self.update_cursor_visibility(visible)
+            .map_err(|error| Box::new(error) as PlatformError)
     }
 }
 
@@ -1657,24 +1708,60 @@ fn whole_host_hook_thread(
 
 fn whole_host_message_loop(generation: u32) -> Result<(), WindowsBackendError> {
     let mut message = MSG::default();
-    loop {
+    let mut cursor_hide_adjustments = 0_u32;
+    let result = loop {
         // SAFETY: message is writable and this thread owns the hook queue.
         let result = unsafe { GetMessageW(&raw mut message, None, 0, 0) };
         if result.0 == -1 {
-            return Err(last_api_error("GetMessageW(whole-host hooks)"));
+            break Err(last_api_error("GetMessageW(whole-host hooks)"));
         }
         if result.0 == 0 {
-            return Ok(());
+            break Ok(());
         }
         if message.message == WHOLE_HOST_STOP_MESSAGE && message.wParam.0 == generation as usize {
-            return Ok(());
+            break Ok(());
+        }
+        if message.wParam.0 == generation as usize {
+            if message.message == WHOLE_HOST_HIDE_CURSOR_MESSAGE {
+                hide_thread_cursor(&mut cursor_hide_adjustments);
+                continue;
+            }
+            if message.message == WHOLE_HOST_SHOW_CURSOR_MESSAGE {
+                show_thread_cursor(&mut cursor_hide_adjustments);
+                continue;
+            }
         }
         // SAFETY: initialized message remains alive for synchronous dispatch.
         unsafe {
             let _ = TranslateMessage(&raw const message);
             let _ = DispatchMessageW(&raw const message);
         }
+    };
+    show_thread_cursor(&mut cursor_hide_adjustments);
+    result
+}
+
+fn hide_thread_cursor(adjustments: &mut u32) {
+    if *adjustments != 0 {
+        return;
     }
+    // SAFETY: The hook thread owns this input queue. Decrement until Windows
+    // reports the cursor hidden, remembering the exact balancing call count.
+    loop {
+        *adjustments = adjustments.saturating_add(1);
+        if unsafe { ShowCursor(false) } < 0 {
+            break;
+        }
+    }
+}
+
+fn show_thread_cursor(adjustments: &mut u32) {
+    for _ in 0..*adjustments {
+        // SAFETY: Each call balances one successful hide adjustment made on
+        // this same native input thread.
+        let _ = unsafe { ShowCursor(true) };
+    }
+    *adjustments = 0;
 }
 
 fn remove_whole_host_hooks(

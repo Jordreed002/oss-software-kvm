@@ -39,6 +39,7 @@ const KEY_FILE: &str = "local-key.pk8";
 const TRUST_FILE: &str = "selected-peer.der";
 const CONTROL_FILE: &str = "runtime.control";
 const RUNTIME_LOG_FILE: &str = "runtime.log";
+const RUNTIME_STATUS_FILE: &str = "runtime.status";
 const MAX_RUNTIME_LOG_READ: u64 = 16 * 1024;
 /// Maximum decoded peer-bundle size (matches the import-bundle byte cap).
 const MAX_PEER_BUNDLE_BYTES: usize = 64 * 1024;
@@ -120,6 +121,17 @@ struct DisplayDto {
     height: f64,
     scale_factor: f64,
     primary: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    native_bounds: Option<NativeBoundsDto>,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct NativeBoundsDto {
+    x: f64,
+    y: f64,
+    width: f64,
+    height: f64,
 }
 
 #[derive(Debug, Serialize)]
@@ -166,6 +178,57 @@ enum RuntimeFault {
 
 #[derive(Clone, Copy, Debug, Serialize)]
 #[serde(rename_all = "snake_case")]
+enum InputOwnerState {
+    Local,
+    Peer,
+    Transitioning,
+    Unavailable,
+}
+
+#[derive(Clone, Copy, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct InputAuthorityDto {
+    owner: InputOwnerState,
+    link_ready: bool,
+    session_active: bool,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum RuntimeStatusService {
+    Starting,
+    Running,
+    Stopping,
+    Faulted,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum RuntimeStatusOwner {
+    Local,
+    Peer,
+    Transitioning,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum RuntimeStatusRouting {
+    Enabled,
+    Gated,
+    WaitingForWorkspace,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize)]
+struct RuntimeStatusFile {
+    schema_version: u16,
+    service: RuntimeStatusService,
+    input_owner: RuntimeStatusOwner,
+    routing: RuntimeStatusRouting,
+    session_active: bool,
+}
+
+#[derive(Clone, Copy, Debug, Serialize)]
+#[serde(rename_all = "snake_case")]
 enum LanBindingState {
     Healthy,
     Mismatch,
@@ -198,6 +261,7 @@ pub(crate) struct SetupSnapshot {
     validated: bool,
     runtime: RuntimeState,
     runtime_fault: Option<RuntimeFault>,
+    input_authority: InputAuthorityDto,
     runtime_log_path: Option<String>,
     discovery_available: bool,
     nearby_machines: Vec<NearbyMachineDto>,
@@ -334,6 +398,7 @@ impl SetupService {
             .map(|local| self.local_dto(local, &displays))
             .transpose()?;
         let peer = setup.peer.clone().map(peer_dto);
+        let input_authority = snapshot_input_authority(runtime_state, &self.directory);
         Ok(SetupSnapshot {
             platform: current_platform(),
             suggested_name: suggested_name(),
@@ -346,6 +411,7 @@ impl SetupService {
             validated: setup.validated,
             runtime: runtime_state,
             runtime_fault: *last_fault,
+            input_authority,
             runtime_log_path: setup.configured.then(|| {
                 self.directory
                     .join(RUNTIME_LOG_FILE)
@@ -779,7 +845,7 @@ pub(crate) fn forget_paired_computer(
 
     // The local private identity remains intact. Only peer-derived public
     // trust and runtime configuration are discarded and can be regenerated.
-    for name in [TRUST_FILE, CONFIG_FILE, PROFILE_FILE] {
+    for name in [TRUST_FILE, CONFIG_FILE, PROFILE_FILE, RUNTIME_STATUS_FILE] {
         match fs::remove_file(service.directory.join(name)) {
             Ok(()) => {}
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
@@ -836,19 +902,35 @@ pub(crate) fn validate_setup(service: State<'_, SetupService>) -> Result<SetupSn
 
 #[tauri::command]
 pub(crate) fn start_runtime(service: State<'_, SetupService>) -> Result<SetupSnapshot, String> {
-    {
-        let setup = service.inner.lock().map_err(|_| coarse_error())?;
-        if !setup.validated {
-            return Err(coarse_error());
-        }
-    }
     let mut active = service.runtime.lock().map_err(|_| coarse_error())?;
     if active.is_some() || runtime_lock_held(&service.directory) {
         return Err(coarse_error());
     }
+    {
+        let mut setup = service.inner.lock().map_err(|_| coarse_error())?;
+        if !setup.validated {
+            return Err(coarse_error());
+        }
+        // Re-enumerate displays on every start. Docking, undocking, or moving
+        // a secondary monitor must not leave the cross-host edge attached to
+        // a stale virtual-desktop boundary.
+        write_setup_configuration(&service, &mut setup)?;
+    }
+    kvm_runtime::prepare(&service.directory.join(PROFILE_FILE))
+        .map_err(|error| format!("runtime validation failed safely: {error}"))?;
+    {
+        let mut setup = service.inner.lock().map_err(|_| coarse_error())?;
+        setup.validated = true;
+        service.save(&setup).map_err(|()| coarse_error())?;
+    }
     let binary = runtime_binary().ok_or_else(coarse_error)?;
     let control = service.directory.join(CONTROL_FILE);
     secure_write(&control, b"run\n", true).map_err(|()| coarse_error())?;
+    match fs::remove_file(service.directory.join(RUNTIME_STATUS_FILE)) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(_) => return Err(coarse_error()),
+    }
     let log_path = service.directory.join(RUNTIME_LOG_FILE);
     secure_write(&log_path, b"", true).map_err(|()| coarse_error())?;
     let stdout_log = fs::OpenOptions::new()
@@ -939,6 +1021,14 @@ fn validate_bundle(peer: &PairingBundle) -> Result<(), String> {
                 || display.width <= 0.0
                 || display.height <= 0.0
                 || display.scale_factor <= 0.0
+                || display.native_bounds.is_some_and(|bounds| {
+                    !bounds.x.is_finite()
+                        || !bounds.y.is_finite()
+                        || !bounds.width.is_finite()
+                        || !bounds.height.is_finite()
+                        || bounds.width <= 0.0
+                        || bounds.height <= 0.0
+                })
         })
     {
         return Err(coarse_error());
@@ -1025,10 +1115,8 @@ fn build_config(
     placement: &Placement,
 ) -> Result<Config, String> {
     let remote_host = parse_host_id(&peer.host_id)?;
-    let mut ordered_local = local_displays.to_vec();
-    ordered_local.sort_by_key(|display| !display.primary);
-    let mut ordered_peer = peer.displays.clone();
-    ordered_peer.sort_by_key(|display| !display.primary);
+    let ordered_local = displays_left_to_right(local_displays);
+    let ordered_peer = displays_left_to_right(&peer.displays);
     let (first, second) = match placement {
         Placement::LocalLeft => (&ordered_local, &ordered_peer),
         Placement::LocalRight => (&ordered_peer, &ordered_local),
@@ -1089,6 +1177,31 @@ fn build_config(
     Ok(config)
 }
 
+fn displays_left_to_right(displays: &[DisplayDto]) -> Vec<DisplayDto> {
+    let mut ordered = displays.to_vec();
+    if ordered
+        .iter()
+        .all(|display| display.native_bounds.is_some())
+    {
+        ordered.sort_by(|left, right| {
+            let left_bounds = left.native_bounds.expect("bounds presence checked");
+            let right_bounds = right.native_bounds.expect("bounds presence checked");
+            left_bounds
+                .x
+                .total_cmp(&right_bounds.x)
+                .then_with(|| left_bounds.y.total_cmp(&right_bounds.y))
+                .then_with(|| right.primary.cmp(&left.primary))
+                .then_with(|| left.id.cmp(&right.id))
+        });
+    } else {
+        // Pairing bundles created before native bounds were included retain
+        // their former one-display/primary-first behavior. A fresh pairing
+        // upgrades both sides to exact multi-monitor ordering.
+        ordered.sort_by_key(|display| !display.primary);
+    }
+    ordered
+}
+
 fn build_profile(directory: &Path, local: &StoredLocal, peer: &PairingBundle) -> String {
     format!(
         "version = 2\nenabled = true\nwhole_host_alpha = true\nkvm_config_path = {}\ntopology = \"selected_only\"\nrouting = \"selected_only\"\nlisten_addresses = [{}]\n\n[local]\nhost_id = \"{}\"\npeer_id = \"{}\"\ndisplay_name = {}\n\n[selected_peer]\nhost_id = \"{}\"\npeer_id = \"{}\"\nidentity_fingerprint = \"{}\"\nsocket_address = \"{}\"\nserver_name = {}\n\n[tls]\ncertificate = {}\nprivate_key = {}\npeer_trust = {}\n",
@@ -1144,6 +1257,61 @@ fn read_runtime_fault(directory: &Path) -> RuntimeFault {
         RuntimeFault::RuntimeTask
     } else {
         RuntimeFault::Unknown
+    }
+}
+
+fn snapshot_input_authority(runtime: RuntimeState, directory: &Path) -> InputAuthorityDto {
+    if matches!(runtime, RuntimeState::Running) {
+        read_input_authority(directory)
+    } else {
+        InputAuthorityDto {
+            owner: InputOwnerState::Unavailable,
+            link_ready: false,
+            session_active: false,
+        }
+    }
+}
+
+fn read_input_authority(directory: &Path) -> InputAuthorityDto {
+    let unavailable = InputAuthorityDto {
+        owner: InputOwnerState::Unavailable,
+        link_ready: false,
+        session_active: false,
+    };
+    let Ok(file) = fs::File::open(directory.join(RUNTIME_STATUS_FILE)) else {
+        return unavailable;
+    };
+    let mut source = String::new();
+    if file.take(4 * 1024).read_to_string(&mut source).is_err() {
+        return unavailable;
+    }
+    let Ok(status) = toml::from_str::<RuntimeStatusFile>(&source) else {
+        return unavailable;
+    };
+    if status.schema_version != 1 {
+        return unavailable;
+    }
+
+    let running = matches!(status.service, RuntimeStatusService::Running);
+    let link_ready =
+        running && status.session_active && matches!(status.routing, RuntimeStatusRouting::Enabled);
+    let owner = match status.service {
+        RuntimeStatusService::Starting
+        | RuntimeStatusService::Stopping
+        | RuntimeStatusService::Faulted => InputOwnerState::Local,
+        RuntimeStatusService::Running => match status.input_owner {
+            RuntimeStatusOwner::Peer if link_ready => InputOwnerState::Peer,
+            RuntimeStatusOwner::Transitioning if status.session_active => {
+                InputOwnerState::Transitioning
+            }
+            RuntimeStatusOwner::Local | RuntimeStatusOwner::Peer => InputOwnerState::Local,
+            RuntimeStatusOwner::Transitioning => InputOwnerState::Unavailable,
+        },
+    };
+    InputAuthorityDto {
+        owner,
+        link_ready,
+        session_active: running && status.session_active,
     }
 }
 
@@ -1313,6 +1481,12 @@ fn display_dto(display: Display) -> DisplayDto {
         height: display.logical_size.height,
         scale_factor: display.scale_factor,
         primary: display.primary,
+        native_bounds: Some(NativeBoundsDto {
+            x: display.native_bounds.x,
+            y: display.native_bounds.y,
+            width: display.native_bounds.width,
+            height: display.native_bounds.height,
+        }),
     }
 }
 
@@ -1443,15 +1617,18 @@ fn runtime_lock_held(directory: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_config, validate_bundle, DisplayDto, PairingBundle, Placement, PlatformDto,
-        PAIRING_VERSION,
+        build_config, read_input_authority, validate_bundle, DisplayDto, InputOwnerState,
+        NativeBoundsDto, PairingBundle, Placement, PlatformDto, PAIRING_VERSION,
+        RUNTIME_STATUS_FILE,
     };
     #[cfg(windows)]
     use super::{rewrite_windows_profile_paths, CONFIG_FILE, KEY_FILE};
     use base64::engine::general_purpose::URL_SAFE_NO_PAD;
     use base64::Engine;
+    use kvm_types::Edge;
     use rcgen::{CertificateParams, KeyPair};
     use sha2::{Digest, Sha256};
+    use std::fs;
     #[cfg(windows)]
     use std::path::Path;
 
@@ -1463,6 +1640,12 @@ mod tests {
             height: 1_080.0,
             scale_factor: 1.0,
             primary,
+            native_bounds: Some(NativeBoundsDto {
+                x: 0.0,
+                y: 0.0,
+                width: 1_920.0,
+                height: 1_080.0,
+            }),
         }
     }
 
@@ -1505,6 +1688,93 @@ mod tests {
         assert_eq!(config.topology.displays.len(), 2);
         assert_eq!(config.topology.links.len(), 2);
         assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn generated_topology_uses_the_real_outer_monitor_instead_of_primary_order() {
+        let peer = bundle();
+        let mut left_secondary = display("00000000-0000-4000-8000-000000000004", false);
+        left_secondary.native_bounds.as_mut().unwrap().x = -1_920.0;
+        let primary = display("00000000-0000-4000-8000-000000000005", true);
+
+        let local_right = build_config(
+            &peer,
+            &[primary.clone(), left_secondary.clone()],
+            &Placement::LocalRight,
+        )
+        .expect("left outer monitor should form the host boundary");
+        assert_eq!(
+            local_right.topology.links[1].from_display,
+            left_secondary.id.parse().unwrap()
+        );
+        assert_eq!(local_right.topology.links[1].from_edge, Edge::Left);
+
+        let local_left = build_config(
+            &peer,
+            &[primary.clone(), left_secondary],
+            &Placement::LocalLeft,
+        )
+        .expect("right outer monitor should form the host boundary");
+        assert_eq!(
+            local_left.topology.links[0].from_display,
+            primary.id.parse().unwrap()
+        );
+        assert_eq!(local_left.topology.links[0].from_edge, Edge::Right);
+    }
+
+    #[test]
+    fn both_hosts_compile_the_same_topology_for_a_secondary_monitor_on_the_left() {
+        let mac_display = display("00000000-0000-4000-8000-000000000006", true);
+        let mut windows_secondary = display("00000000-0000-4000-8000-000000000004", false);
+        windows_secondary.native_bounds.as_mut().unwrap().x = -1_920.0;
+        let windows_primary = display("00000000-0000-4000-8000-000000000005", true);
+
+        let mut windows_bundle = bundle();
+        windows_bundle.displays = vec![windows_primary.clone(), windows_secondary.clone()];
+        let mac_config = build_config(
+            &windows_bundle,
+            std::slice::from_ref(&mac_display),
+            &Placement::LocalLeft,
+        )
+        .unwrap();
+
+        let mut mac_bundle = bundle();
+        mac_bundle.displays = vec![mac_display];
+        let windows_config = build_config(
+            &mac_bundle,
+            &[windows_primary, windows_secondary],
+            &Placement::LocalRight,
+        )
+        .unwrap();
+
+        assert_eq!(mac_config.topology, windows_config.topology);
+    }
+
+    #[test]
+    fn runtime_status_reports_only_an_effective_peer_authority() {
+        let directory =
+            std::env::temp_dir().join(format!("software-kvm-status-{}", uuid::Uuid::new_v4()));
+        fs::create_dir(&directory).unwrap();
+        fs::write(
+            directory.join(RUNTIME_STATUS_FILE),
+            b"schema_version = 1\nservice = \"running\"\ninput_owner = \"peer\"\nrouting = \"enabled\"\nsession_active = true\n",
+        )
+        .unwrap();
+
+        let status = read_input_authority(&directory);
+        assert!(matches!(status.owner, InputOwnerState::Peer));
+        assert!(status.link_ready);
+        assert!(status.session_active);
+
+        fs::write(
+            directory.join(RUNTIME_STATUS_FILE),
+            b"schema_version = 1\nservice = \"running\"\ninput_owner = \"peer\"\nrouting = \"gated\"\nsession_active = true\n",
+        )
+        .unwrap();
+        let gated = read_input_authority(&directory);
+        assert!(matches!(gated.owner, InputOwnerState::Local));
+        assert!(!gated.link_ready);
+        fs::remove_dir_all(directory).unwrap();
     }
 
     #[cfg(windows)]
