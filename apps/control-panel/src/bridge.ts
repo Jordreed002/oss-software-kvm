@@ -30,6 +30,7 @@ const mock: SetupSnapshot = {
     lanBinding: "healthy", configuredListener: "192.168.1.24:24800",
     routedListener: "192.168.1.24:24800", configuredPeer: "192.168.1.31:24800",
     observedPeer: "192.168.1.31:24800", recentEvents: ["[dev] listener=ready", "[dev] capture=armed"],
+    peerRecentEvents: ["[dev] listener=ready", "[dev] manager=state sessions:1 routing:enabled"],
   } : null,
   setupDirectory: null,
   profilePath: null,

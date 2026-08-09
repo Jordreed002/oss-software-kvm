@@ -452,9 +452,13 @@ function DeveloperDiagnosticsPanel({ diagnostics, busy, onRepair }: { diagnostic
       <DiagnosticValue label="Observed peer" value={diagnostics.observedPeer}/>
     </div>
     {mismatch && <div className="diagnostic-repair"><div><strong>The runtime is bound to the wrong network interface.</strong><span>Repair rewrites the listener and peer addresses using the active LAN route, revalidates, and restarts if necessary.</span></div><button disabled={!!busy} onClick={onRepair}>{busy === "repair-lan" ? <LoaderCircle className="spin" size={14}/> : <Radio size={14}/>}Repair LAN binding</button></div>}
-    <div className="event-console" aria-label="Recent redacted runtime events">
-      <div><span>Recent runtime events</span><em>REDACTED · LIVE</em></div>
+    <div className="event-console" aria-label="Recent local redacted runtime events">
+      <div><span>This computer</span><em>REDACTED · LIVE</em></div>
       {diagnostics.recentEvents.length === 0 ? <p>No detailed events yet. Restart the runtime from this development build.</p> : <ol>{diagnostics.recentEvents.map((event, index) => <li key={`${index}-${event}`}>{event}</li>)}</ol>}
+    </div>
+    <div className="event-console" aria-label="Recent paired-computer redacted runtime events">
+      <div><span>Paired computer</span><em>SIGNED · LIVE</em></div>
+      {diagnostics.peerRecentEvents.length === 0 ? <p>Waiting for signed diagnostics from the paired development build.</p> : <ol>{diagnostics.peerRecentEvents.map((event, index) => <li key={`${index}-${event}`}>{event}</li>)}</ol>}
     </div>
   </details>;
 }

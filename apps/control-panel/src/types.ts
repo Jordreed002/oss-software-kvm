@@ -109,4 +109,5 @@ export interface DeveloperDiagnostics {
   configuredPeer: string | null;
   observedPeer: string | null;
   recentEvents: string[];
+  peerRecentEvents: string[];
 }

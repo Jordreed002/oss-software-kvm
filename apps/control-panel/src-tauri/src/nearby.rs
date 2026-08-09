@@ -16,11 +16,14 @@ const MAX_NEARBY_MACHINES: usize = 32;
 const MAX_NAME_BYTES: usize = 64;
 const MAX_BEACON_BYTES: usize = 512;
 const MAX_PAIRING_PACKET_BYTES: usize = 24 * 1024;
+const MAX_DIAGNOSTIC_PAYLOAD_BYTES: usize = 8 * 1024;
+const MAX_DIAGNOSTIC_SIGNATURE_BYTES: usize = 256;
 const MAX_RECEIVE_DRAIN: usize = 64;
 const BEACON_INTERVAL: Duration = Duration::from_secs(2);
 const STALE_AFTER: Duration = Duration::from_secs(8);
 const PAIRING_EXPIRES_AFTER: Duration = Duration::from_mins(2);
 const CONFIRM_RETRY_AFTER: Duration = Duration::from_secs(15);
+const DIAGNOSTIC_RETRY_AFTER: Duration = Duration::from_secs(1);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -129,6 +132,16 @@ struct WorkspaceAcknowledgementAdvertisement {
     last_sent: Option<Instant>,
 }
 
+#[derive(Clone, Eq, PartialEq)]
+struct DiagnosticAdvertisement {
+    peer_id: String,
+    stream_id: String,
+    first_sequence: u64,
+    payload: String,
+    signature: String,
+    last_sent: Option<Instant>,
+}
+
 pub(crate) struct IncomingWorkspaceLayout {
     pub(crate) from_peer_id: String,
     pub(crate) revision: u64,
@@ -150,6 +163,25 @@ pub(crate) struct IncomingWorkspaceAcknowledgement {
     pub(crate) from_peer_id: String,
     pub(crate) revision: u64,
     pub(crate) signature: String,
+}
+
+pub(crate) struct IncomingDiagnosticBatch {
+    pub(crate) from_peer_id: String,
+    pub(crate) stream_id: String,
+    pub(crate) first_sequence: u64,
+    pub(crate) payload: String,
+    pub(crate) signature: String,
+}
+
+impl fmt::Debug for IncomingDiagnosticBatch {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("IncomingDiagnosticBatch")
+            .field("first_sequence", &self.first_sequence)
+            .field("payload_bytes", &self.payload.len())
+            .field("signature_bytes", &self.signature.len())
+            .finish_non_exhaustive()
+    }
 }
 
 impl fmt::Debug for IncomingWorkspaceAcknowledgement {
@@ -197,6 +229,14 @@ enum PairingPacket {
         from_peer_id: String,
         to_peer_id: String,
         revision: u64,
+        signature: String,
+    },
+    DiagnosticBatch {
+        from_peer_id: String,
+        to_peer_id: String,
+        stream_id: String,
+        first_sequence: u64,
+        payload: String,
         signature: String,
     },
 }
@@ -271,6 +311,8 @@ pub(crate) struct NearbyDiscovery {
     incoming_workspace: Mutex<Option<IncomingWorkspaceLayout>>,
     workspace_ack_advertised: Mutex<Option<WorkspaceAcknowledgementAdvertisement>>,
     incoming_workspace_ack: Mutex<Option<IncomingWorkspaceAcknowledgement>>,
+    diagnostic_advertised: Mutex<Option<DiagnosticAdvertisement>>,
+    incoming_diagnostic: Mutex<Option<IncomingDiagnosticBatch>>,
 }
 
 impl NearbyDiscovery {
@@ -310,6 +352,8 @@ impl NearbyDiscovery {
             incoming_workspace: Mutex::new(None),
             workspace_ack_advertised: Mutex::new(None),
             incoming_workspace_ack: Mutex::new(None),
+            diagnostic_advertised: Mutex::new(None),
+            incoming_diagnostic: Mutex::new(None),
         })
     }
 
@@ -357,6 +401,7 @@ impl NearbyDiscovery {
         self.retry_pairing_packet(now);
         self.retry_workspace_packet(now);
         self.retry_workspace_ack_packet(now);
+        self.retry_diagnostic_packet(now);
     }
 
     pub(crate) fn snapshot(&self, paired_peer_id: Option<&str>) -> Vec<NearbyMachineDto> {
@@ -444,9 +489,7 @@ impl NearbyDiscovery {
         }
         let mut advertised = self.workspace_advertised.lock().map_err(|_| ())?;
         let changed = advertised.as_ref().is_none_or(|current| {
-            current.peer_id != peer_id
-                || current.revision != revision
-                || current.payload != payload
+            current.peer_id != peer_id || current.revision != revision || current.payload != payload
         });
         if changed {
             *advertised = Some(WorkspaceAdvertisement {
@@ -500,6 +543,60 @@ impl NearbyDiscovery {
 
     pub(crate) fn take_workspace_ack(&self) -> Option<IncomingWorkspaceAcknowledgement> {
         self.incoming_workspace_ack.lock().ok()?.take()
+    }
+
+    /// Publishes one opaque, externally signed batch of already-redacted
+    /// developer diagnostics to the selected paired computer.
+    ///
+    /// The latest batch is retried on the discovery channel without creating
+    /// backpressure in the authenticated KVM input transport. Role enforcement,
+    /// payload decoding, and signature verification remain with `SetupService`.
+    pub(crate) fn publish_diagnostic_batch(
+        &self,
+        peer_id: &str,
+        stream_id: &str,
+        first_sequence: u64,
+        payload: &str,
+        signature: &str,
+    ) -> Result<(), ()> {
+        if !valid_peer_id(peer_id)
+            || peer_id == self.peer_id
+            || !valid_stream_id(stream_id)
+            || first_sequence == 0
+            || !valid_diagnostic_payload(payload)
+            || !valid_diagnostic_signature(signature)
+        {
+            return Err(());
+        }
+        let mut advertised = self.diagnostic_advertised.lock().map_err(|_| ())?;
+        let changed = advertised.as_ref().is_none_or(|current| {
+            current.peer_id != peer_id
+                || current.stream_id != stream_id
+                || current.first_sequence != first_sequence
+                || current.payload != payload
+                || current.signature != signature
+        });
+        if changed {
+            *advertised = Some(DiagnosticAdvertisement {
+                peer_id: peer_id.to_owned(),
+                stream_id: stream_id.to_owned(),
+                first_sequence,
+                payload: payload.to_owned(),
+                signature: signature.to_owned(),
+                last_sent: None,
+            });
+        }
+        drop(advertised);
+        self.retry_diagnostic_packet(Instant::now());
+        Ok(())
+    }
+
+    /// Takes the newest source- and destination-gated diagnostic batch.
+    ///
+    /// The caller must still authenticate the opaque payload with the paired
+    /// public signing key before surfacing it.
+    pub(crate) fn take_diagnostic_batch(&self) -> Option<IncomingDiagnosticBatch> {
+        self.incoming_diagnostic.lock().ok()?.take()
     }
 
     pub(crate) fn request_pairing(&self, peer_id: &str, local_bundle: &str) -> Result<(), ()> {
@@ -694,6 +791,12 @@ impl NearbyDiscovery {
         if let Ok(mut acknowledgement) = self.incoming_workspace_ack.lock() {
             *acknowledgement = None;
         }
+        if let Ok(mut diagnostic) = self.diagnostic_advertised.lock() {
+            *diagnostic = None;
+        }
+        if let Ok(mut diagnostic) = self.incoming_diagnostic.lock() {
+            *diagnostic = None;
+        }
     }
 
     fn handle_pairing_packet(
@@ -769,6 +872,64 @@ impl NearbyDiscovery {
                 source,
                 records,
             ),
+            PairingPacket::DiagnosticBatch {
+                from_peer_id,
+                to_peer_id,
+                stream_id,
+                first_sequence,
+                payload,
+                signature,
+            } => self.handle_diagnostic_batch(
+                from_peer_id,
+                &to_peer_id,
+                stream_id,
+                first_sequence,
+                payload,
+                signature,
+                source,
+                records,
+            ),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn handle_diagnostic_batch(
+        &self,
+        from_peer_id: String,
+        to_peer_id: &str,
+        stream_id: String,
+        first_sequence: u64,
+        payload: String,
+        signature: String,
+        source: SocketAddr,
+        records: &BTreeMap<String, NearbyRecord>,
+    ) {
+        let Some(record) = records.get(&from_peer_id) else {
+            return;
+        };
+        if to_peer_id != self.peer_id
+            || record.address.ip() != source.ip()
+            || !valid_stream_id(&stream_id)
+            || first_sequence == 0
+            || !valid_diagnostic_payload(&payload)
+            || !valid_diagnostic_signature(&signature)
+        {
+            return;
+        }
+        let Ok(mut incoming) = self.incoming_diagnostic.lock() else {
+            return;
+        };
+        let replace = incoming.as_ref().is_none_or(|current| {
+            current.stream_id != stream_id || first_sequence >= current.first_sequence
+        });
+        if replace {
+            *incoming = Some(IncomingDiagnosticBatch {
+                from_peer_id,
+                stream_id,
+                first_sequence,
+                payload,
+                signature,
+            });
         }
     }
 
@@ -1074,9 +1235,10 @@ impl NearbyDiscovery {
         let Some(workspace) = advertised.as_mut() else {
             return;
         };
-        if workspace.last_sent.is_some_and(|last_sent| {
-            now.duration_since(last_sent) < BEACON_INTERVAL
-        }) {
+        if workspace
+            .last_sent
+            .is_some_and(|last_sent| now.duration_since(last_sent) < BEACON_INTERVAL)
+        {
             return;
         }
         let Some(record) = records.get(&workspace.peer_id) else {
@@ -1123,6 +1285,39 @@ impl NearbyDiscovery {
         let target = SocketAddr::new(record.address.ip(), DISCOVERY_PORT);
         if send_pairing_packet(&self.socket, target, &packet).is_ok() {
             acknowledgement.last_sent = Some(now);
+        }
+    }
+
+    fn retry_diagnostic_packet(&self, now: Instant) {
+        let Ok(records) = self.records.lock() else {
+            return;
+        };
+        let Ok(mut advertised) = self.diagnostic_advertised.lock() else {
+            return;
+        };
+        let Some(diagnostic) = advertised.as_mut() else {
+            return;
+        };
+        if diagnostic
+            .last_sent
+            .is_some_and(|last_sent| now.duration_since(last_sent) < DIAGNOSTIC_RETRY_AFTER)
+        {
+            return;
+        }
+        let Some(record) = records.get(&diagnostic.peer_id) else {
+            return;
+        };
+        let packet = PairingPacket::DiagnosticBatch {
+            from_peer_id: self.peer_id.clone(),
+            to_peer_id: diagnostic.peer_id.clone(),
+            stream_id: diagnostic.stream_id.clone(),
+            first_sequence: diagnostic.first_sequence,
+            payload: diagnostic.payload.clone(),
+            signature: diagnostic.signature.clone(),
+        };
+        let target = SocketAddr::new(record.address.ip(), DISCOVERY_PORT);
+        if send_pairing_packet(&self.socket, target, &packet).is_ok() {
+            diagnostic.last_sent = Some(now);
         }
     }
 }
@@ -1269,6 +1464,13 @@ impl fmt::Debug for NearbyDiscovery {
                     .lock()
                     .is_ok_and(|acknowledgement| acknowledgement.is_some()),
             )
+            .field(
+                "diagnostic_advertised",
+                &self
+                    .diagnostic_advertised
+                    .lock()
+                    .is_ok_and(|diagnostic| diagnostic.is_some()),
+            )
             .finish_non_exhaustive()
     }
 }
@@ -1365,6 +1567,23 @@ fn parse_pairing_packet(bytes: &[u8]) -> Option<PairingPacket> {
                 && valid_workspace_field(signature))
             .then_some(packet);
         }
+        PairingPacket::DiagnosticBatch {
+            from_peer_id,
+            to_peer_id,
+            stream_id,
+            first_sequence,
+            payload,
+            signature,
+        } => {
+            return (valid_peer_id(from_peer_id)
+                && valid_peer_id(to_peer_id)
+                && from_peer_id != to_peer_id
+                && valid_stream_id(stream_id)
+                && *first_sequence > 0
+                && valid_diagnostic_payload(payload)
+                && valid_diagnostic_signature(signature))
+            .then_some(packet);
+        }
         _ => {}
     }
     let (request_id, from_peer_id, to_peer_id, bundle) = match &packet {
@@ -1390,7 +1609,9 @@ fn parse_pairing_packet(bytes: &[u8]) -> Option<PairingPacket> {
             from_peer_id,
             to_peer_id,
         } => (request_id, from_peer_id, to_peer_id, None),
-        PairingPacket::WorkspaceLayout { .. } | PairingPacket::WorkspaceLayoutAck { .. } => {
+        PairingPacket::WorkspaceLayout { .. }
+        | PairingPacket::WorkspaceLayoutAck { .. }
+        | PairingPacket::DiagnosticBatch { .. } => {
             unreachable!("handled above")
         }
     };
@@ -1415,6 +1636,26 @@ fn valid_workspace_field(value: &str) -> bool {
 
 fn valid_request_id(request_id: &str) -> bool {
     Uuid::parse_str(request_id).is_ok_and(|id| id.get_version_num() == 4)
+}
+
+fn valid_stream_id(stream_id: &str) -> bool {
+    Uuid::parse_str(stream_id).is_ok_and(|id| id.get_version_num() == 4)
+}
+
+fn valid_diagnostic_payload(payload: &str) -> bool {
+    valid_opaque_field(payload, MAX_DIAGNOSTIC_PAYLOAD_BYTES)
+}
+
+fn valid_diagnostic_signature(signature: &str) -> bool {
+    valid_opaque_field(signature, MAX_DIAGNOSTIC_SIGNATURE_BYTES)
+}
+
+fn valid_opaque_field(value: &str, maximum: usize) -> bool {
+    !value.is_empty()
+        && value.len() <= maximum
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'='))
 }
 
 fn valid_bundle_shape(bundle: &str) -> bool {
@@ -1521,6 +1762,40 @@ fn private_address(address: IpAddr) -> bool {
 mod tests {
     use super::*;
 
+    const LOCAL_PEER: &str = "11111111-1111-4111-8111-111111111111";
+    const REMOTE_PEER: &str = "22222222-2222-4222-8222-222222222222";
+    const STREAM_ID: &str = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+
+    fn test_discovery() -> NearbyDiscovery {
+        NearbyDiscovery {
+            socket: UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap(),
+            peer_id: LOCAL_PEER.to_owned(),
+            runtime_port: 24_800,
+            broadcast_targets: Vec::new(),
+            advertised: Mutex::new(None),
+            records: Mutex::new(BTreeMap::new()),
+            pairing: Mutex::new(None),
+            completed_bundle: Mutex::new(None),
+            workspace_advertised: Mutex::new(None),
+            incoming_workspace: Mutex::new(None),
+            workspace_ack_advertised: Mutex::new(None),
+            incoming_workspace_ack: Mutex::new(None),
+            diagnostic_advertised: Mutex::new(None),
+            incoming_diagnostic: Mutex::new(None),
+        }
+    }
+
+    fn remote_record() -> NearbyRecord {
+        NearbyRecord {
+            peer_id: REMOTE_PEER.to_owned(),
+            name: "Windows".to_owned(),
+            platform: "windows".to_owned(),
+            presence: NearbyPresence::RuntimeActive,
+            address: "192.168.1.25:24800".parse().unwrap(),
+            last_seen: Instant::now(),
+        }
+    }
+
     #[test]
     fn beacon_round_trip_is_bounded_and_rejects_hostile_shapes() {
         let state = AdvertisementState {
@@ -1621,6 +1896,139 @@ mod tests {
             parse_pairing_packet(&encoded),
             Some(PairingPacket::WorkspaceLayoutAck { revision: 3, .. })
         ));
+
+        let diagnostic = PairingPacket::DiagnosticBatch {
+            from_peer_id: "22222222-2222-4222-8222-222222222222".to_owned(),
+            to_peer_id: "11111111-1111-4111-8111-111111111111".to_owned(),
+            stream_id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa".to_owned(),
+            first_sequence: 41,
+            payload: "redacted_diagnostic_payload".to_owned(),
+            signature: "diagnostic_signature".to_owned(),
+        };
+        let body = serde_json::to_vec(&diagnostic).unwrap();
+        let mut encoded = format!("{PAIRING_MAGIC}\n").into_bytes();
+        encoded.extend_from_slice(&body);
+        assert!(matches!(
+            parse_pairing_packet(&encoded),
+            Some(PairingPacket::DiagnosticBatch {
+                first_sequence: 41,
+                ..
+            })
+        ));
+
+        let invalid_diagnostic = PairingPacket::DiagnosticBatch {
+            from_peer_id: "22222222-2222-4222-8222-222222222222".to_owned(),
+            to_peer_id: "11111111-1111-4111-8111-111111111111".to_owned(),
+            stream_id: "not-a-stream".to_owned(),
+            first_sequence: 0,
+            payload: "payload".to_owned(),
+            signature: "signature".to_owned(),
+        };
+        let body = serde_json::to_vec(&invalid_diagnostic).unwrap();
+        let mut encoded = format!("{PAIRING_MAGIC}\n").into_bytes();
+        encoded.extend_from_slice(&body);
+        assert!(parse_pairing_packet(&encoded).is_none());
+    }
+
+    #[test]
+    fn incoming_diagnostic_debug_redacts_stream_payload_and_signature() {
+        let incoming = IncomingDiagnosticBatch {
+            from_peer_id: "peer-marker".to_owned(),
+            stream_id: "stream-marker".to_owned(),
+            first_sequence: 7,
+            payload: "payload-marker".to_owned(),
+            signature: "signature-marker".to_owned(),
+        };
+        let diagnostic = format!("{incoming:?}");
+        assert!(diagnostic.contains("first_sequence: 7"));
+        for marker in [
+            "peer-marker",
+            "stream-marker",
+            "payload-marker",
+            "signature-marker",
+        ] {
+            assert!(!diagnostic.contains(marker));
+        }
+    }
+
+    #[test]
+    fn diagnostic_batches_require_a_known_peer_source_and_keep_the_newest_sequence() {
+        let discovery = test_discovery();
+        let mut records = BTreeMap::new();
+        records.insert(REMOTE_PEER.to_owned(), remote_record());
+        let packet = |first_sequence| PairingPacket::DiagnosticBatch {
+            from_peer_id: REMOTE_PEER.to_owned(),
+            to_peer_id: LOCAL_PEER.to_owned(),
+            stream_id: STREAM_ID.to_owned(),
+            first_sequence,
+            payload: format!("payload_{first_sequence}"),
+            signature: "signature".to_owned(),
+        };
+
+        discovery.handle_pairing_packet(
+            packet(8),
+            "192.168.1.99:24801".parse().unwrap(),
+            &records,
+            Instant::now(),
+            true,
+        );
+        assert!(discovery.take_diagnostic_batch().is_none());
+
+        discovery.handle_pairing_packet(
+            packet(8),
+            "192.168.1.25:24801".parse().unwrap(),
+            &records,
+            Instant::now(),
+            true,
+        );
+        discovery.handle_pairing_packet(
+            packet(7),
+            "192.168.1.25:24801".parse().unwrap(),
+            &records,
+            Instant::now(),
+            true,
+        );
+        let incoming = discovery.take_diagnostic_batch().unwrap();
+        assert_eq!(incoming.first_sequence, 8);
+        assert_eq!(incoming.payload, "payload_8");
+    }
+
+    #[test]
+    fn diagnostic_publish_validates_bounds_before_advertising() {
+        let discovery = test_discovery();
+        assert!(discovery
+            .publish_diagnostic_batch(REMOTE_PEER, STREAM_ID, 1, "payload", "signature")
+            .is_ok());
+        assert!(discovery
+            .publish_diagnostic_batch(REMOTE_PEER, "invalid", 1, "payload", "signature")
+            .is_err());
+        assert!(discovery
+            .publish_diagnostic_batch(REMOTE_PEER, STREAM_ID, 0, "payload", "signature")
+            .is_err());
+        assert!(discovery
+            .publish_diagnostic_batch(
+                REMOTE_PEER,
+                STREAM_ID,
+                2,
+                &"a".repeat(MAX_DIAGNOSTIC_PAYLOAD_BYTES + 1),
+                "signature",
+            )
+            .is_err());
+        assert!(discovery
+            .publish_diagnostic_batch(
+                REMOTE_PEER,
+                STREAM_ID,
+                2,
+                "payload",
+                &"a".repeat(MAX_DIAGNOSTIC_SIGNATURE_BYTES + 1),
+            )
+            .is_err());
+        assert!(discovery
+            .diagnostic_advertised
+            .lock()
+            .unwrap()
+            .as_ref()
+            .is_some_and(|batch| batch.first_sequence == 1));
     }
 
     #[test]

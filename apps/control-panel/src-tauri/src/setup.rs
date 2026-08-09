@@ -46,6 +46,8 @@ const CONTROL_FILE: &str = "runtime.control";
 const RUNTIME_LOG_FILE: &str = "runtime.log";
 const RUNTIME_STATUS_FILE: &str = "runtime.status";
 const MAX_RUNTIME_LOG_READ: u64 = 16 * 1024;
+const MAX_RELAYED_DIAGNOSTIC_LINES: usize = 20;
+const MAX_RELAYED_DIAGNOSTIC_LINE_CHARS: usize = 240;
 /// Maximum decoded peer-bundle size (matches the import-bundle byte cap).
 const MAX_PEER_BUNDLE_BYTES: usize = 64 * 1024;
 /// Upper bound on the base64 (URL-safe, no-pad) bundle text *before* decoding:
@@ -63,7 +65,40 @@ pub(crate) struct SetupService {
     runtime: Mutex<Option<Child>>,
     last_runtime_fault: Mutex<Option<RuntimeFault>>,
     pending_workspace: Mutex<Option<IncomingWorkspaceLayout>>,
+    diagnostic_relay: Mutex<DiagnosticRelayState>,
     discovery: Option<NearbyDiscovery>,
+}
+
+struct DiagnosticRelayState {
+    local_stream_id: String,
+    next_local_sequence: u64,
+    last_local_events: Vec<String>,
+    peer_stream_id: Option<String>,
+    peer_sequence: u64,
+    peer_events: Vec<String>,
+}
+
+impl DiagnosticRelayState {
+    fn new() -> Self {
+        Self {
+            local_stream_id: Uuid::new_v4().to_string(),
+            next_local_sequence: 1,
+            last_local_events: Vec::new(),
+            peer_stream_id: None,
+            peer_sequence: 0,
+            peer_events: Vec::new(),
+        }
+    }
+}
+
+impl std::fmt::Debug for DiagnosticRelayState {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("DiagnosticRelayState")
+            .field("local_event_count", &self.last_local_events.len())
+            .field("peer_event_count", &self.peer_events.len())
+            .finish_non_exhaustive()
+    }
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -294,6 +329,7 @@ struct DeveloperDiagnosticsDto {
     configured_peer: Option<String>,
     observed_peer: Option<String>,
     recent_events: Vec<String>,
+    peer_recent_events: Vec<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -373,6 +409,7 @@ impl SetupService {
             runtime: Mutex::new(None),
             last_runtime_fault: Mutex::new(None),
             pending_workspace: Mutex::new(None),
+            diagnostic_relay: Mutex::new(DiagnosticRelayState::new()),
             discovery,
         })
     }
@@ -424,14 +461,17 @@ impl SetupService {
             .discovery
             .as_ref()
             .and_then(NearbyDiscovery::pairing_snapshot);
-        let developer_diagnostics =
-            cfg!(debug_assertions).then(|| self.developer_diagnostics(&setup));
         let host_id = setup
             .local
             .as_ref()
             .map_or(setup.draft_host_id.as_str(), |local| local.host_id.as_str());
         let displays = native_displays(parse_host_id(host_id).map_err(|_| ())?).map_err(|_| ())?;
         self.synchronize_workspace(runtime_state, &displays, &mut setup)?;
+        if cfg!(debug_assertions) {
+            let _ = self.synchronize_developer_diagnostics(&setup);
+        }
+        let developer_diagnostics =
+            cfg!(debug_assertions).then(|| self.developer_diagnostics(&setup));
         let local = setup
             .local
             .as_ref()
@@ -835,7 +875,109 @@ impl SetupService {
             configured_peer,
             observed_peer,
             recent_events: read_developer_events(&self.directory.join(RUNTIME_LOG_FILE)),
+            peer_recent_events: self
+                .diagnostic_relay
+                .lock()
+                .map_or_else(|_| Vec::new(), |relay| relay.peer_events.clone()),
         }
+    }
+
+    fn synchronize_developer_diagnostics(&self, setup: &StoredSetup) -> Result<(), ()> {
+        let Some(discovery) = self.discovery.as_ref() else {
+            return Ok(());
+        };
+        match setup.workspace_role {
+            WorkspaceRole::Follower => self.publish_developer_diagnostics(setup, discovery),
+            WorkspaceRole::Leader => self.receive_developer_diagnostics(setup, discovery),
+            WorkspaceRole::Unassigned => {
+                let mut relay = self.diagnostic_relay.lock().map_err(|_| ())?;
+                relay.peer_stream_id = None;
+                relay.peer_sequence = 0;
+                relay.peer_events.clear();
+                Ok(())
+            }
+        }
+    }
+
+    fn publish_developer_diagnostics(
+        &self,
+        setup: &StoredSetup,
+        discovery: &NearbyDiscovery,
+    ) -> Result<(), ()> {
+        let local = setup.local.as_ref().ok_or(())?;
+        let peer = setup.peer.as_ref().ok_or(())?;
+        let events = relayed_developer_events(&self.directory.join(RUNTIME_LOG_FILE));
+        let mut relay = self.diagnostic_relay.lock().map_err(|_| ())?;
+        if relay.last_local_events == events {
+            return Ok(());
+        }
+        let sequence = relay.next_local_sequence;
+        let encoded = serde_json::to_vec(&events).map_err(|_| ())?;
+        let payload = URL_SAFE_NO_PAD.encode(encoded);
+        let message = diagnostic_signature_message(
+            &local.peer_id,
+            &peer.peer_id,
+            &relay.local_stream_id,
+            sequence,
+            &payload,
+        );
+        let private_key = Zeroizing::new(fs::read(self.directory.join(KEY_FILE)).map_err(|_| ())?);
+        let key_pair = KeyPair::try_from(private_key.as_slice()).map_err(|_| ())?;
+        let signature = URL_SAFE_NO_PAD.encode(key_pair.sign(&message).map_err(|_| ())?);
+        discovery.publish_diagnostic_batch(
+            &peer.peer_id,
+            &relay.local_stream_id,
+            sequence,
+            &payload,
+            &signature,
+        )?;
+        relay.last_local_events = events;
+        relay.next_local_sequence = sequence.checked_add(1).ok_or(())?;
+        Ok(())
+    }
+
+    fn receive_developer_diagnostics(
+        &self,
+        setup: &StoredSetup,
+        discovery: &NearbyDiscovery,
+    ) -> Result<(), ()> {
+        let Some(batch) = discovery.take_diagnostic_batch() else {
+            return Ok(());
+        };
+        let local = setup.local.as_ref().ok_or(())?;
+        let peer = setup.peer.as_ref().ok_or(())?;
+        if batch.from_peer_id != peer.peer_id {
+            return Ok(());
+        }
+        let message = diagnostic_signature_message(
+            &batch.from_peer_id,
+            &local.peer_id,
+            &batch.stream_id,
+            batch.first_sequence,
+            &batch.payload,
+        );
+        if verify_peer_signature(&peer.signing_public_key, &batch.signature, &message).is_err() {
+            return Ok(());
+        }
+        let Ok(decoded) = URL_SAFE_NO_PAD.decode(&batch.payload) else {
+            return Ok(());
+        };
+        let Ok(events) = serde_json::from_slice::<Vec<String>>(&decoded) else {
+            return Ok(());
+        };
+        if !valid_relayed_developer_events(&events) {
+            return Ok(());
+        }
+        let mut relay = self.diagnostic_relay.lock().map_err(|_| ())?;
+        if relay.peer_stream_id.as_deref() == Some(batch.stream_id.as_str())
+            && batch.first_sequence <= relay.peer_sequence
+        {
+            return Ok(());
+        }
+        relay.peer_stream_id = Some(batch.stream_id);
+        relay.peer_sequence = batch.first_sequence;
+        relay.peer_events = events;
+        Ok(())
     }
 }
 
@@ -1552,6 +1694,40 @@ fn workspace_ack_signature_message(
     message
 }
 
+fn diagnostic_signature_message(
+    from_peer_id: &str,
+    to_peer_id: &str,
+    stream_id: &str,
+    first_sequence: u64,
+    payload: &str,
+) -> Vec<u8> {
+    let mut message = Vec::with_capacity(
+        96 + from_peer_id.len() + to_peer_id.len() + stream_id.len() + payload.len(),
+    );
+    message.extend_from_slice(b"software-kvm-redacted-diagnostics-v1\0");
+    message.extend_from_slice(from_peer_id.as_bytes());
+    message.push(0);
+    message.extend_from_slice(to_peer_id.as_bytes());
+    message.push(0);
+    message.extend_from_slice(stream_id.as_bytes());
+    message.push(0);
+    message.extend_from_slice(&first_sequence.to_be_bytes());
+    message.extend_from_slice(payload.as_bytes());
+    message
+}
+
+fn verify_peer_signature(
+    encoded_public_key: &str,
+    encoded_signature: &str,
+    message: &[u8],
+) -> Result<(), ()> {
+    let public_key = URL_SAFE_NO_PAD.decode(encoded_public_key).map_err(|_| ())?;
+    let signature = URL_SAFE_NO_PAD.decode(encoded_signature).map_err(|_| ())?;
+    UnparsedPublicKey::new(&ECDSA_P256_SHA256_ASN1, public_key)
+        .verify(message, &signature)
+        .map_err(|_| ())
+}
+
 fn verify_workspace_signature(
     encoded_public_key: &str,
     encoded_signature: &str,
@@ -1575,6 +1751,27 @@ fn verify_workspace_signature(
     UnparsedPublicKey::new(&ECDSA_P256_SHA256_ASN1, public_key)
         .verify(&message, &signature)
         .map_err(|_| coarse_error())
+}
+
+fn relayed_developer_events(path: &Path) -> Vec<String> {
+    let events = read_developer_events(path);
+    let mut relayed = events
+        .into_iter()
+        .filter(|line| line.starts_with("[dev] "))
+        .rev()
+        .take(MAX_RELAYED_DIAGNOSTIC_LINES)
+        .collect::<Vec<_>>();
+    relayed.reverse();
+    relayed
+}
+
+fn valid_relayed_developer_events(events: &[String]) -> bool {
+    events.len() <= MAX_RELAYED_DIAGNOSTIC_LINES
+        && events.iter().all(|line| {
+            line.starts_with("[dev] ")
+                && line.chars().count() <= MAX_RELAYED_DIAGNOSTIC_LINE_CHARS
+                && !line.chars().any(char::is_control)
+        })
 }
 
 fn verify_workspace_ack_signature(
@@ -2215,10 +2412,11 @@ fn runtime_lock_held(directory: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_config, read_input_authority, validate_bundle, verify_workspace_ack_signature,
-        verify_workspace_signature, workspace_ack_signature_message, workspace_signature_message,
-        DisplayDto, DisplayLayoutDto, InputOwnerState, NativeBoundsDto, PairingBundle, Placement,
-        PlatformDto, PAIRING_VERSION, RUNTIME_STATUS_FILE,
+        build_config, diagnostic_signature_message, read_input_authority, validate_bundle,
+        verify_peer_signature, verify_workspace_ack_signature, verify_workspace_signature,
+        workspace_ack_signature_message, workspace_signature_message, DisplayDto,
+        DisplayLayoutDto, InputOwnerState, NativeBoundsDto, PairingBundle, Placement, PlatformDto,
+        PAIRING_VERSION, RUNTIME_STATUS_FILE,
     };
     #[cfg(windows)]
     use super::{rewrite_windows_profile_paths, CONFIG_FILE, KEY_FILE};
@@ -2438,6 +2636,24 @@ mod tests {
         assert!(
             verify_workspace_ack_signature(&public_key, &acknowledgement, from, to, 7).is_err()
         );
+    }
+
+    #[test]
+    fn diagnostic_signature_binds_direction_stream_sequence_and_payload() {
+        let key = KeyPair::generate().unwrap();
+        let from = "00000000-0000-4000-8000-000000000001";
+        let to = "00000000-0000-4000-8000-000000000002";
+        let stream = "00000000-0000-4000-8000-000000000003";
+        let payload = URL_SAFE_NO_PAD.encode(b"[\"[dev] routing=enabled\"]");
+        let message = diagnostic_signature_message(from, to, stream, 1, &payload);
+        let public_key = URL_SAFE_NO_PAD.encode(key.public_key_raw());
+        let signature = URL_SAFE_NO_PAD.encode(key.sign(&message).unwrap());
+
+        assert!(verify_peer_signature(&public_key, &signature, &message).is_ok());
+        let replay = diagnostic_signature_message(from, to, stream, 2, &payload);
+        assert!(verify_peer_signature(&public_key, &signature, &replay).is_err());
+        let reversed = diagnostic_signature_message(to, from, stream, 1, &payload);
+        assert!(verify_peer_signature(&public_key, &signature, &reversed).is_err());
     }
 
     #[test]
