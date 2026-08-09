@@ -20,6 +20,12 @@ export interface DisplayInfo {
   height: number;
   scaleFactor: number;
   primary: boolean;
+  nativeBounds?: {
+    x: number;
+    y: number;
+    width: number;
+    height: number;
+  };
 }
 
 export interface LocalIdentity {

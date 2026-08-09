@@ -115,6 +115,17 @@ struct DisplayDto {
     height: f64,
     scale_factor: f64,
     primary: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    native_bounds: Option<NativeBoundsDto>,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct NativeBoundsDto {
+    x: f64,
+    y: f64,
+    width: f64,
+    height: f64,
 }
 
 #[derive(Debug, Serialize)]
@@ -868,15 +879,26 @@ pub(crate) fn validate_setup(service: State<'_, SetupService>) -> Result<SetupSn
 
 #[tauri::command]
 pub(crate) fn start_runtime(service: State<'_, SetupService>) -> Result<SetupSnapshot, String> {
-    {
-        let setup = service.inner.lock().map_err(|_| coarse_error())?;
-        if !setup.validated {
-            return Err(coarse_error());
-        }
-    }
     let mut active = service.runtime.lock().map_err(|_| coarse_error())?;
     if active.is_some() || runtime_lock_held(&service.directory) {
         return Err(coarse_error());
+    }
+    {
+        let mut setup = service.inner.lock().map_err(|_| coarse_error())?;
+        if !setup.validated {
+            return Err(coarse_error());
+        }
+        // Re-enumerate displays on every start. Docking, undocking, or moving
+        // a secondary monitor must not leave the cross-host edge attached to
+        // a stale virtual-desktop boundary.
+        write_setup_configuration(&service, &mut setup)?;
+    }
+    kvm_runtime::prepare(&service.directory.join(PROFILE_FILE))
+        .map_err(|error| format!("runtime validation failed safely: {error}"))?;
+    {
+        let mut setup = service.inner.lock().map_err(|_| coarse_error())?;
+        setup.validated = true;
+        service.save(&setup).map_err(|()| coarse_error())?;
     }
     let binary = runtime_binary().ok_or_else(coarse_error)?;
     let control = service.directory.join(CONTROL_FILE);
@@ -976,6 +998,14 @@ fn validate_bundle(peer: &PairingBundle) -> Result<(), String> {
                 || display.width <= 0.0
                 || display.height <= 0.0
                 || display.scale_factor <= 0.0
+                || display.native_bounds.is_some_and(|bounds| {
+                    !bounds.x.is_finite()
+                        || !bounds.y.is_finite()
+                        || !bounds.width.is_finite()
+                        || !bounds.height.is_finite()
+                        || bounds.width <= 0.0
+                        || bounds.height <= 0.0
+                })
         })
     {
         return Err(coarse_error());
@@ -1062,10 +1092,8 @@ fn build_config(
     placement: &Placement,
 ) -> Result<Config, String> {
     let remote_host = parse_host_id(&peer.host_id)?;
-    let mut ordered_local = local_displays.to_vec();
-    ordered_local.sort_by_key(|display| !display.primary);
-    let mut ordered_peer = peer.displays.clone();
-    ordered_peer.sort_by_key(|display| !display.primary);
+    let ordered_local = displays_left_to_right(local_displays);
+    let ordered_peer = displays_left_to_right(&peer.displays);
     let (first, second) = match placement {
         Placement::LocalLeft => (&ordered_local, &ordered_peer),
         Placement::LocalRight => (&ordered_peer, &ordered_local),
@@ -1124,6 +1152,28 @@ fn build_config(
     };
     config.validate().map_err(|_| coarse_error())?;
     Ok(config)
+}
+
+fn displays_left_to_right(displays: &[DisplayDto]) -> Vec<DisplayDto> {
+    let mut ordered = displays.to_vec();
+    if ordered.iter().all(|display| display.native_bounds.is_some()) {
+        ordered.sort_by(|left, right| {
+            let left_bounds = left.native_bounds.expect("bounds presence checked");
+            let right_bounds = right.native_bounds.expect("bounds presence checked");
+            left_bounds
+                .x
+                .total_cmp(&right_bounds.x)
+                .then_with(|| left_bounds.y.total_cmp(&right_bounds.y))
+                .then_with(|| right.primary.cmp(&left.primary))
+                .then_with(|| left.id.cmp(&right.id))
+        });
+    } else {
+        // Pairing bundles created before native bounds were included retain
+        // their former one-display/primary-first behavior. A fresh pairing
+        // upgrades both sides to exact multi-monitor ordering.
+        ordered.sort_by_key(|display| !display.primary);
+    }
+    ordered
 }
 
 fn build_profile(directory: &Path, local: &StoredLocal, peer: &PairingBundle) -> String {
@@ -1406,6 +1456,12 @@ fn display_dto(display: Display) -> DisplayDto {
         height: display.logical_size.height,
         scale_factor: display.scale_factor,
         primary: display.primary,
+        native_bounds: Some(NativeBoundsDto {
+            x: display.native_bounds.x,
+            y: display.native_bounds.y,
+            width: display.native_bounds.width,
+            height: display.native_bounds.height,
+        }),
     }
 }
 
@@ -1537,12 +1593,14 @@ fn runtime_lock_held(directory: &Path) -> bool {
 mod tests {
     use super::{
         build_config, read_input_authority, validate_bundle, DisplayDto, InputOwnerState,
-        PairingBundle, Placement, PlatformDto, PAIRING_VERSION, RUNTIME_STATUS_FILE,
+        NativeBoundsDto, PairingBundle, Placement, PlatformDto, PAIRING_VERSION,
+        RUNTIME_STATUS_FILE,
     };
     #[cfg(windows)]
     use super::{rewrite_windows_profile_paths, CONFIG_FILE, KEY_FILE};
     use base64::engine::general_purpose::URL_SAFE_NO_PAD;
     use base64::Engine;
+    use kvm_types::Edge;
     use rcgen::{CertificateParams, KeyPair};
     use sha2::{Digest, Sha256};
     use std::fs;
@@ -1557,6 +1615,12 @@ mod tests {
             height: 1_080.0,
             scale_factor: 1.0,
             primary,
+            native_bounds: Some(NativeBoundsDto {
+                x: 0.0,
+                y: 0.0,
+                width: 1_920.0,
+                height: 1_080.0,
+            }),
         }
     }
 
@@ -1599,6 +1663,67 @@ mod tests {
         assert_eq!(config.topology.displays.len(), 2);
         assert_eq!(config.topology.links.len(), 2);
         assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn generated_topology_uses_the_real_outer_monitor_instead_of_primary_order() {
+        let peer = bundle();
+        let mut left_secondary = display("00000000-0000-4000-8000-000000000004", false);
+        left_secondary.native_bounds.as_mut().unwrap().x = -1_920.0;
+        let primary = display("00000000-0000-4000-8000-000000000005", true);
+
+        let local_right = build_config(
+            &peer,
+            &[primary.clone(), left_secondary.clone()],
+            &Placement::LocalRight,
+        )
+        .expect("left outer monitor should form the host boundary");
+        assert_eq!(
+            local_right.topology.links[1].from_display,
+            left_secondary.id.parse().unwrap()
+        );
+        assert_eq!(local_right.topology.links[1].from_edge, Edge::Left);
+
+        let local_left = build_config(
+            &peer,
+            &[primary.clone(), left_secondary],
+            &Placement::LocalLeft,
+        )
+        .expect("right outer monitor should form the host boundary");
+        assert_eq!(
+            local_left.topology.links[0].from_display,
+            primary.id.parse().unwrap()
+        );
+        assert_eq!(local_left.topology.links[0].from_edge, Edge::Right);
+    }
+
+    #[test]
+    fn both_hosts_compile_the_same_topology_for_a_secondary_monitor_on_the_left() {
+        let mac_display = display("00000000-0000-4000-8000-000000000006", true);
+        let mut windows_secondary =
+            display("00000000-0000-4000-8000-000000000004", false);
+        windows_secondary.native_bounds.as_mut().unwrap().x = -1_920.0;
+        let windows_primary = display("00000000-0000-4000-8000-000000000005", true);
+
+        let mut windows_bundle = bundle();
+        windows_bundle.displays = vec![windows_primary.clone(), windows_secondary.clone()];
+        let mac_config = build_config(
+            &windows_bundle,
+            std::slice::from_ref(&mac_display),
+            &Placement::LocalLeft,
+        )
+        .unwrap();
+
+        let mut mac_bundle = bundle();
+        mac_bundle.displays = vec![mac_display];
+        let windows_config = build_config(
+            &mac_bundle,
+            &[windows_primary, windows_secondary],
+            &Placement::LocalRight,
+        )
+        .unwrap();
+
+        assert_eq!(mac_config.topology, windows_config.topology);
     }
 
     #[test]

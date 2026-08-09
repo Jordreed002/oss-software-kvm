@@ -1113,6 +1113,24 @@ fn prepare_workspace(
     local_displays: Vec<Display>,
 ) -> Result<PreparedWorkspace, RuntimeCompositionError> {
     let primary = local_primary(&local_displays, local_host)?;
+    let local_display_ids = local_displays
+        .iter()
+        .map(|display| display.id)
+        .collect::<std::collections::BTreeSet<_>>();
+    let pointer_display = config
+        .topology
+        .links
+        .iter()
+        .find(|link| {
+            local_display_ids.contains(&link.from_display)
+                && !local_display_ids.contains(&link.to_display)
+        })
+        .and_then(|link| {
+            local_displays
+                .iter()
+                .find(|display| display.id == link.from_display)
+        })
+        .unwrap_or(primary);
     let placements: Vec<_> = config
         .topology
         .displays
@@ -1144,9 +1162,9 @@ fn prepare_workspace(
         })
         .collect();
     let pointer = LogicalPointer::new(
-        primary.id,
-        primary.logical_size.width / 2.0,
-        primary.logical_size.height / 2.0,
+        pointer_display.id,
+        pointer_display.logical_size.width / 2.0,
+        pointer_display.logical_size.height / 2.0,
     );
     let initial_state = WorkspaceState::new(local_host, local_host, pointer);
     let mut inventory = DisplayInventory::new(local_host, DisplayInventoryConfig::default())
@@ -1190,14 +1208,16 @@ fn local_primary(
 
 #[cfg(test)]
 mod tests {
-    use kvm_config::{DisplayPlacement, TopologyConfig};
-    use kvm_types::{DisplayId, HostId, Rect, Size};
+    use kvm_config::{DisplayPlacement, TopologyConfig, TopologyLink};
+    use kvm_types::{DisplayId, Edge, HostId, Rect, Size};
 
     use super::*;
 
     const LOCAL_HOST: HostId = HostId::from_bytes([0x11; 16]);
     const OTHER_HOST: HostId = HostId::from_bytes([0x22; 16]);
     const DISPLAY: DisplayId = DisplayId::from_bytes([0x33; 16]);
+    const SECONDARY_DISPLAY: DisplayId = DisplayId::from_bytes([0x44; 16]);
+    const REMOTE_DISPLAY: DisplayId = DisplayId::from_bytes([0x55; 16]);
 
     fn display(host_id: HostId, primary: bool) -> Display {
         Display {
@@ -1211,6 +1231,13 @@ mod tests {
             native_bounds: Rect::new(0.0, 0.0, 200.0, 100.0),
             primary,
         }
+    }
+
+    fn secondary_display() -> Display {
+        let mut display = display(LOCAL_HOST, false);
+        display.id = SECONDARY_DISPLAY;
+        display.native_bounds = Rect::new(-200.0, 0.0, 200.0, 100.0);
+        display
     }
 
     fn config_with_local_placement() -> Config {
@@ -1255,6 +1282,39 @@ mod tests {
         .unwrap();
 
         assert_eq!(error.kind(), RuntimeCompositionErrorKind::Topology);
+    }
+
+    #[test]
+    fn linked_outer_monitor_seeds_pointer_authority_with_multiple_local_displays() {
+        let mut config = config_with_local_placement();
+        config.topology.displays.extend([
+            DisplayPlacement {
+                display_id: SECONDARY_DISPLAY,
+                x: -200.0,
+                y: 20.0,
+            },
+            DisplayPlacement {
+                display_id: REMOTE_DISPLAY,
+                x: -400.0,
+                y: 20.0,
+            },
+        ]);
+        config.topology.links.push(TopologyLink {
+            from_display: SECONDARY_DISPLAY,
+            from_edge: Edge::Left,
+            to_display: REMOTE_DISPLAY,
+            to_edge: Edge::Right,
+        });
+
+        let prepared = prepare_workspace(
+            &config,
+            LOCAL_HOST,
+            vec![display(LOCAL_HOST, true), secondary_display()],
+        )
+        .unwrap();
+
+        assert_eq!(prepared.pointer.display_id, SECONDARY_DISPLAY);
+        assert_eq!(prepared.initial_state.active_display, SECONDARY_DISPLAY);
     }
 
     #[test]
