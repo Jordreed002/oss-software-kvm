@@ -81,6 +81,9 @@ pub struct CaptureStatistics {
     pub untranslated_events: u64,
     /// Panics contained at a native callback boundary.
     pub callback_panics: u64,
+    /// Whole-host generations faulted because the daemon callback overran the
+    /// tap-dispatch deadline and would freeze system-wide input delivery.
+    pub callback_overruns: u64,
     /// Whole-host generations terminated by an out-of-band tap disable.
     pub tap_disables: u64,
     /// Current or terminal health of the capture pipeline.
@@ -108,6 +111,10 @@ pub enum CaptureHealth {
     TapInvalidated = 6,
     /// The synchronous daemon callback panicked; the generation is terminal.
     CallbackPanicked = 7,
+    /// The synchronous daemon callback overran the tap-dispatch deadline; the
+    /// generation is terminal (a blocking callback freezes system-wide input
+    /// delivery, so the generation is faulted to fail open).
+    CallbackOverran = 8,
 }
 
 /// Failures at the platform boundary.

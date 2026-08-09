@@ -166,6 +166,18 @@ pub(crate) fn translate_keyboard(packet: RawKeyboardPacket) -> Option<InputPaylo
     Some(InputPayload::Key { code, state })
 }
 
+/// Decodes one Raw Input mouse packet into zero-or-more input payloads.
+///
+/// # F-20: per-packet allocation (accepted, INFO/perf)
+///
+/// Returns an owned `Vec`, so each mouse packet performs one small heap
+/// allocation (`with_capacity(7)`). At very high mouse poll rates this is a few
+/// thousand short-lived allocations per second. The trade-off is accepted: the
+/// payloads must flow into the generic input channel as owned values anyway, a
+/// fixed-size stack buffer (`ArrayVec`) would require a dependency or a wider
+/// signature change, and the allocator path is not on the network-bound
+/// critical section. Revisit only if profiling on a high-poll-rate device shows
+/// this as a hotspot.
 pub(crate) fn translate_mouse(packet: RawMousePacket) -> Vec<InputPayload> {
     let mut events = Vec::with_capacity(7);
 

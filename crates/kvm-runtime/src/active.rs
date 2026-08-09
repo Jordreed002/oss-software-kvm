@@ -465,7 +465,8 @@ where
                             developer_event(&format!("transport=manager_tick_failed detail:{error:?}"));
                             return Err(error);
                         }
-                        report_manager_snapshot(&self.manager, &mut last_manager_snapshot, status.as_ref())?;
+                        let previous = &mut last_manager_snapshot;
+                        report_manager_snapshot(&self.manager, previous, status.as_ref());
                         if dial_tasks.is_empty() {
                             if let Some(task) = poll_dial(&self.manager, now_duration(started))? {
                                 developer_event("transport=outbound_dial_started");
@@ -509,17 +510,24 @@ fn report_manager_snapshot<I>(
     manager: &Arc<Mutex<PeerManager<I, ManagedSessionOutbound>>>,
     previous: &mut Option<ManagerDiagnosticSnapshot>,
     status: Option<&RuntimeStatusPublisher>,
-) -> Result<(), RuntimeTransportError>
-where
+) where
     I: OutputInjectionBackend,
 {
+    // R-1: this is a best-effort diagnostic read and status publish. A failure
+    // here reads no pressed-key state, so it must never propagate and tear down
+    // the transport loop — log and return instead.
     let (manager_snapshot, routing) = {
-        let manager = lock_manager(manager)?;
+        let Ok(manager) = lock_manager(manager) else {
+            developer_event("transport=manager_snapshot_failed detail:lock");
+            return;
+        };
         let manager_snapshot = manager.snapshot();
-        let routing = manager
-            .selected_routing_handle()
-            .map_err(|_| RuntimeTransportError::new(RuntimeTransportErrorKind::Authority))?
-            .load();
+        let routing = if let Ok(handle) = manager.selected_routing_handle() {
+            handle.load()
+        } else {
+            developer_event("transport=manager_snapshot_failed detail:authority");
+            return;
+        };
         (manager_snapshot, routing)
     };
     let routing_state = if routing.enabled {
@@ -543,29 +551,7 @@ where
             AuthorityDiagnosticState::Remote
         },
     };
-    let input_owner = if snapshot.handoff == HandoffDiagnosticState::Pending {
-        RuntimeInputOwner::Transitioning
-    } else if snapshot.routing == RoutingDiagnosticState::Enabled
-        && snapshot.manager.session_tasks != 0
-        && snapshot.authority == AuthorityDiagnosticState::Remote
-    {
-        RuntimeInputOwner::Peer
-    } else {
-        RuntimeInputOwner::Local
-    };
-    if let Some(status) = status {
-        status.publish(RuntimeStatusSnapshot::running(
-            input_owner,
-            match snapshot.routing {
-                RoutingDiagnosticState::Enabled => RuntimeRoutingState::Enabled,
-                RoutingDiagnosticState::Gated => RuntimeRoutingState::Gated,
-                RoutingDiagnosticState::WaitingForWorkspace => {
-                    RuntimeRoutingState::WaitingForWorkspace
-                }
-            },
-            snapshot.manager.session_tasks != 0,
-        ));
-    }
+    publish_running_status(&snapshot, snapshot.manager.session_tasks != 0, status);
     if *previous != Some(snapshot) {
         developer_event(&format!(
             "manager=state candidates:{} connecting:{} sessions:{} routing:{} handoff:{} authority:{}",
@@ -578,7 +564,39 @@ where
         ));
         *previous = Some(snapshot);
     }
-    Ok(())
+}
+
+/// Derives the active input owner from a manager snapshot and publishes the
+/// running status to the UI/control panel. Extracted from
+/// `report_manager_snapshot` to keep that helper under the line budget; it is
+/// part of the R-1 best-effort status path and performs no fallible I/O.
+fn publish_running_status(
+    snapshot: &ManagerDiagnosticSnapshot,
+    has_sessions: bool,
+    status: Option<&RuntimeStatusPublisher>,
+) {
+    let input_owner = if snapshot.handoff == HandoffDiagnosticState::Pending {
+        RuntimeInputOwner::Transitioning
+    } else if snapshot.routing == RoutingDiagnosticState::Enabled
+        && has_sessions
+        && snapshot.authority == AuthorityDiagnosticState::Remote
+    {
+        RuntimeInputOwner::Peer
+    } else {
+        RuntimeInputOwner::Local
+    };
+    let routing_state = match snapshot.routing {
+        RoutingDiagnosticState::Enabled => RuntimeRoutingState::Enabled,
+        RoutingDiagnosticState::Gated => RuntimeRoutingState::Gated,
+        RoutingDiagnosticState::WaitingForWorkspace => RuntimeRoutingState::WaitingForWorkspace,
+    };
+    if let Some(status) = status {
+        status.publish(RuntimeStatusSnapshot::running(
+            input_owner,
+            routing_state,
+            has_sessions,
+        ));
+    }
 }
 
 fn report_capture_metrics(
@@ -837,7 +855,15 @@ where
         }
     };
     let generation = prepared.generation();
-    match lock_manager(manager)?.install_prepared_session(prepared) {
+    // Bind the manager guard to a block scope so it is dropped at the block's
+    // closing brace, *before* the `match` runs. Otherwise the match-scrutinee
+    // temporary keeps the non-reentrant std Mutex locked for the whole match,
+    // and the `Err` arm's `lock_manager(manager)?` would self-deadlock (F-01).
+    let install_outcome = {
+        let mut manager_guard = lock_manager(manager)?;
+        manager_guard.install_prepared_session(prepared)
+    };
+    match install_outcome {
         Ok(installed) => {
             developer_event("session=installed");
             Ok(installed)
@@ -1062,10 +1088,20 @@ impl PreparedTwoHostAlpha {
         let supervisor = PeerSessionSupervisor::new(gate, coordinator);
         let paired = PairedPeer::from_persisted_public_identity(parts.remote_identity.clone());
         let managed_peer = ManagedPairedPeer::new(&paired, supervisor);
-        let mut manager =
-            PeerManager::new(local_peer, [managed_peer], PeerManagerConfig::default()).map_err(
-                |_| RuntimeCompositionError::new(RuntimeCompositionErrorKind::Authority),
-            )?;
+        // F-08: pin discovery-derived dial candidates to this host's service
+        // port so a malicious LAN peer can't induce internal connects by
+        // advertising a paired PeerId with a forged mDNS SRV port. All listen
+        // addresses share one port (validated at profile load), so the first
+        // suffices; `None` only if no address is configured.
+        let manager_config = PeerManagerConfig {
+            expected_service_port: parts
+                .listen_addresses
+                .first()
+                .map(std::net::SocketAddr::port),
+            ..PeerManagerConfig::default()
+        };
+        let mut manager = PeerManager::new(local_peer, [managed_peer], manager_config)
+            .map_err(|_| RuntimeCompositionError::new(RuntimeCompositionErrorKind::Authority))?;
         let workspace = WorkspaceControlPlane::new(
             remote_peer,
             prepared_workspace.inventory,

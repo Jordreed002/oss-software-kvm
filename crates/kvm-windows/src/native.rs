@@ -2277,6 +2277,12 @@ fn raw_device_entries() -> Result<Vec<RAWINPUTDEVICELIST>, WindowsBackendError> 
 }
 
 fn raw_device_name(device: HANDLE) -> Result<String, WindowsBackendError> {
+    // F-30: device-interface paths are short (a few hundred UTF-16 units). The
+    // size query returns a hostile `u32` directly from the Win32 API, so cap it
+    // before allocating — this bounds the worst case to ~2 KiB instead of a
+    // near-`u32::MAX` (~8 GiB on 64-bit) allocation, and removes the unguarded
+    // `+ 1` overflow on 32-bit targets. A path this long is malformed anyway.
+    const MAX_DEVICE_NAME_CHARS: u32 = 1024;
     let mut characters = 0_u32;
     // SAFETY: this is the documented size-query form; the device handle comes
     // directly from `GetRawInputDeviceList` and `characters` is writable.
@@ -2287,6 +2293,12 @@ fn raw_device_name(device: HANDLE) -> Result<String, WindowsBackendError> {
     }
     if characters == 0 {
         return Ok(String::new());
+    }
+    if characters > MAX_DEVICE_NAME_CHARS {
+        return Err(WindowsBackendError::CaptureRuntime(format!(
+            "GetRawInputDeviceInfoW reported a {characters}-char device name, \
+             exceeding the {MAX_DEVICE_NAME_CHARS}-char sanity cap"
+        )));
     }
 
     let mut buffer = vec![0_u16; characters as usize + 1];
@@ -2474,8 +2486,8 @@ fn display_from_monitor(
         .unwrap_or(info.szDevice.len());
     let name = String::from_utf16_lossy(&info.szDevice[..name_end]);
     let bounds = info.monitorInfo.rcMonitor;
-    let width = bounds.right - bounds.left;
-    let height = bounds.bottom - bounds.top;
+    let width = bounds.right.saturating_sub(bounds.left);
+    let height = bounds.bottom.saturating_sub(bounds.top);
     if width <= 0 || height <= 0 {
         return Err(WindowsBackendError::InvalidInput(
             "Windows returned non-positive display bounds",

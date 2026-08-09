@@ -6,7 +6,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use std::sync::mpsc::{sync_channel, Receiver, RecvTimeoutError, SyncSender, TrySendError};
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use kvm_daemon::{
     CaptureCallback, CaptureDisposition, CaptureLifecycleState, CapturedInput, DisplayBackend,
@@ -294,6 +294,7 @@ struct CaptureCounters {
     suppressed_events: AtomicU64,
     untranslated_events: AtomicU64,
     callback_panics: AtomicU64,
+    callback_overruns: AtomicU64,
     tap_disables: AtomicU64,
     health: AtomicU8,
 }
@@ -312,6 +313,7 @@ impl CaptureCounters {
             5 => CaptureHealth::TapDisabled,
             6 => CaptureHealth::TapInvalidated,
             7 => CaptureHealth::CallbackPanicked,
+            8 => CaptureHealth::CallbackOverran,
             _ => CaptureHealth::Idle,
         }
     }
@@ -326,6 +328,7 @@ impl CaptureCounters {
             suppressed_events: self.suppressed_events.load(Ordering::Relaxed),
             untranslated_events: self.untranslated_events.load(Ordering::Relaxed),
             callback_panics: self.callback_panics.load(Ordering::Relaxed),
+            callback_overruns: self.callback_overruns.load(Ordering::Relaxed),
             tap_disables: self.tap_disables.load(Ordering::Relaxed),
             health: self.health(),
         }
@@ -408,6 +411,13 @@ impl Drop for WholeHostOwnershipClaim {
     }
 }
 
+/// Maximum wall-clock time a synchronous daemon callback may spend inside a
+/// Quartz event-tap dispatch before the whole-host generation is faulted. A
+/// tap cannot deliver the next event until the callback returns, so unbounded
+/// blocking work freezes input delivery system-wide with no recovery. Mirrors
+/// the Windows `WHOLE_HOST_CALLBACK_DEADLINE` watchdog (F-04).
+const WHOLE_HOST_CALLBACK_DEADLINE: Duration = Duration::from_millis(100);
+
 struct WholeHostCallbackContext {
     host_id: HostId,
     keyboard_device: DeviceId,
@@ -417,6 +427,7 @@ struct WholeHostCallbackContext {
     active: Arc<AtomicBool>,
     run_loop: CFRunLoopRef,
     sequence: AtomicU64,
+    timebase: MachTimebaseInfo,
 }
 
 #[derive(Debug)]
@@ -538,6 +549,16 @@ impl MacInputBackend {
     fn start_observation(&mut self, callback: CaptureCallback) -> Result<(), PlatformError> {
         if self.capture.is_some() || self.whole_host_capture.is_some() {
             return Err(MacBackendError::CaptureAlreadyRunning.into());
+        }
+        // F-18: preflight permissions before IOHIDManagerOpen, mirroring
+        // start_whole_host_alpha. Without this, a denied Input Monitoring grant
+        // surfaces as a healthy-looking but silently dead capture (zero events).
+        let permissions = probe_permissions()?;
+        if !permissions.input_monitoring {
+            return Err(MacBackendError::PermissionDenied("Input Monitoring").into());
+        }
+        if !permissions.accessibility {
+            return Err(MacBackendError::PermissionDenied("Accessibility").into());
         }
 
         let counters = Arc::new(CaptureCounters::default());
@@ -875,7 +896,8 @@ impl MacInputBackend {
             | CaptureHealth::DeliveryDisconnected
             | CaptureHealth::TapDisabled
             | CaptureHealth::TapInvalidated
-            | CaptureHealth::CallbackPanicked => CaptureLifecycleState::Faulted,
+            | CaptureHealth::CallbackPanicked
+            | CaptureHealth::CallbackOverran => CaptureLifecycleState::Faulted,
             CaptureHealth::Running => CaptureLifecycleState::Running,
             CaptureHealth::Stopped => CaptureLifecycleState::Stopped,
             CaptureHealth::Idle => CaptureLifecycleState::Idle,
@@ -1009,9 +1031,18 @@ impl MacOutputBackend {
             } => {
                 let vertical = rounded_i32(vertical);
                 let horizontal = rounded_i32(horizontal);
-                // SAFETY: CoreGraphics defines the non-variadic `...Event2`
-                // entry point with three fixed wheel values. `wheel_count`
-                // selects the two populated pixel-unit axes; the third is zero.
+                // SAFETY (F-27): the C prototype of CGEventCreateScrollWheelEvent2
+                // is variadic (`...`), but it is declared here with fixed
+                // arguments. This is sound on every supported macOS target:
+                // x86-64 SysV and arm64 AAPCS64 pass leading integer/pointer
+                // arguments in registers identically whether the callee is
+                // variadic or not, and all six arguments here are integers or
+                // pointers (the upstream `core-graphics` crate binds this same
+                // fixed-arg shape for the same reason). A divergence would only
+                // matter on an ABI whose variadic and non-variadic conventions
+                // differ before the `...`, which no macOS target has.
+                // `wheel_count` is 2 and selects the two populated pixel-unit
+                // axes; the third wheel value is zero.
                 let event = unsafe {
                     CGEventCreateScrollWheelEvent2(
                         ptr::null(),
@@ -1119,6 +1150,21 @@ fn run_whole_host_capture_thread(
         return Ok(());
     }
 
+    // F-28: query the mach timebase so Quartz (whole-host alpha) timestamps can
+    // be converted to nanoseconds — matching the IOHID path — instead of being
+    // passed through as raw mach absolute-time ticks (~41x too small on Apple
+    // Silicon if read as ns).
+    let mut timebase = MachTimebaseInfo::default();
+    // SAFETY: `timebase` is valid writable storage for the fixed C structure.
+    let timebase_status = unsafe { mach_timebase_info(&raw mut timebase) };
+    if timebase_status != 0 || timebase.denominator == 0 {
+        let _ = ready.send(Err(MacBackendError::NativeStatus {
+            operation: "mach_timebase_info",
+            code: timebase_status,
+        }));
+        return Ok(());
+    }
+
     let mut context = Box::new(WholeHostCallbackContext {
         host_id,
         keyboard_device: derive_whole_host_device_id(host_id, WholeHostDeviceKind::Keyboard),
@@ -1128,6 +1174,7 @@ fn run_whole_host_capture_thread(
         active: Arc::clone(active),
         run_loop,
         sequence: AtomicU64::new(1),
+        timebase,
     });
     let context_ptr = (&raw mut *context).cast::<c_void>();
     // SAFETY: The callback context remains boxed until after this tap is
@@ -1223,7 +1270,8 @@ fn run_whole_host_capture_thread(
         CaptureHealth::TransitionDiscontinuity => Err(MacBackendError::CaptureDiscontinuity),
         CaptureHealth::TapDisabled
         | CaptureHealth::TapInvalidated
-        | CaptureHealth::CallbackPanicked => Err(MacBackendError::CaptureTapTerminated),
+        | CaptureHealth::CallbackPanicked
+        | CaptureHealth::CallbackOverran => Err(MacBackendError::CaptureTapTerminated),
         _ => Ok(()),
     }
 }
@@ -1370,7 +1418,13 @@ fn dispatch_quartz_event(
     let mut captured = CapturedInput::new(
         InputEvent::new(
             sequence,
-            unsafe { CGEventGetTimestamp(event) },
+            // F-28: convert mach absolute-time ticks to nanoseconds via the
+            // queried timebase, so downstream ns-assuming logic is correct.
+            mach_timestamp_ns(
+                unsafe { CGEventGetTimestamp(event) },
+                context.timebase.numerator,
+                context.timebase.denominator,
+            ),
             context.host_id,
             source_device,
             payload,
@@ -1386,7 +1440,21 @@ fn dispatch_quartz_event(
         .counters
         .delivered_events
         .fetch_add(1, Ordering::Relaxed);
+    // F-04: bound the synchronous daemon callback like the Windows
+    // WHOLE_HOST_CALLBACK_DEADLINE watchdog. A Quartz event tap cannot deliver
+    // the next event until the callback returns, so a blocking callback
+    // freezes keyboard/mouse delivery system-wide. Fault the generation on
+    // overrun; subsequent input fails open while runtime health drives cleanup.
+    let callback_started = Instant::now();
     let disposition = (context.callback)(captured);
+    if callback_started.elapsed() > WHOLE_HOST_CALLBACK_DEADLINE {
+        context
+            .counters
+            .callback_overruns
+            .fetch_add(1, Ordering::Relaxed);
+        context.counters.set_health(CaptureHealth::CallbackOverran);
+        terminally_deactivate_whole_host(context);
+    }
     if disposition == CaptureDisposition::SuppressLocal
         && classification == EventClassification::Physical
         && context.active.load(Ordering::Acquire)

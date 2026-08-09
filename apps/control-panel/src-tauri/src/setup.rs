@@ -41,6 +41,12 @@ const CONTROL_FILE: &str = "runtime.control";
 const RUNTIME_LOG_FILE: &str = "runtime.log";
 const RUNTIME_STATUS_FILE: &str = "runtime.status";
 const MAX_RUNTIME_LOG_READ: u64 = 16 * 1024;
+/// Maximum decoded peer-bundle size (matches the import-bundle byte cap).
+const MAX_PEER_BUNDLE_BYTES: usize = 64 * 1024;
+/// Upper bound on the base64 (URL-safe, no-pad) bundle text *before* decoding:
+/// every 3 bytes encode to 4 chars, plus slack for whitespace and rounding. This
+/// lets an oversized paste be rejected without allocating the full decode (F-23).
+const MAX_PEER_BUNDLE_INPUT_CHARS: usize = MAX_PEER_BUNDLE_BYTES * 4 / 3 + 16;
 #[cfg(windows)]
 // Keep credentials separate from WebView2's profile in the app-data root.
 const WINDOWS_SETUP_DIRECTORY: &str = "runtime";
@@ -375,8 +381,12 @@ impl SetupService {
             .as_ref()
             .and_then(NearbyDiscovery::take_completed_bundle)
         {
-            self.install_peer_bundle(&bundle).map_err(|_| ())?;
-            setup = self.inner.lock().map_err(|_| ())?.clone();
+            // N-3: a late incoming-pairing completion must not overwrite an
+            // already-configured peer (the victim's own concurrent action).
+            // install_peer_bundle guards atomically under its lock as well.
+            if setup.peer.is_none() && self.install_peer_bundle(&bundle).is_ok() {
+                setup = self.inner.lock().map_err(|_| ())?.clone();
+            }
             if let Some(discovery) = &self.discovery {
                 nearby_machines =
                     discovery.snapshot(setup.peer.as_ref().map(|peer| peer.peer_id.as_str()));
@@ -386,8 +396,8 @@ impl SetupService {
             .discovery
             .as_ref()
             .and_then(NearbyDiscovery::pairing_snapshot);
-        let developer_diagnostics = cfg!(debug_assertions)
-            .then(|| self.developer_diagnostics(&setup));
+        let developer_diagnostics =
+            cfg!(debug_assertions).then(|| self.developer_diagnostics(&setup));
         let host_id = setup
             .local
             .as_ref()
@@ -477,10 +487,16 @@ impl SetupService {
     }
 
     fn validate_peer_bundle(&self, bundle: &str) -> Result<(PairingBundle, Vec<u8>), String> {
+        let trimmed = bundle.trim();
+        // F-23: bound the input text length before base64 allocation so an
+        // oversized paste can't force a large transient allocation.
+        if trimmed.len() > MAX_PEER_BUNDLE_INPUT_CHARS {
+            return Err(coarse_error());
+        }
         let raw = URL_SAFE_NO_PAD
-            .decode(bundle.trim())
+            .decode(trimmed)
             .map_err(|_| coarse_error())?;
-        if raw.len() > 64 * 1024 {
+        if raw.len() > MAX_PEER_BUNDLE_BYTES {
             return Err(coarse_error());
         }
         let peer: PairingBundle = serde_json::from_slice(&raw).map_err(|_| coarse_error())?;
@@ -504,6 +520,13 @@ impl SetupService {
         secure_write(&self.directory.join(TRUST_FILE), &certificate, false)
             .map_err(|()| coarse_error())?;
         let mut setup = self.inner.lock().map_err(|_| coarse_error())?;
+        // N-3: never overwrite an already-configured peer. The command handlers
+        // pre-check this for UX, but the snapshot-driven incoming-completion
+        // path does not; guard atomically under the lock so a late/async
+        // completion cannot silently discard a prior trust decision.
+        if setup.peer.is_some() {
+            return Err(coarse_error());
+        }
         setup.peer = Some(peer);
         setup.display_layout.clear();
         setup.configured = false;
@@ -1329,7 +1352,10 @@ fn touching_edges(
 
 fn displays_left_to_right(displays: &[DisplayDto]) -> Vec<DisplayDto> {
     let mut ordered = displays.to_vec();
-    if ordered.iter().all(|display| display.native_bounds.is_some()) {
+    if ordered
+        .iter()
+        .all(|display| display.native_bounds.is_some())
+    {
         ordered.sort_by(|left, right| {
             let left_bounds = left.native_bounds.expect("bounds presence checked");
             let right_bounds = right.native_bounds.expect("bounds presence checked");
@@ -1440,9 +1466,8 @@ fn read_input_authority(directory: &Path) -> InputAuthorityDto {
     }
 
     let running = matches!(status.service, RuntimeStatusService::Running);
-    let link_ready = running
-        && status.session_active
-        && matches!(status.routing, RuntimeStatusRouting::Enabled);
+    let link_ready =
+        running && status.session_active && matches!(status.routing, RuntimeStatusRouting::Enabled);
     let owner = match status.service {
         RuntimeStatusService::Starting
         | RuntimeStatusService::Stopping
@@ -1879,8 +1904,7 @@ mod tests {
     #[test]
     fn both_hosts_compile_the_same_topology_for_a_secondary_monitor_on_the_left() {
         let mac_display = display("00000000-0000-4000-8000-000000000006", true);
-        let mut windows_secondary =
-            display("00000000-0000-4000-8000-000000000004", false);
+        let mut windows_secondary = display("00000000-0000-4000-8000-000000000004", false);
         windows_secondary.native_bounds.as_mut().unwrap().x = -1_920.0;
         let windows_primary = display("00000000-0000-4000-8000-000000000005", true);
 
@@ -1960,10 +1984,8 @@ mod tests {
 
     #[test]
     fn runtime_status_reports_only_an_effective_peer_authority() {
-        let directory = std::env::temp_dir().join(format!(
-            "software-kvm-status-{}",
-            uuid::Uuid::new_v4()
-        ));
+        let directory =
+            std::env::temp_dir().join(format!("software-kvm-status-{}", uuid::Uuid::new_v4()));
         fs::create_dir(&directory).unwrap();
         fs::write(
             directory.join(RUNTIME_STATUS_FILE),

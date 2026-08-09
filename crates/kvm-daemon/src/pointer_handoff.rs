@@ -824,6 +824,28 @@ where
         Ok(PointerHandoffStatus::Applied)
     }
 
+    /// Applies an inbound `enter`, the host-gaining-pointer side of a handoff.
+    ///
+    /// # F-21: known out-of-order recovery gap (accepted, documented)
+    ///
+    /// If a non-matching `enter` arrives while a `Prepared`/`Hint`/`Proposal` is
+    /// already pending for this session (neither its hint's `expected_enter` nor
+    /// its proposal's `enter` equals the inbound message), the branch at the
+    /// `rejection_effect` call below rejects the new `enter` and, as a side
+    /// effect, discards the pending state. Recovery then requires a session
+    /// resync (re-hint) rather than converging from the strayed packet alone.
+    ///
+    /// This is deliberately not patched here. Pointer handoff is the most
+    /// safety-critical concurrent protocol in the workspace: preserving the
+    /// pending inbound across a rejection would interact with `self.reply`,
+    /// `self.last_inbound_sequence`, and the handoff deadlines, and the only
+    /// environment that exercises two-host handoff cannot be reproduced on a
+    /// single host. Shipping an unverified change to this path risks stranding
+    /// the pointer on the wrong host — strictly worse than the documented gap.
+    /// The gap is LOW severity and self-heals: the next `hint`/`leave` from the
+    /// authoritative host resyncs the session and reacquires the pointer, and no
+    /// key state or suppression is stranded by it (the central safety invariant
+    /// is independent of pointer ownership).
     fn receive_enter(
         &mut self,
         session: &B,

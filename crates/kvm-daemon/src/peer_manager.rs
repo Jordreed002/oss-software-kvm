@@ -47,6 +47,17 @@ pub struct PeerManagerConfig {
     pub maximum_peers: usize,
     pub maximum_candidates_per_peer: usize,
     pub reconnect: ReconnectPolicy,
+    /// The canonical TCP service port this host listens on. When set,
+    /// discovery-derived dial candidates are pinned to this port instead of
+    /// trusting the peer-advertised mDNS SRV port, closing the F-08 SSRF
+    /// vector where a malicious LAN peer advertises a victim's paired `PeerId`
+    /// with an arbitrary internal `ip:port` to induce internal connects. The
+    /// IP is still taken from discovery (legitimate DHCP/address roaming), but
+    /// the port is not. `None` preserves the legacy trust-the-advertised-port
+    /// behavior for callers that do not know their own service port.
+    /// Operator-provided candidates ([`PeerManager::replace_selected_outbound_candidate`])
+    /// bypass this pin — an explicit operator address is trusted verbatim.
+    pub expected_service_port: Option<u16>,
 }
 
 impl Default for PeerManagerConfig {
@@ -55,6 +66,7 @@ impl Default for PeerManagerConfig {
             maximum_peers: MAX_MANAGED_PEERS,
             maximum_candidates_per_peer: MAX_CANDIDATES_PER_PEER,
             reconnect: ReconnectPolicy::default(),
+            expected_service_port: None,
         }
     }
 }
@@ -66,6 +78,7 @@ impl PeerManagerConfig {
             || self.maximum_candidates_per_peer == 0
             || self.maximum_candidates_per_peer > MAX_CANDIDATES_PER_PEER
             || self.reconnect.validate().is_err()
+            || self.expected_service_port == Some(0)
         {
             return Err(PeerManagerError::InvalidConfiguration);
         }
@@ -1587,6 +1600,15 @@ where
             if peer.revoked {
                 continue;
             }
+            // F-08: don't trust the peer-advertised mDNS SRV port. A malicious
+            // LAN peer that knows a paired PeerId can advertise it with an
+            // arbitrary internal ip:port to induce internal connects. Pin the
+            // dial port to this host's canonical service port (IP still roams
+            // from discovery). Operator-provided candidates bypass this path.
+            let address = match self.config.expected_service_port {
+                Some(port) => SocketAddr::new(address.ip(), port),
+                None => address,
+            };
             let address =
                 LanPeerAddress::new(address).map_err(|_| PeerManagerError::InvalidCandidate)?;
             let values = replacement.entry(peer_id).or_default();
@@ -5103,6 +5125,53 @@ mod tests {
         other
             .outbound_task_lost(&other_task, Duration::ZERO)
             .unwrap();
+    }
+
+    #[test]
+    fn discovery_candidate_port_is_pinned_to_the_expected_service_port() {
+        // F-08: a malicious LAN peer that learns a paired PeerId can advertise
+        // it via mDNS with an arbitrary internal ip:port to induce the daemon
+        // to open connects there. When expected_service_port is set, the
+        // advertised port is discarded and the candidate is pinned to this
+        // host's service port; the roving IP from discovery is still honored.
+        let managed = managed_peer(LOCAL_PEER, DIAL_PEER, 11);
+        let config = PeerManagerConfig {
+            expected_service_port: Some(24_800),
+            ..PeerManagerConfig::default()
+        };
+        let mut pinned = PeerManager::new(LOCAL_PEER, [managed], config).unwrap();
+        pinned
+            .replace_candidates([(DIAL_PEER, "10.0.0.2:9999".parse().unwrap())])
+            .unwrap();
+        let candidate = pinned
+            .peers
+            .get(&DIAL_PEER)
+            .unwrap()
+            .candidates
+            .iter()
+            .next()
+            .unwrap();
+        assert_eq!(candidate.socket_addr().port(), 24_800);
+        assert_eq!(
+            candidate.socket_addr().ip(),
+            "10.0.0.2".parse::<IpAddr>().unwrap()
+        );
+
+        // Legacy callers that don't set expected_service_port still honor the
+        // advertised port verbatim (backward-compatible opt-in).
+        let mut legacy = manager(DIAL_PEER);
+        legacy
+            .replace_candidates([(DIAL_PEER, "10.0.0.2:9999".parse().unwrap())])
+            .unwrap();
+        let legacy_candidate = legacy
+            .peers
+            .get(&DIAL_PEER)
+            .unwrap()
+            .candidates
+            .iter()
+            .next()
+            .unwrap();
+        assert_eq!(legacy_candidate.socket_addr().port(), 9999);
     }
 
     #[test]

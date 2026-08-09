@@ -784,7 +784,13 @@ where
 
     fn trigger_capture_emergency(&mut self, now_ns: u64) -> Result<(), CoordinatorError> {
         self.core.trigger_emergency(now_ns)?;
-        self.drain_remote_cleanup(now_ns)
+        // Emergency chord must release locally-injected inbound keys too, not just
+        // drain outbound cleanup — otherwise the user regains control of the machine
+        // with the peer's injected modifiers still physically held (F-02). Mirrors the
+        // shutdown path (session.rs:978), running both and combining so neither masks.
+        let injection_result = self.release_all_inbound(now_ns);
+        let outbound_result = self.drain_remote_cleanup(now_ns);
+        combine_cleanup_results(injection_result, outbound_result)
     }
 
     pub(crate) const fn route_policy_revision(&self) -> u64 {
@@ -1389,6 +1395,15 @@ where
         }
         self.inbound_pressed.retain(|_, state| !state.is_empty());
         first_error.map_or(Ok(()), Err)
+    }
+
+    /// Releases every locally-injected inbound key immediately, independent of any
+    /// outbound or transport cleanup. Used by terminal reconciliation (fatal /
+    /// shutdown) to guarantee the release-all-keys invariant even when the
+    /// subsequent workspace `retire` fails on an in-flight affine capture decision
+    /// (F-03). Idempotent: a second call finds no pressed inbound state.
+    pub(crate) fn release_all_inbound_keys(&mut self, now_ns: u64) -> Result<(), CoordinatorError> {
+        self.release_all_inbound(now_ns)
     }
 
     fn inbound_releases(&self, selected: Option<DeviceId>) -> Vec<(DeviceId, InputPayload)> {

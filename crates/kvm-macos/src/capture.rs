@@ -82,6 +82,31 @@ pub const fn classify_quartz_user_data(user_data: i64) -> EventClassification {
 /// is nevertheless positive evidence that the event came from the hardware
 /// input state table. Private and combined-session event sources remain
 /// unknown, even when they carry no user-data marker.
+///
+/// # F-09: known misclassification vectors (accepted, documented)
+///
+/// This classification is a heuristic over unauthenticated Quartz metadata, so
+/// two false-positive directions exist and are deliberately accepted:
+///
+/// 1. *Injected-as-physical.* Another Accessibility-privileged process (a rival
+///    KVM/synergy tool, an assistive switch, a macro driver) that posts events
+///    via the HID-system event source at `kCGHIDEventTap` produces
+///    `source_state_id == HID_SYSTEM` and is classified `Physical`. When this
+///    host is the non-active side of the workspace, such an event could be
+///    suppressed instead of passed through.
+/// 2. *Spoofed KVM tag.* A privileged process can set `kCGEventSourceUserData`
+///    to `KVM_EVENT_TAG` and be classified `InjectedByKvm`, which suppression
+///    ignores.
+///
+/// Both vectors require the same Accessibility trust boundary the daemon itself
+/// operates under: a process holding that grant already controls local input.
+/// They cause event misclassification, never a feedback loop or runaway key
+/// state — a suppressed foreign event is dropped once, and suppression ends
+/// deterministically on route change, disconnect, or the emergency chord
+/// (see the central safety invariant). Correctly distinguishing these events
+/// would need a kernel-attested device identity that Quartz does not expose, so
+/// the trade-off favors the latency-critical positive evidence the HID state
+/// table provides.
 pub(crate) const fn classify_quartz_capture(
     user_data: i64,
     source_state_id: i64,

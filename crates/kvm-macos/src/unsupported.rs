@@ -69,6 +69,7 @@ impl MacInputBackend {
             suppressed_events: 0,
             untranslated_events: 0,
             callback_panics: 0,
+            callback_overruns: 0,
             tap_disables: 0,
             health: CaptureHealth::Idle,
         }

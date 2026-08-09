@@ -58,7 +58,7 @@ pub(crate) enum NearbyPairingStatus {
     WaitingForConfirmation,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct NearbyPairingDto {
     request_id: String,
@@ -68,6 +68,27 @@ pub(crate) struct NearbyPairingDto {
     address: String,
     status: NearbyPairingStatus,
     verification_code: Option<String>,
+}
+
+impl fmt::Debug for NearbyPairingDto {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // N-5: redact the verification SAS code. The other fields are non-secret
+        // metadata already surfaced to the UI; this keeps the code out of {:?}
+        // output, including transitively through SetupSnapshot.
+        formatter
+            .debug_struct("NearbyPairingDto")
+            .field("request_id", &self.request_id)
+            .field("peer_id", &self.peer_id)
+            .field("name", &self.name)
+            .field("platform", &self.platform)
+            .field("address", &self.address)
+            .field("status", &self.status)
+            .field(
+                "verification_code_present",
+                &self.verification_code.is_some(),
+            )
+            .finish_non_exhaustive()
+    }
 }
 
 #[derive(Clone, Eq, PartialEq)]
@@ -240,18 +261,16 @@ impl NearbyDiscovery {
         });
         if should_send {
             let packet = encode_beacon(&self.peer_id, &next);
-            let limited_broadcast = SocketAddr::from((Ipv4Addr::BROADCAST, DISCOVERY_PORT));
             let mut sent = false;
             if packet.len() <= MAX_BEACON_BYTES {
-                for target in self
-                    .broadcast_targets
-                    .iter()
-                    .copied()
-                    .chain(std::iter::once(limited_broadcast))
-                {
-                    // Always attempt every interface. Short-circuiting after
-                    // a successful Hyper-V/VPN/WSL send can hide the beacon
-                    // from the physical Wi-Fi LAN.
+                // N-1: send only to the per-private-interface directed broadcast
+                // targets (RFC1918/ULA, validated at construction). The previous
+                // blanket send to Ipv4Addr::BROADCAST (255.255.255.255) reached
+                // every broadcast-capable adapter — including public Wi-Fi —
+                // leaking hostname, OS, and a stable cross-LAN peer_id. Always
+                // attempt every interface; short-circuiting after a successful
+                // Hyper-V/VPN/WSL send can hide the beacon from the physical LAN.
+                for target in self.broadcast_targets.iter().copied() {
                     if self.socket.send_to(packet.as_bytes(), target).is_ok() {
                         sent = true;
                     }
@@ -290,7 +309,13 @@ impl NearbyDiscovery {
                             records.insert(record.peer_id.clone(), record);
                         }
                     } else if let Some(packet) = parse_pairing_packet(&buffer[..length]) {
-                        self.handle_pairing_packet(packet, source, &records, now);
+                        self.handle_pairing_packet(
+                            packet,
+                            source,
+                            &records,
+                            now,
+                            paired_peer_id.is_some(),
+                        );
                     }
                 }
                 Err(error) if error.kind() == ErrorKind::WouldBlock => break,
@@ -518,6 +543,7 @@ impl NearbyDiscovery {
         source: SocketAddr,
         records: &BTreeMap<String, NearbyRecord>,
         now: Instant,
+        peer_configured: bool,
     ) {
         if !private_address(source.ip()) || source.port() != DISCOVERY_PORT {
             return;
@@ -536,6 +562,7 @@ impl NearbyDiscovery {
                 source,
                 records,
                 now,
+                peer_configured,
             ),
             PairingPacket::Accept {
                 request_id,
@@ -568,6 +595,7 @@ impl NearbyDiscovery {
         source: SocketAddr,
         records: &BTreeMap<String, NearbyRecord>,
         now: Instant,
+        peer_configured: bool,
     ) {
         let Some(record) = records.get(&from_peer_id) else {
             return;
@@ -577,6 +605,14 @@ impl NearbyDiscovery {
             || !valid_request_id(&request_id)
             || !valid_bundle_shape(&bundle)
         {
+            return;
+        }
+        // N-4: a peer is already configured. Ignore stale or replayed Request
+        // packets so they cannot surface a phantom incoming-pairing prompt
+        // after a completed pairing. Re-pairing clears the configured peer
+        // first, which re-enables incoming requests. The 2-minute request
+        // expiry already bounds this to a UX nuisance; this suppresses it.
+        if peer_configured {
             return;
         }
         let Ok(mut pairing) = self.pairing.lock() else {
@@ -911,6 +947,31 @@ fn encode_beacon(peer_id: &str, state: &AdvertisementState) -> String {
     )
 }
 
+/// Sends one pairing handshake packet over the shared discovery socket.
+///
+/// # N-2: cleartext UDP pairing is accepted, documented here
+///
+/// Pairing packets (request / accept / confirm / decline) travel as cleartext
+/// JSON over UDP on the LAN discovery port. This is deliberate and bounded:
+///
+/// - The transport is scoped: `target` must be on `DISCOVERY_PORT` and a
+///   private/RFC1918 address, and packets are size-capped. A remote attacker
+///   off-LAN cannot reach it.
+/// - The handshake is mutual-consent: each side's operator must approve, and a
+///   request carries an opaque peer bundle (identity/cert material) that is
+///   *not* trusted on receipt — it becomes a credential only after the operator
+///   confirms.
+/// - Confidentiality of the actual session is not at stake: the data channel
+///   is TLS 1.3 with TOFU leaf-cert pinning (exact SHA-256 `ct_eq`). An on-LAN
+///   observer or active MITM can read or tamper with the *pairing* flow, but
+///   cannot derive the pinned cert and therefore cannot intercept the session.
+///   The worst realistic outcome is a denial/spoof of the pairing UX, which the
+///   operator notices and re-runs.
+///
+/// Moving pairing behind TLS would be circular (TLS is what pairing bootstraps)
+/// unless a separate authenticated channel existed; on a trusted LAN the
+/// cleartext handshake plus operator confirmation plus cert pinning is the
+/// proportionate control.
 fn send_pairing_packet(
     socket: &UdpSocket,
     target: SocketAddr,

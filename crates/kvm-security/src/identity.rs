@@ -1,6 +1,7 @@
 use core::{fmt, str::FromStr};
 
 use kvm_types::{HostId, PeerId};
+use subtle::ConstantTimeEq;
 use thiserror::Error;
 
 const FINGERPRINT_BYTES: usize = 32;
@@ -24,6 +25,14 @@ impl IdentityFingerprint {
     #[must_use]
     pub const fn as_bytes(&self) -> &[u8; FINGERPRINT_BYTES] {
         &self.0
+    }
+}
+
+/// Constant-time equality so fingerprint comparisons do not short-circuit and
+/// leak byte-position timing (F-24). Mirrors the TLS-layer `ct_eq` convention.
+impl ConstantTimeEq for IdentityFingerprint {
+    fn ct_eq(&self, other: &Self) -> subtle::Choice {
+        self.0.ct_eq(&other.0)
     }
 }
 

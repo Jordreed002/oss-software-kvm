@@ -167,7 +167,7 @@ impl fmt::Display for NativeCaptureError {
 impl std::error::Error for NativeCaptureError {}
 
 /// Owns one native backend and its serialized, non-blocking callback bridge.
-pub struct NativeCaptureSupervisor<B, R> {
+pub struct NativeCaptureSupervisor<B: InputCaptureBackend, R> {
     backend: B,
     router: Arc<Mutex<R>>,
     callback_armed: Arc<AtomicBool>,
@@ -176,16 +176,28 @@ pub struct NativeCaptureSupervisor<B, R> {
     cursor_visible: bool,
 }
 
-impl<B, R> Drop for NativeCaptureSupervisor<B, R> {
+impl<B: InputCaptureBackend, R> Drop for NativeCaptureSupervisor<B, R> {
     fn drop(&mut self) {
         // A native backend may retain its callback while teardown is delayed or
         // fails. Revoke suppression authority before any backend field is
         // dropped so that such a callback can only fail open.
         self.callback_armed.store(false, Ordering::Release);
+        // F-07: fail-closed. If the supervisor is dropped while native capture may
+        // still be installed (Armed, or Degraded from a prior failed teardown),
+        // attempt a best-effort backend stop so the CGEventTap / low-level keyboard
+        // hook is not left armed for the process lifetime. The normal exit path is
+        // expected to call shutdown(); this is its backstop. stop_capture is
+        // best-effort here — Drop cannot propagate errors.
+        if matches!(
+            self.state,
+            NativeCaptureState::Armed | NativeCaptureState::Degraded
+        ) {
+            let _ = self.backend.stop_capture();
+        }
     }
 }
 
-impl<B, R> fmt::Debug for NativeCaptureSupervisor<B, R> {
+impl<B: InputCaptureBackend, R> fmt::Debug for NativeCaptureSupervisor<B, R> {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("NativeCaptureSupervisor")
@@ -931,7 +943,12 @@ mod tests {
             retained_callback(captured()),
             CaptureDisposition::AllowLocal
         );
-        assert!(lock(&router_events).is_empty());
+        // F-07: dropping an Armed supervisor is fail-closed — Drop best-effort
+        // stops the native backend so the CGEventTap / low-level hook is not left
+        // installed for the process lifetime. That records exactly one "stop"; the
+        // retained callback is still revoked (fails open to AllowLocal) and Drop
+        // performs no routing.
+        assert_eq!(*lock(&router_events), vec!["stop"]);
     }
 
     #[test]
