@@ -476,7 +476,10 @@ where
                     },
                 );
             }
-        } else if matches!(peer.task, PeerTaskSlot::Session { .. }) {
+        } else if let PeerTaskSlot::Session { generation } = peer.task {
+            if peer.supervisor.pending_generation() == Some(generation) {
+                return SelectedCaptureOutcome::rejected(SelectedCaptureState::Gated);
+            }
             peer.task = PeerTaskSlot::Idle;
             schedule_retry(peer, Duration::from_nanos(now_ns));
             return SelectedCaptureOutcome::rejected(SelectedCaptureState::SessionRetired);
@@ -3795,6 +3798,30 @@ mod tests {
         candidate
             .rearm_native_capture(CaptureLifecycleState::Running)
             .unwrap();
+    }
+
+    #[test]
+    fn capture_during_pending_activation_preserves_the_exact_session_slot() {
+        let mut manager = manager(DIAL_PEER);
+        let pending = manager
+            .peers
+            .get_mut(&DIAL_PEER)
+            .unwrap()
+            .supervisor
+            .begin_pending(ConnectionDirection::Outbound)
+            .unwrap();
+        let generation = pending.generation();
+        manager.peers.get_mut(&DIAL_PEER).unwrap().task = PeerTaskSlot::Session { generation };
+
+        let outcome =
+            manager.route_selected_capture(captured_key(1, KeyCode::KeyA, KeyState::Pressed), 1);
+
+        assert_eq!(outcome.disposition(), CaptureDisposition::AllowLocal);
+        assert_eq!(outcome.state(), SelectedCaptureState::Gated);
+        let peer = manager.peers.get_mut(&DIAL_PEER).unwrap();
+        assert_eq!(peer.task, PeerTaskSlot::Session { generation });
+        assert_eq!(peer.supervisor.pending_generation(), Some(generation));
+        peer.supervisor.cancel_pending(pending).unwrap();
     }
 
     #[test]

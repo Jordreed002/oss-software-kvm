@@ -362,6 +362,12 @@ impl ConnectionGenerationGate {
         Ok(())
     }
 
+    /// Generation reserved by the sole in-flight connection task, if any.
+    #[must_use]
+    pub const fn pending_generation(&self) -> Option<ConnectionGeneration> {
+        self.pending
+    }
+
     #[must_use]
     pub const fn active_generation(&self) -> Option<ConnectionGeneration> {
         self.active
@@ -450,11 +456,13 @@ mod tests {
 
         let pending = gate.begin_pending(ConnectionDirection::Outbound).unwrap();
         assert_eq!(pending.generation().get(), 1);
+        assert_eq!(gate.pending_generation(), Some(pending.generation()));
         assert!(matches!(
             gate.begin_pending(ConnectionDirection::Outbound),
             Err(ConnectionGenerationError::PendingExists)
         ));
         gate.cancel_pending(pending).unwrap();
+        assert_eq!(gate.pending_generation(), None);
 
         let next = gate.begin_pending(ConnectionDirection::Outbound).unwrap();
         assert_eq!(next.generation().get(), 2);

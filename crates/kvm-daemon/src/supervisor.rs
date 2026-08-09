@@ -404,6 +404,10 @@ where
         self.engine.active_generation()
     }
 
+    pub(crate) const fn pending_generation(&self) -> Option<ConnectionGeneration> {
+        self.engine.gate.pending_generation()
+    }
+
     pub(crate) fn validates_selected_workspace_attachment(
         &self,
         workspace: &WorkspaceControlPlane,
