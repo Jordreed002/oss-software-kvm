@@ -270,6 +270,13 @@ impl RoutingTable {
     /// Resolves a policy without requiring an `InputEvent`.
     #[must_use]
     pub fn destination_for_device(&self, device: DeviceId, state: &WorkspaceState) -> Destination {
+        // F-14: fail-closed on a malformed caller-supplied workspace snapshot.
+        // A nil active or local host must never yield `Remote(nil)` — route
+        // `Local` so a phantom endpoint is never addressed. The authority layer
+        // above gates unknown endpoints; this is the router's own nil guard.
+        if state.active_host.into_bytes() == [0; 16] || state.local_host.into_bytes() == [0; 16] {
+            return Destination::Local;
+        }
         let target = match self.route_for(device) {
             DeviceRoute::Local => return Destination::Local,
             DeviceRoute::FollowActiveHost => state.active_host,
@@ -405,6 +412,23 @@ mod tests {
         assert_eq!(
             routes.destination(&event(DEVICE), &state(REMOTE)),
             Destination::Remote(REMOTE)
+        );
+    }
+
+    #[test]
+    fn nil_workspace_host_fails_closed_to_local() {
+        // F-14: a caller-supplied workspace snapshot with a nil active or local
+        // host must never route Remote(nil); the router fails closed to Local.
+        let routes = RoutingTable::new(); // DEVICE defaults to FollowActiveHost
+        let nil = HostId::from_bytes([0; 16]);
+        assert_eq!(
+            routes.destination_for_device(DEVICE, &state(nil)),
+            Destination::Local
+        );
+        let nil_local = WorkspaceState::new(nil, REMOTE, LogicalPointer::new(DISPLAY, 10.0, 20.0));
+        assert_eq!(
+            routes.destination_for_device(DEVICE, &nil_local),
+            Destination::Local
         );
     }
 
