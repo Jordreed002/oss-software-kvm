@@ -4,6 +4,7 @@ use std::fmt;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 use kvm_daemon::{
     CaptureCallback, CaptureDisposition, CaptureLifecycleState, CapturedInput, InputCaptureBackend,
@@ -238,6 +239,8 @@ where
             Arc::clone(&self.router),
             Arc::clone(&self.callback_armed),
             Arc::clone(&self.metrics),
+            now_ns,
+            Instant::now(),
         );
         if self.backend.start_capture(callback).is_err() {
             self.state = if self.backend.stop_capture().is_ok() {
@@ -354,6 +357,8 @@ fn capture_callback<R>(
     router: Arc<Mutex<R>>,
     armed: Arc<AtomicBool>,
     metrics: Arc<SharedCaptureMetrics>,
+    clock_base_ns: u64,
+    clock_started: Instant,
 ) -> CaptureCallback
 where
     R: NativeCaptureRouter + 'static,
@@ -374,8 +379,16 @@ where
             return CaptureDisposition::AllowLocal;
         }
 
+        // Native event timestamps are not portable clock values: macOS uses
+        // mach-absolute time since boot while the service lifecycle uses time
+        // since this runtime started. Sampling the runtime-owned clock only
+        // after acquiring serialized authority keeps capture and lifecycle
+        // operations in one monotonic domain and prevents a later service tick
+        // from appearing to move backwards.
+        let elapsed_ns = u64::try_from(clock_started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+        let route_now_ns = clock_base_ns.saturating_add(elapsed_ns);
         let disposition = catch_unwind(AssertUnwindSafe(|| {
-            router.route_capture(captured, captured.event.timestamp_ns)
+            router.route_capture(captured, route_now_ns)
         }));
         match disposition {
             Ok(CaptureDisposition::SuppressLocal) => {
@@ -479,13 +492,15 @@ mod tests {
         disposition: CaptureDisposition,
         fail_gate: bool,
         fail_rearm: bool,
+        last_route_now_ns: Option<u64>,
     }
 
     impl NativeCaptureRouter for FakeRouter {
         type Error = FakeError;
 
-        fn route_capture(&mut self, _captured: CapturedInput, _now_ns: u64) -> CaptureDisposition {
+        fn route_capture(&mut self, _captured: CapturedInput, now_ns: u64) -> CaptureDisposition {
             self.events.lock().unwrap().push("route");
+            self.last_route_now_ns = Some(now_ns);
             self.disposition
         }
 
@@ -547,6 +562,7 @@ mod tests {
             disposition,
             fail_gate: false,
             fail_rearm: false,
+            last_route_now_ns: None,
         }));
         let backend = FakeBackend {
             control: Arc::clone(&backend_control),
@@ -595,6 +611,19 @@ mod tests {
             supervisor.start(10).unwrap();
             assert_eq!(callback(&backend)(captured()), disposition);
         }
+    }
+
+    #[test]
+    fn native_timestamp_never_becomes_the_routing_clock() {
+        let (mut supervisor, backend, router, _) = fixture(CaptureDisposition::AllowLocal);
+        supervisor.start(10).unwrap();
+        let mut event = captured();
+        event.event.timestamp_ns = u64::MAX;
+
+        assert_eq!(callback(&backend)(event), CaptureDisposition::AllowLocal);
+        let routed_at = lock(&router).last_route_now_ns.unwrap();
+        assert!(routed_at >= 10);
+        assert_ne!(routed_at, u64::MAX);
     }
 
     #[test]
@@ -794,6 +823,8 @@ mod tests {
             Arc::new(Mutex::new(PanickingRouter)),
             Arc::clone(&armed),
             Arc::new(SharedCaptureMetrics::default()),
+            10,
+            Instant::now(),
         );
         assert_eq!(callback(captured()), CaptureDisposition::AllowLocal);
     }

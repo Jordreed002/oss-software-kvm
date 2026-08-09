@@ -883,7 +883,10 @@ where
     manager
         .selected_lifecycle_tick(now)
         .map(|_| ())
-        .map_err(|_| RuntimeTransportError::new(RuntimeTransportErrorKind::Authority))
+        .map_err(|error| {
+            developer_event(&format!("manager=lifecycle_rejected detail:{error:?}"));
+            RuntimeTransportError::new(RuntimeTransportErrorKind::Authority)
+        })
 }
 
 async fn settle_shutdown<I>(
