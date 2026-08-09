@@ -6,7 +6,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use std::sync::mpsc::{sync_channel, Receiver, RecvTimeoutError, SyncSender, TrySendError};
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use kvm_daemon::{
     CaptureCallback, CaptureDisposition, CaptureLifecycleState, CapturedInput, DisplayBackend,
@@ -291,6 +291,7 @@ struct CaptureCounters {
     suppressed_events: AtomicU64,
     untranslated_events: AtomicU64,
     callback_panics: AtomicU64,
+    callback_overruns: AtomicU64,
     tap_disables: AtomicU64,
     health: AtomicU8,
 }
@@ -309,6 +310,7 @@ impl CaptureCounters {
             5 => CaptureHealth::TapDisabled,
             6 => CaptureHealth::TapInvalidated,
             7 => CaptureHealth::CallbackPanicked,
+            8 => CaptureHealth::CallbackOverran,
             _ => CaptureHealth::Idle,
         }
     }
@@ -323,6 +325,7 @@ impl CaptureCounters {
             suppressed_events: self.suppressed_events.load(Ordering::Relaxed),
             untranslated_events: self.untranslated_events.load(Ordering::Relaxed),
             callback_panics: self.callback_panics.load(Ordering::Relaxed),
+            callback_overruns: self.callback_overruns.load(Ordering::Relaxed),
             tap_disables: self.tap_disables.load(Ordering::Relaxed),
             health: self.health(),
         }
@@ -404,6 +407,13 @@ impl Drop for WholeHostOwnershipClaim {
         WHOLE_HOST_CAPTURE_OWNED.store(false, Ordering::Release);
     }
 }
+
+/// Maximum wall-clock time a synchronous daemon callback may spend inside a
+/// Quartz event-tap dispatch before the whole-host generation is faulted. A
+/// tap cannot deliver the next event until the callback returns, so unbounded
+/// blocking work freezes input delivery system-wide with no recovery. Mirrors
+/// the Windows `WHOLE_HOST_CALLBACK_DEADLINE` watchdog (F-04).
+const WHOLE_HOST_CALLBACK_DEADLINE: Duration = Duration::from_millis(100);
 
 struct WholeHostCallbackContext {
     host_id: HostId,
@@ -842,7 +852,8 @@ impl MacInputBackend {
             | CaptureHealth::DeliveryDisconnected
             | CaptureHealth::TapDisabled
             | CaptureHealth::TapInvalidated
-            | CaptureHealth::CallbackPanicked => CaptureLifecycleState::Faulted,
+            | CaptureHealth::CallbackPanicked
+            | CaptureHealth::CallbackOverran => CaptureLifecycleState::Faulted,
             CaptureHealth::Running => CaptureLifecycleState::Running,
             CaptureHealth::Stopped => CaptureLifecycleState::Stopped,
             CaptureHealth::Idle => CaptureLifecycleState::Idle,
@@ -1199,7 +1210,8 @@ fn run_whole_host_capture_thread(
         CaptureHealth::TransitionDiscontinuity => Err(MacBackendError::CaptureDiscontinuity),
         CaptureHealth::TapDisabled
         | CaptureHealth::TapInvalidated
-        | CaptureHealth::CallbackPanicked => Err(MacBackendError::CaptureTapTerminated),
+        | CaptureHealth::CallbackPanicked
+        | CaptureHealth::CallbackOverran => Err(MacBackendError::CaptureTapTerminated),
         _ => Ok(()),
     }
 }
@@ -1368,7 +1380,23 @@ fn dispatch_quartz_event(
         .counters
         .delivered_events
         .fetch_add(1, Ordering::Relaxed);
+    // F-04: bound the synchronous daemon callback like the Windows
+    // WHOLE_HOST_CALLBACK_DEADLINE watchdog. A Quartz event tap cannot deliver
+    // the next event until the callback returns, so a blocking callback
+    // freezes keyboard/mouse delivery system-wide. Fault the generation on
+    // overrun; subsequent input fails open while runtime health drives cleanup.
+    let callback_started = Instant::now();
     let disposition = (context.callback)(captured);
+    if callback_started.elapsed() > WHOLE_HOST_CALLBACK_DEADLINE {
+        context
+            .counters
+            .callback_overruns
+            .fetch_add(1, Ordering::Relaxed);
+        context
+            .counters
+            .set_health(CaptureHealth::CallbackOverran);
+        terminally_deactivate_whole_host(context);
+    }
     if disposition == CaptureDisposition::SuppressLocal
         && classification == EventClassification::Physical
         && context.active.load(Ordering::Acquire)
