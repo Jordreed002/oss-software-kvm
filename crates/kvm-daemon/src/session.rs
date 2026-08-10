@@ -1951,8 +1951,25 @@ mod tests {
             "peer-injected modifier is held before the chord"
         );
 
-        // Local user presses the failsafe chord: the three modifiers build the
-        // physical pressed state, then Backspace completes it.
+        // Local user presses the failsafe chord (helper presses
+        // Ctrl+Alt+Shift, then Backspace) and returns the outcome.
+        let outcome = drive_failsafe_chord(&mut coord);
+        assert!(
+            outcome.failsafe_activated(),
+            "the chord must activate the failsafe"
+        );
+        assert!(
+            coord.inbound_pressed.is_empty(),
+            "failsafe must release the peer-injected inbound modifier (F-02)"
+        );
+    }
+
+    /// Presses the default failsafe chord (Ctrl+Alt+Shift+Backspace) on the
+    /// local device through `route_captured` and returns the final outcome.
+    /// Used by the §25 failsafe-chord inbound-release tests.
+    fn drive_failsafe_chord(
+        coord: &mut PeerSessionCoordinator<RecordingInjection, RecordingOutbound>,
+    ) -> CaptureOutcome {
         for code in [KeyCode::ControlLeft, KeyCode::AltLeft, KeyCode::ShiftLeft] {
             coord
                 .route_captured(
@@ -1973,7 +1990,7 @@ mod tests {
                 )
                 .unwrap();
         }
-        let outcome = coord
+        coord
             .route_captured(
                 CapturedInput::new(
                     InputEvent::new(
@@ -1990,14 +2007,38 @@ mod tests {
                 ),
                 3_000,
             )
-            .unwrap();
-        assert!(
-            outcome.failsafe_activated(),
-            "the chord must activate the failsafe"
+            .unwrap()
+    }
+
+    #[test]
+    fn failsafe_chord_releases_peer_injected_inbound_pointer_button() {
+        // §25 also covers pointer buttons, not just keys: a peer-injected held
+        // button must be released when the chord fires. Mirrors the key variant
+        // but injects a PointerButton press.
+        let mut coord = coordinator();
+        admit(&mut coord);
+        coord.core.mark_workspace_routing_ready(0).unwrap();
+        let injected = InputEvent::new(
+            1,
+            1_000,
+            REMOTE,
+            DEVICE,
+            InputPayload::PointerButton {
+                button: kvm_input::PointerButton::Left,
+                state: ButtonState::Pressed,
+            },
         );
+        coord.test_hold_inbound(injected, 1_000).unwrap();
+        assert!(
+            !coord.inbound_pressed.is_empty(),
+            "peer-injected button is held before the chord"
+        );
+
+        let outcome = drive_failsafe_chord(&mut coord);
+        assert!(outcome.failsafe_activated(), "the chord must activate the failsafe");
         assert!(
             coord.inbound_pressed.is_empty(),
-            "failsafe must release the peer-injected inbound modifier (F-02)"
+            "failsafe must release the peer-injected inbound button (F-02)"
         );
     }
 
