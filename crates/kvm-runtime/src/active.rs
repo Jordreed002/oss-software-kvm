@@ -32,7 +32,16 @@ const INITIAL_DISPLAY_REVISION: u64 = 1;
 const INITIAL_DEVICE_REVISION: u64 = 2;
 const INITIAL_NOW_NS: u64 = 1;
 const POINTER_HANDOFF_TIMEOUT: Duration = Duration::from_secs(2);
-const SERVICE_TICK: Duration = Duration::from_millis(8);
+// Poll cursor authority at 250 Hz. Native input packets still route directly
+// from their callbacks; this cadence only bounds cursor visibility, landing
+// warps, handoff observation, and transport lifecycle work. Four milliseconds
+// keeps those operations below one frame on high-refresh displays without
+// turning the manager mutex into a continuous capture-path contender.
+const CAPTURE_POLL_TICK: Duration = Duration::from_millis(4);
+// Transport maintenance does not carry pointer samples. Keep it at the prior
+// cadence so doubling cursor polling does not also double manager-lock
+// contention against the synchronous native capture callback.
+const TRANSPORT_SERVICE_TICK: Duration = Duration::from_millis(8);
 const SHUTDOWN_SETTLE_TIMEOUT: Duration = Duration::from_secs(3);
 
 struct PreparedWorkspace {
@@ -332,7 +341,8 @@ where
             return Err(RuntimeServiceError::new(RuntimeServiceErrorKind::Capture));
         }
         developer_event("capture=armed");
-        let mut lifecycle_tick = tokio::time::interval(SERVICE_TICK);
+        developer_event("pointer=pipeline samples:individual cursor_poll_hz:250");
+        let mut lifecycle_tick = tokio::time::interval(CAPTURE_POLL_TICK);
         let mut last_capture_metrics = capture.metrics();
         let mut next_capture_report = Instant::now() + Duration::from_secs(1);
         let mut transport_finished = false;
@@ -408,7 +418,7 @@ where
         let connector = Arc::new(tokio::sync::Mutex::new(self.connector));
         let mut dial_tasks = tokio::task::JoinSet::new();
         let mut session_tasks = tokio::task::JoinSet::new();
-        let mut tick = tokio::time::interval(SERVICE_TICK);
+        let mut tick = tokio::time::interval(TRANSPORT_SERVICE_TICK);
         let mut last_manager_snapshot = None;
 
         let run_result = async {
@@ -847,7 +857,7 @@ where
             RuntimeTransportErrorKind::Admission,
         ));
     };
-    let prepared = match start.build(admission, PersistentPeerConfig::default()) {
+    let prepared = match start.build(admission, alpha_peer_config()) {
         Ok(prepared) => prepared,
         Err(error) => {
             developer_event("session=admission_failed");
@@ -885,6 +895,18 @@ where
             ))
         }
     }
+}
+
+fn alpha_peer_config() -> PersistentPeerConfig {
+    let mut config = PersistentPeerConfig::default();
+    // The selected two-host alpha runs on a bounded private-LAN session whose
+    // transport can comfortably carry individual pointer samples. Folding a
+    // burst into one larger delta is position-correct, but Quartz then receives
+    // fewer updates and renders visible steps. Preserve each sample here for a
+    // smoother destination cursor; the fixed queue/channel capacities and TLS
+    // write batching continue to bound memory and syscall overhead.
+    config.queue.coalesce_pointer_moves = false;
+    config
 }
 
 async fn drive_session<I, S, A>(
@@ -1008,7 +1030,7 @@ where
                 RuntimeTransportErrorKind::Authority,
             ));
         }
-        tokio::time::sleep(SERVICE_TICK).await;
+        tokio::time::sleep(TRANSPORT_SERVICE_TICK).await;
     }
 }
 
@@ -1384,5 +1406,15 @@ mod tests {
             no_primary.kind(),
             RuntimeCompositionErrorKind::LocalInventory
         );
+    }
+
+    #[test]
+    fn alpha_transport_preserves_individual_pointer_updates() {
+        let config = alpha_peer_config();
+
+        assert!(!config.queue.coalesce_pointer_moves);
+        assert!(config.validate().is_ok());
+        assert_eq!(CAPTURE_POLL_TICK, Duration::from_millis(4));
+        assert_eq!(TRANSPORT_SERVICE_TICK, Duration::from_millis(8));
     }
 }
