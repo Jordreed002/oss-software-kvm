@@ -566,6 +566,7 @@ impl PersistentPeerConfig {
 #[derive(Clone, Debug)]
 pub struct PeerSender {
     sender: mpsc::Sender<WireMessage>,
+    observable_stats: Arc<ObservableSessionStats>,
 }
 
 impl PeerSender {
@@ -576,7 +577,11 @@ impl PeerSender {
     /// Returns the original message when the channel is full or closed.
     pub fn try_send(&self, message: WireMessage) -> Result<(), OutboundSendError> {
         self.sender.try_send(message).map_err(|error| match error {
-            mpsc::error::TrySendError::Full(message) => OutboundSendError::Full(Box::new(message)),
+            mpsc::error::TrySendError::Full(message) => {
+                self.observable_stats
+                    .record_channel_rejection(TrafficClass::for_message(&message));
+                OutboundSendError::Full(Box::new(message))
+            }
             mpsc::error::TrySendError::Closed(message) => {
                 OutboundSendError::Closed(Box::new(message))
             }
@@ -883,16 +888,18 @@ impl<A: SessionAdmission> SecurePeerSession<A> {
         config.validate()?;
         let (outbound_sender, outbound) = mpsc::channel(config.outbound_channel_capacity);
         let (events, event_receiver) = mpsc::channel(config.event_channel_capacity);
+        let observable_stats = Arc::new(ObservableSessionStats::default());
         Ok((
             Self {
                 admission,
                 config,
                 outbound,
                 events,
-                observable_stats: Arc::new(ObservableSessionStats::default()),
+                observable_stats: Arc::clone(&observable_stats),
             },
             PeerSender {
                 sender: outbound_sender,
+                observable_stats,
             },
             event_receiver,
         ))
@@ -993,6 +1000,7 @@ impl<A: SessionAdmission> GenerationBoundPeerSession<A> {
         let (internal_events, internal_event_receiver) =
             mpsc::channel(config.event_channel_capacity.max(4));
         let (bound_events, bound_event_receiver) = mpsc::channel(config.event_channel_capacity);
+        let observable_stats = Arc::new(ObservableSessionStats::default());
         Ok((
             Self {
                 admission,
@@ -1002,10 +1010,11 @@ impl<A: SessionAdmission> GenerationBoundPeerSession<A> {
                 internal_event_receiver,
                 bound_events,
                 pending,
-                observable_stats: Arc::new(ObservableSessionStats::default()),
+                observable_stats: Arc::clone(&observable_stats),
             },
             PeerSender {
                 sender: outbound_sender,
+                observable_stats,
             },
             bound_event_receiver,
         ))
@@ -1469,6 +1478,7 @@ where
         config.validate()?;
         let (outbound_sender, outbound) = mpsc::channel(config.outbound_channel_capacity);
         let (events, event_receiver) = mpsc::channel(config.event_channel_capacity);
+        let observable_stats = Arc::new(ObservableSessionStats::default());
         Ok((
             Self {
                 connector,
@@ -1477,10 +1487,11 @@ where
                 config,
                 outbound,
                 events,
-                observable_stats: Arc::new(ObservableSessionStats::default()),
+                observable_stats: Arc::clone(&observable_stats),
             },
             PeerSender {
                 sender: outbound_sender,
+                observable_stats,
             },
             event_receiver,
         ))
@@ -1700,12 +1711,17 @@ async fn run_session_with_stats<S: SecurePeerStream, A: SessionAdmission>(
                     FrameWriteProgress::Flushed => {
                         // Retain the flushed batch's allocation for reuse by the
                         // next batch instead of dropping and reallocating it.
-                        recycled = pending.take();
+                        if let Some(frame) = pending.take() {
+                            if let Some(stats) = stats {
+                                stats.record_outbound(frame.frames.len(), frame.bytes.len());
+                            }
+                            recycled = Some(frame);
+                        }
                     }
                 }
             }
             read_result = reader.read_and_drain(&mut read_progress, &mut inbound_messages) => {
-                read_result?;
+                let inbound_bytes = read_result?;
                 // `read_and_drain` makes forward progress on every successful
                 // call: it either decodes at least one buffered frame into
                 // `inbound_messages`, or performs a transport read. A completed
@@ -1716,6 +1732,9 @@ async fn run_session_with_stats<S: SecurePeerStream, A: SessionAdmission>(
                     !inbound_messages.is_empty() || read_progress.buffered_bytes() > 0,
                     "read_and_drain made no forward progress"
                 );
+                if let Some(stats) = stats {
+                    stats.record_inbound(inbound_messages.len(), inbound_bytes);
+                }
                 for message in inbound_messages.drain(..) {
                     handle_inbound(
                         message,
@@ -1725,6 +1744,9 @@ async fn run_session_with_stats<S: SecurePeerStream, A: SessionAdmission>(
                         &mut queue,
                         events,
                     )?;
+                }
+                if let Some(stats) = stats {
+                    stats.publish_rtt(heartbeat.health().last_rtt);
                 }
             }
             message = outbound.recv(), if outbound_open => {
@@ -3179,6 +3201,35 @@ mod tests {
     }
 
     #[test]
+    fn producer_channel_backpressure_is_visible_by_traffic_lane() {
+        let config = PersistentPeerConfig {
+            outbound_channel_capacity: 1,
+            ..test_config()
+        };
+        let (session, sender, _events) =
+            SecurePeerSession::new(TestAdmission { hello: hello(1) }, config).unwrap();
+        let observable = session.observable_stats();
+        sender
+            .try_send(WireMessage::Ping(kvm_protocol::PingV1 {
+                nonce: 1,
+                sent_at_ns: 1,
+            }))
+            .unwrap();
+        assert!(matches!(
+            sender.try_send(WireMessage::Ping(kvm_protocol::PingV1 {
+                nonce: 2,
+                sent_at_ns: 2,
+            })),
+            Err(OutboundSendError::Full(_))
+        ));
+
+        assert_eq!(
+            observable.telemetry_snapshot().channel_rejections.control,
+            1
+        );
+    }
+
+    #[test]
     fn exporter_context_is_canonical_and_sender_direction_bound() {
         let lower = hello(1);
         let higher = hello(20);
@@ -3766,6 +3817,9 @@ mod tests {
             snapshot.coalesced_moves, 1,
             "live observable must reflect the single coalesced move"
         );
+        let telemetry = observable.telemetry_snapshot();
+        assert!(telemetry.outbound_frames >= 1);
+        assert!(telemetry.outbound_bytes > 0);
     }
 
     #[tokio::test]

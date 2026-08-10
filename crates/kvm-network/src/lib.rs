@@ -48,7 +48,7 @@ pub use peer::{
 };
 pub use queue::{
     DropCounters, EnqueueError, ObservableSessionStats, OutboundQueue, QueueConfig,
-    QueueConfigError, SessionStats, TrafficClass,
+    QueueConfigError, SessionStats, SessionTelemetry, TrafficClass,
 };
 pub use reconnect::{ReconnectBackoff, ReconnectPolicy, ReconnectPolicyError};
 pub use rustls_acceptor::{

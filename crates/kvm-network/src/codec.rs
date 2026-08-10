@@ -114,11 +114,11 @@ where
         &mut self,
         progress: &mut FrameReadProgress,
         out: &mut Vec<WireMessage>,
-    ) -> Result<(), NetworkError> {
-        drain_complete_frames(&mut progress.buf, self.required_version, out)?;
+    ) -> Result<usize, NetworkError> {
+        let buffered_bytes = drain_complete_frames(&mut progress.buf, self.required_version, out)?;
         if !out.is_empty() {
             // Delivered buffered frames without touching the socket.
-            return Ok(());
+            return Ok(buffered_bytes);
         }
 
         // No complete frame buffered: pull the next chunk and drain whatever
@@ -132,8 +132,7 @@ where
             )));
         }
         progress.buf.extend_from_slice(&chunk[..read]);
-        drain_complete_frames(&mut progress.buf, self.required_version, out)?;
-        Ok(())
+        drain_complete_frames(&mut progress.buf, self.required_version, out)
     }
 
     pub fn into_inner(self) -> R {
@@ -162,7 +161,7 @@ fn drain_complete_frames(
     buf: &mut Vec<u8>,
     required_version: u16,
     out: &mut Vec<WireMessage>,
-) -> Result<(), NetworkError> {
+) -> Result<usize, NetworkError> {
     let mut offset = 0_usize;
     loop {
         match decode_complete_frame(&buf[offset..], required_version) {
@@ -182,7 +181,7 @@ fn drain_complete_frames(
     if offset > 0 {
         buf.drain(..offset);
     }
-    Ok(())
+    Ok(offset)
 }
 
 /// Parses one complete frame from the front of `buf`.
@@ -443,11 +442,12 @@ mod tests {
 
         let mut out = Vec::new();
         // The record arrives in one transport read; one drain yields every frame.
-        reader
+        let drained_bytes = reader
             .read_and_drain(&mut progress, &mut out)
             .await
             .unwrap();
         assert_eq!(out, messages);
+        assert_eq!(drained_bytes, record.len());
         assert_eq!(progress.buffered_bytes(), 0);
     }
 

@@ -2259,8 +2259,6 @@ impl<S, A> PreparedPeerSession<S, A> {
     /// session streams. Clone it before [`run`](Self::run) consumes the session
     /// so the §31 diagnostics surface can read cumulative counters live.
     ///
-    /// Only present when the daemon is built with the `diagnostics` feature.
-    #[cfg(feature = "diagnostics")]
     #[must_use]
     pub fn observable_stats(&self) -> std::sync::Arc<kvm_network::ObservableSessionStats>
     where

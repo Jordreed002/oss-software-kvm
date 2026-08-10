@@ -15,7 +15,7 @@ use kvm_daemon::{
 use kvm_network::{
     AuthenticatedLanConnector, BoundedLanListener, ConnectionGenerationGate, ConnectionRole,
     LanListenerConfig, LanListenerEvent, LanListenerReport, LanPeerAddress, PersistentPeerConfig,
-    RustlsPeerStream, RustlsTcpConnector, SecurePeerStream,
+    RustlsPeerStream, RustlsTcpConnector, SecurePeerStream, SessionTelemetry,
 };
 use kvm_protocol::WirePeerId;
 use kvm_security::PairedPeer;
@@ -923,9 +923,15 @@ where
     developer_event("session=runner_started");
     let peer_id = installed.runner.peer_id();
     let generation = installed.runner.generation();
+    let observable_stats = installed.runner.observable_stats();
     let (session_shutdown, session_receiver) = tokio::sync::watch::channel(false);
     let runner = tokio::spawn(installed.runner.run(session_receiver));
     let mut events = installed.events;
+    let telemetry_enabled = developer_logging_enabled();
+    let mut telemetry_tick = tokio::time::interval(Duration::from_secs(1));
+    telemetry_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    telemetry_tick.tick().await;
+    let mut telemetry_baseline = (Instant::now(), observable_stats.telemetry_snapshot());
 
     loop {
         tokio::select! {
@@ -964,6 +970,12 @@ where
                     }
                 }
             }
+            _ = telemetry_tick.tick(), if telemetry_enabled => {
+                report_session_telemetry(
+                    observable_stats.telemetry_snapshot(),
+                    &mut telemetry_baseline,
+                );
+            }
         }
     }
 
@@ -981,6 +993,52 @@ where
     let _ = lock_manager(&manager)?.connection_task_lost(peer_id, generation, now_ns(started));
     developer_event("session=runner_stopped");
     Ok(())
+}
+
+fn report_session_telemetry(current: SessionTelemetry, baseline: &mut (Instant, SessionTelemetry)) {
+    let now = Instant::now();
+    let elapsed = now.saturating_duration_since(baseline.0);
+    if elapsed.is_zero() {
+        return;
+    }
+    let previous = baseline.1;
+    let tx_bytes = current
+        .outbound_bytes
+        .saturating_sub(previous.outbound_bytes);
+    let rx_bytes = current.inbound_bytes.saturating_sub(previous.inbound_bytes);
+    let tx_frames = current
+        .outbound_frames
+        .saturating_sub(previous.outbound_frames);
+    let rx_frames = current
+        .inbound_frames
+        .saturating_sub(previous.inbound_frames);
+    let rtt_ms = current.last_rtt.map_or_else(
+        || "pending".to_owned(),
+        |rtt| format!("{:.2}", rtt.as_secs_f64() * 1_000.0),
+    );
+    developer_event(&format!(
+        "network=telemetry rtt_ms:{rtt_ms} tx_bps:{} rx_bps:{} tx_fps:{} rx_fps:{} tx_total:{} rx_total:{} queue_drop_input:{} queue_drop_control:{} queue_drop_background:{} channel_full_input:{} channel_full_control:{} channel_full_background:{} coalesced:{}",
+        rate_per_second(tx_bytes, elapsed),
+        rate_per_second(rx_bytes, elapsed),
+        rate_per_second(tx_frames, elapsed),
+        rate_per_second(rx_frames, elapsed),
+        current.outbound_bytes,
+        current.inbound_bytes,
+        current.queue.dropped.input,
+        current.queue.dropped.control,
+        current.queue.dropped.background,
+        current.channel_rejections.input,
+        current.channel_rejections.control,
+        current.channel_rejections.background,
+        current.queue.coalesced_moves,
+    ));
+    *baseline = (now, current);
+}
+
+fn rate_per_second(value: u64, elapsed: Duration) -> u64 {
+    let elapsed_ms = elapsed.as_millis().max(1);
+    let rate = u128::from(value).saturating_mul(1_000) / elapsed_ms;
+    u64::try_from(rate).unwrap_or(u64::MAX)
 }
 
 fn poll_dial<I>(
@@ -1416,5 +1474,12 @@ mod tests {
         assert!(config.validate().is_ok());
         assert_eq!(CAPTURE_POLL_TICK, Duration::from_millis(4));
         assert_eq!(TRANSPORT_SERVICE_TICK, Duration::from_millis(8));
+    }
+
+    #[test]
+    fn telemetry_rate_is_bounded_and_uses_the_observation_window() {
+        assert_eq!(rate_per_second(2_048, Duration::from_secs(2)), 1_024);
+        assert_eq!(rate_per_second(7, Duration::from_millis(500)), 14);
+        assert_eq!(rate_per_second(u64::MAX, Duration::from_nanos(1)), u64::MAX);
     }
 }

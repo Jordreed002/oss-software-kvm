@@ -4,6 +4,7 @@ use std::collections::VecDeque;
 use std::error::Error;
 use std::fmt;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 
 /// Conceptual transport lane. Ordering is FIFO within each lane.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -207,6 +208,22 @@ pub struct SessionStats {
     pub coalesced_moves: u64,
 }
 
+/// Live authenticated-session traffic counters for developer diagnostics.
+///
+/// Byte totals count complete framed application bytes accepted by the TLS
+/// stream, before encryption overhead. They deliberately expose no payload,
+/// identity, address, or timing transcript data.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct SessionTelemetry {
+    pub queue: SessionStats,
+    pub channel_rejections: DropCounters,
+    pub outbound_frames: u64,
+    pub outbound_bytes: u64,
+    pub inbound_frames: u64,
+    pub inbound_bytes: u64,
+    pub last_rtt: Option<Duration>,
+}
+
 /// Shared, lock-free observable mirror of a session's cumulative
 /// [`SessionStats`], so the pull-model diagnostics surface can read *live*
 /// coalescing/drop counters during sustained streaming without owning the
@@ -224,6 +241,14 @@ pub struct ObservableSessionStats {
     dropped_control: AtomicU64,
     dropped_background: AtomicU64,
     coalesced_moves: AtomicU64,
+    outbound_frames: AtomicU64,
+    outbound_bytes: AtomicU64,
+    inbound_frames: AtomicU64,
+    inbound_bytes: AtomicU64,
+    last_rtt_ns: AtomicU64,
+    channel_rejected_input: AtomicU64,
+    channel_rejected_control: AtomicU64,
+    channel_rejected_background: AtomicU64,
 }
 
 impl ObservableSessionStats {
@@ -252,11 +277,74 @@ impl ObservableSessionStats {
         }
     }
 
+    /// Records one fully flushed outbound batch.
+    pub fn record_outbound(&self, frames: usize, bytes: usize) {
+        self.outbound_frames
+            .fetch_add(u64::try_from(frames).unwrap_or(u64::MAX), Ordering::Relaxed);
+        self.outbound_bytes
+            .fetch_add(u64::try_from(bytes).unwrap_or(u64::MAX), Ordering::Relaxed);
+    }
+
+    /// Records complete inbound frames decoded from the authenticated stream.
+    pub fn record_inbound(&self, frames: usize, bytes: usize) {
+        self.inbound_frames
+            .fetch_add(u64::try_from(frames).unwrap_or(u64::MAX), Ordering::Relaxed);
+        self.inbound_bytes
+            .fetch_add(u64::try_from(bytes).unwrap_or(u64::MAX), Ordering::Relaxed);
+    }
+
+    /// Records a submission rejected because the bounded producer channel was
+    /// full before the private priority queue could accept it.
+    pub fn record_channel_rejection(&self, class: TrafficClass) {
+        let counter = match class {
+            TrafficClass::Input => &self.channel_rejected_input,
+            TrafficClass::Control => &self.channel_rejected_control,
+            TrafficClass::Background => &self.channel_rejected_background,
+        };
+        counter.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Publishes the latest authenticated ping round-trip time. Zero denotes
+    /// that no validated pong has been observed yet.
+    pub fn publish_rtt(&self, rtt: Option<Duration>) {
+        let rtt_ns = rtt.map_or(0, |value| {
+            u64::try_from(value.as_nanos()).unwrap_or(u64::MAX)
+        });
+        self.last_rtt_ns.store(rtt_ns, Ordering::Relaxed);
+    }
+
+    /// Snapshots queue pressure, traffic volume, and the latest RTT.
+    #[must_use]
+    pub fn telemetry_snapshot(&self) -> SessionTelemetry {
+        let rtt_ns = self.last_rtt_ns.load(Ordering::Relaxed);
+        SessionTelemetry {
+            queue: self.snapshot(),
+            channel_rejections: DropCounters {
+                input: self.channel_rejected_input.load(Ordering::Relaxed),
+                control: self.channel_rejected_control.load(Ordering::Relaxed),
+                background: self.channel_rejected_background.load(Ordering::Relaxed),
+            },
+            outbound_frames: self.outbound_frames.load(Ordering::Relaxed),
+            outbound_bytes: self.outbound_bytes.load(Ordering::Relaxed),
+            inbound_frames: self.inbound_frames.load(Ordering::Relaxed),
+            inbound_bytes: self.inbound_bytes.load(Ordering::Relaxed),
+            last_rtt: (rtt_ns != 0).then(|| Duration::from_nanos(rtt_ns)),
+        }
+    }
+
     /// Resets every counter to zero. Called at the start of each connection so
     /// the observable reports the current connection's burst pressure rather
     /// than a total across reconnects.
     pub fn reset(&self) {
         self.publish(SessionStats::default());
+        self.outbound_frames.store(0, Ordering::Relaxed);
+        self.outbound_bytes.store(0, Ordering::Relaxed);
+        self.inbound_frames.store(0, Ordering::Relaxed);
+        self.inbound_bytes.store(0, Ordering::Relaxed);
+        self.last_rtt_ns.store(0, Ordering::Relaxed);
+        self.channel_rejected_input.store(0, Ordering::Relaxed);
+        self.channel_rejected_control.store(0, Ordering::Relaxed);
+        self.channel_rejected_background.store(0, Ordering::Relaxed);
     }
 }
 
@@ -1050,8 +1138,22 @@ mod tests {
         assert_eq!(observable.snapshot().dropped.input, 8);
         assert_eq!(observable.snapshot().coalesced_moves, 201);
 
+        observable.record_outbound(12, 1_024);
+        observable.record_inbound(9, 768);
+        observable.record_channel_rejection(TrafficClass::Input);
+        observable.publish_rtt(Some(Duration::from_micros(2_500)));
+        let telemetry = observable.telemetry_snapshot();
+        assert_eq!(telemetry.queue, observable.snapshot());
+        assert_eq!(telemetry.outbound_frames, 12);
+        assert_eq!(telemetry.outbound_bytes, 1_024);
+        assert_eq!(telemetry.inbound_frames, 9);
+        assert_eq!(telemetry.inbound_bytes, 768);
+        assert_eq!(telemetry.last_rtt, Some(Duration::from_micros(2_500)));
+        assert_eq!(telemetry.channel_rejections.input, 1);
+
         // Reset zeroes every counter, modelling the start of a fresh connection.
         observable.reset();
         assert_eq!(observable.snapshot(), SessionStats::default());
+        assert_eq!(observable.telemetry_snapshot(), SessionTelemetry::default());
     }
 }
