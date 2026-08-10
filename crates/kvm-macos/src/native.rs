@@ -81,6 +81,8 @@ const CG_EVENT_OTHER_MOUSE_DRAGGED: u32 = 27;
 const CAPTURE_QUEUE_CAPACITY: usize = 4_096;
 const CAPTURE_STARTUP_TIMEOUT: Duration = Duration::from_secs(5);
 const CAPTURE_STOP_TIMEOUT: Duration = Duration::from_secs(2);
+const POINTER_BURST_RESYNC: Duration = Duration::from_millis(100);
+const POINTER_ACTIVE_RESYNC: Duration = Duration::from_millis(32);
 static WHOLE_HOST_CAPTURE_OWNED: AtomicBool = AtomicBool::new(false);
 
 #[repr(C)]
@@ -992,10 +994,24 @@ impl InputCaptureBackend for MacInputBackend {
 }
 
 /// Quartz output injector with button state needed to emit drag events.
-#[derive(Debug, Default)]
+#[derive(Default)]
 pub struct MacOutputBackend {
     pressed_buttons: BTreeSet<PointerButton>,
     windows_modifier_roles: bool,
+    pointer_target: Option<CGPoint>,
+    last_pointer_injection: Option<Instant>,
+    last_pointer_resync: Option<Instant>,
+}
+
+impl std::fmt::Debug for MacOutputBackend {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("MacOutputBackend")
+            .field("pressed_button_count", &self.pressed_buttons.len())
+            .field("windows_modifier_roles", &self.windows_modifier_roles)
+            .field("has_pointer_target", &self.pointer_target.is_some())
+            .finish_non_exhaustive()
+    }
 }
 
 impl MacOutputBackend {
@@ -1004,6 +1020,9 @@ impl MacOutputBackend {
         Self {
             pressed_buttons: BTreeSet::new(),
             windows_modifier_roles: false,
+            pointer_target: None,
+            last_pointer_injection: None,
+            last_pointer_resync: None,
         }
     }
 
@@ -1014,7 +1033,32 @@ impl MacOutputBackend {
         Self {
             pressed_buttons: BTreeSet::new(),
             windows_modifier_roles: true,
+            pointer_target: None,
+            last_pointer_injection: None,
+            last_pointer_resync: None,
         }
+    }
+
+    fn pointer_base(&mut self, now: Instant) -> Result<CGPoint, MacBackendError> {
+        let active_burst = self
+            .last_pointer_injection
+            .is_some_and(|last| now.saturating_duration_since(last) <= POINTER_BURST_RESYNC);
+        let recently_resynced = self
+            .last_pointer_resync
+            .is_some_and(|last| now.saturating_duration_since(last) <= POINTER_ACTIVE_RESYNC);
+        if active_burst && recently_resynced {
+            if let Some(target) = self.pointer_target {
+                return Ok(target);
+            }
+        }
+        let actual = current_pointer_location()?;
+        self.pointer_target = Some(actual);
+        self.last_pointer_resync = Some(now);
+        Ok(actual)
+    }
+
+    fn pointer_event_location(&mut self, now: Instant) -> Result<CGPoint, MacBackendError> {
+        self.pointer_base(now)
     }
 
     fn ensure_accessibility() -> Result<(), MacBackendError> {
@@ -1051,7 +1095,8 @@ impl MacOutputBackend {
                 post_owned_event(event, "CGEventCreateKeyboardEvent")
             }
             InputPayload::PointerMove { dx, dy } => {
-                let location = current_pointer_location()?;
+                let now = Instant::now();
+                let location = self.pointer_base(now)?;
                 let destination = CGPoint {
                     x: location.x + dx,
                     y: location.y + dy,
@@ -1067,10 +1112,17 @@ impl MacOutputBackend {
                 let event = unsafe {
                     CGEventCreateMouseEvent(ptr::null(), event_type, destination, button)
                 };
-                post_owned_event(event, "CGEventCreateMouseEvent")
+                post_owned_event(event, "CGEventCreateMouseEvent")?;
+                // Quartz applies posted events asynchronously. Retain the
+                // ordered destination for a short input burst instead of
+                // rereading a cursor position which may still reflect an
+                // earlier event and thereby dropping or reversing deltas.
+                self.pointer_target = Some(destination);
+                self.last_pointer_injection = Some(now);
+                Ok(())
             }
             InputPayload::PointerButton { button, state } => {
-                let location = current_pointer_location()?;
+                let location = self.pointer_event_location(Instant::now())?;
                 let (event_type, native_button) = button_event(button, state);
                 // SAFETY: Location comes from Quartz and event/button constants
                 // follow the public CoreGraphics ABI.
@@ -2292,6 +2344,29 @@ mod tests {
             button_event(PointerButton::Other(9), ButtonState::Released),
             (CG_EVENT_OTHER_MOUSE_UP, 9)
         );
+    }
+
+    #[test]
+    fn pointer_bursts_reuse_the_ordered_posted_target() {
+        let now = Instant::now();
+        let target = CGPoint {
+            x: 12_345.0,
+            y: 54_321.0,
+        };
+        let mut backend = MacOutputBackend::new_from_windows();
+        backend.pointer_target = Some(target);
+        backend.last_pointer_injection = Some(now);
+        backend.last_pointer_resync = Some(now);
+
+        let base = backend
+            .pointer_base(now + Duration::from_millis(1))
+            .unwrap();
+
+        assert!((base.x - target.x).abs() < f64::EPSILON);
+        assert!((base.y - target.y).abs() < f64::EPSILON);
+        let debug = format!("{backend:?}");
+        assert!(!debug.contains("12345"));
+        assert!(!debug.contains("54321"));
     }
 
     #[test]
