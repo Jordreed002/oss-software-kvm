@@ -17,17 +17,21 @@ use serde::{Deserialize, Serialize};
 
 /// One wire-ready read of the daemon's §35/§36 diagnostics state.
 ///
-/// `injection_latency` is `Option` because the §36 capture→injection span is
-/// only recorded once an inbound event has actually been injected at a
-/// destination peer; before the first such event (or when no peer is connected)
-/// there is no latency distribution to report. `event_rate` and
+/// Fields are ordered to follow the input pipeline. Both latency fields are
+/// `Option`: `source_latency` is `None` until the first captured event reaches
+/// a routing decision, and `injection_latency` is `None` until the first
+/// inbound event is injected at a destination peer. `event_rate` and
 /// `dropped_packets` are always present — they default to zero.
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub struct DiagnosticsSnapshot {
     /// §35 input-event rate as observed on this host's capture hot path.
     pub event_rate: kvm_input::EventRateSnapshot,
+    /// §36 source-side capture→routing-decision latency distribution. `None`
+    /// until the first event is processed.
+    pub source_latency: Option<kvm_input::LatencyStats>,
     /// §36 capture→injection latency distribution (the headline software-KVM
-    /// quality metric). `None` until the first inbound event is injected.
+    /// quality metric). `None` until the first inbound event is injected at a
+    /// destination peer.
     pub injection_latency: Option<kvm_input::LatencyStats>,
     /// §35 "dropped packets": cumulative outbound-queue backpressure rejections,
     /// per traffic lane.
@@ -35,21 +39,23 @@ pub struct DiagnosticsSnapshot {
 }
 
 impl DiagnosticsSnapshot {
-    /// Assembles a snapshot from its three independently-owned collectors.
+    /// Assembles a snapshot from its independently-owned collectors.
     ///
-    /// The collectors live on different owners (the §35 meter on `DaemonCore`,
-    /// the §36 history on a peer session coordinator, the §35 drop counters on
-    /// the outbound queue), so the IPC orchestrator reads each and hands them
-    /// here. [`DaemonCore::diagnostics_snapshot`] fills the event-rate portion
-    /// from the core and forwards the other two.
+    /// The collectors live on different owners: the §35 meter and §36
+    /// source-side history on `DaemonCore`, the §36 injection history on a peer
+    /// session coordinator, and the §35 drop counters on the outbound queue.
+    /// [`DaemonCore::diagnostics_snapshot`] fills the two core-owned portions
+    /// and forwards the other two.
     #[must_use]
     pub fn from_parts(
         event_rate: kvm_input::EventRateSnapshot,
+        source_latency: Option<kvm_input::LatencyStats>,
         injection_latency: Option<kvm_input::LatencyStats>,
         dropped_packets: kvm_network::DropCounters,
     ) -> Self {
         Self {
             event_rate,
+            source_latency,
             injection_latency,
             dropped_packets,
         }
@@ -84,7 +90,7 @@ mod tests {
     }
 
     #[test]
-    fn snapshot_assembles_three_collectors() {
+    fn snapshot_assembles_four_collectors() {
         let mut drops = DropCounters::default();
         drops.bump(TrafficClass::Input);
         drops.bump(TrafficClass::Input);
@@ -93,11 +99,16 @@ mod tests {
         let snapshot = DiagnosticsSnapshot::from_parts(
             sample_event_rate(),
             Some(sample_latency()),
+            Some(sample_latency()),
             drops,
         );
         assert_eq!(snapshot.event_rate.window_events, 42);
         assert_eq!(
-            snapshot.injection_latency.expect("latency present").max_ns,
+            snapshot.source_latency.expect("source latency present").max_ns,
+            4_000_000
+        );
+        assert_eq!(
+            snapshot.injection_latency.expect("injection latency present").max_ns,
             4_000_000
         );
         assert_eq!(snapshot.dropped_packets.input, 2);
@@ -106,28 +117,41 @@ mod tests {
     }
 
     #[test]
-    fn injection_latency_is_optional_before_first_event() {
-        // No peer has injected yet → no §36 distribution.
-        let snapshot =
-            DiagnosticsSnapshot::from_parts(sample_event_rate(), None, DropCounters::default());
+    fn latency_fields_are_optional_before_first_event() {
+        // No event processed locally and no peer has injected yet → both §36
+        // distributions are absent.
+        let snapshot = DiagnosticsSnapshot::from_parts(
+            sample_event_rate(),
+            None,
+            None,
+            DropCounters::default(),
+        );
+        assert!(snapshot.source_latency.is_none());
         assert!(snapshot.injection_latency.is_none());
     }
 
     #[test]
     fn snapshot_round_trips_through_serde() {
         // The §31 IPC surface ships this object, so the wire shape must be
-        // stable and round-trip exactly. Pin the three top-level field names.
+        // stable and round-trip exactly. Pin the four top-level field names.
         let mut drops = DropCounters::default();
         drops.bump(TrafficClass::Background);
-        let snapshot =
-            DiagnosticsSnapshot::from_parts(sample_event_rate(), Some(sample_latency()), drops);
+        let snapshot = DiagnosticsSnapshot::from_parts(
+            sample_event_rate(),
+            Some(sample_latency()),
+            None,
+            drops,
+        );
 
         let json = serde_json::to_string(&snapshot).expect("serialize");
         let back: DiagnosticsSnapshot = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(snapshot, back);
 
         assert!(json.contains("\"event_rate\""));
+        assert!(json.contains("\"source_latency\""));
         assert!(json.contains("\"injection_latency\""));
         assert!(json.contains("\"dropped_packets\""));
+        // A None latency serializes to null, not omitted.
+        assert!(json.contains("\"injection_latency\":null"));
     }
 }

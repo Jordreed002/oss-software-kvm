@@ -694,10 +694,11 @@ impl DaemonCore {
     }
 
     /// Unified §35/§36 diagnostics snapshot for the local control IPC surface
-    /// (spec §31). Fills the §35 event-rate portion from this core and composes
-    /// the caller-supplied §36 injection-latency stats (owned by a peer session
-    /// coordinator) and §35 dropped-packets counters (owned by the outbound
-    /// queue) into one wire-ready [`DiagnosticsSnapshot`].
+    /// (spec §31). Fills the §35 event-rate and §36 source-side latency portions
+    /// from this core and composes the caller-supplied §36 injection-latency
+    /// stats (owned by a peer session coordinator) and §35 dropped-packets
+    /// counters (owned by the outbound queue) into one wire-ready
+    /// [`DiagnosticsSnapshot`].
     ///
     /// Only present when the daemon is built with the `diagnostics` feature.
     #[cfg(feature = "diagnostics")]
@@ -710,6 +711,7 @@ impl DaemonCore {
     ) -> crate::DiagnosticsSnapshot {
         crate::DiagnosticsSnapshot::from_parts(
             self.event_rate.snapshot(now_ns),
+            self.source_latency_stats(),
             injection_latency,
             dropped_packets,
         )
