@@ -333,6 +333,12 @@ pub struct PeerSessionCoordinator<I, O> {
     /// §36 capture→injection latency ring; present only with the `diagnostics` feature.
     #[cfg(feature = "diagnostics")]
     injection_latency: kvm_input::LatencyHistory,
+    /// §35 cumulative count of inbound events injected at this peer; present
+    /// only with the `diagnostics` feature. Mirrors the capture-side
+    /// input-event-rate total so a diagnostics surface can detect one-way
+    /// delivery asymmetry (events captured but not injected).
+    #[cfg(feature = "diagnostics")]
+    injected_events: u64,
 }
 
 /// Borrow-only routing composition for one exact current session.
@@ -561,6 +567,8 @@ where
             outbound_sequence: 1,
             #[cfg(feature = "diagnostics")]
             injection_latency: kvm_input::LatencyHistory::default(),
+            #[cfg(feature = "diagnostics")]
+            injected_events: 0,
         })
     }
 
@@ -576,6 +584,16 @@ where
     #[must_use]
     pub fn injection_latency_stats(&self) -> Option<kvm_input::LatencyStats> {
         self.injection_latency.stats()
+    }
+
+    /// §35 cumulative count of inbound events injected at this peer. Only
+    /// present with the `diagnostics` feature; absent in release builds.
+    /// Pairs with the capture-side input-event-rate total so a diagnostics
+    /// surface can detect one-way delivery asymmetry.
+    #[cfg(feature = "diagnostics")]
+    #[must_use]
+    pub const fn injected_events(&self) -> u64 {
+        self.injected_events
     }
 
     #[must_use]
@@ -1272,6 +1290,12 @@ where
                 .with_capture(event.timestamp_ns)
                 .with_injection_request(now_ns),
         );
+        // §35 injected-event counter: one per event successfully injected at
+        // this peer. Dev-only; absent without the `diagnostics` feature.
+        #[cfg(feature = "diagnostics")]
+        {
+            self.injected_events = self.injected_events.saturating_add(1);
+        }
         if release {
             if let Some(state) = self.inbound_pressed.get_mut(&event.source_device) {
                 state.apply(&event.payload);
@@ -1773,6 +1797,30 @@ mod tests {
             .expect("latency recorded after an injected event");
         assert!(stats.count >= 1, "at least one sample: {stats:?}");
         assert_eq!(stats.max_ns, 4_000, "capture→injection span: {stats:?}");
+    }
+
+    #[cfg(feature = "diagnostics")]
+    #[test]
+    fn diagnostics_injected_events_counts_each_injected_event() {
+        // §35 wiring: inject_received tallies one per successfully injected
+        // event, mirroring the capture-side event-rate total.
+        let mut coord = coordinator();
+        assert_eq!(coord.injected_events(), 0, "fresh coordinator injects nothing");
+
+        for seq in 1..=3 {
+            let event = InputEvent::new(
+                seq,
+                1_000,
+                REMOTE,
+                DEVICE,
+                InputPayload::Key {
+                    code: KeyCode::KeyA,
+                    state: KeyState::Pressed,
+                },
+            );
+            coord.test_hold_inbound(event, 5_000).unwrap();
+        }
+        assert_eq!(coord.injected_events(), 3, "three events injected");
     }
 
     fn binding_between(local: HostId, remote: HostId, nonce: u8) -> AdmittedSessionBinding {
