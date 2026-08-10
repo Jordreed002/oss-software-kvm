@@ -32,6 +32,19 @@ impl Extend<u8> for BufExt<'_> {
     }
 }
 
+/// Appends the postcard serialization of one variant's inner payload into `buf`
+/// through the borrowing [`BufExt`] adapter, returning `Ok(())` so each match
+/// arm in [`WireMessage::encode_payload_into`] stays short and uniform (the
+/// concrete payload type differs per variant, so the dispatching match cannot
+/// be collapsed). Monomorphized and inlined per payload type — zero overhead
+/// versus inlining the call.
+fn append_payload<T: serde::Serialize>(
+    value: &T,
+    buf: &mut Vec<u8>,
+) -> Result<(), postcard::Error> {
+    postcard::to_extend(value, BufExt(buf)).map(drop)
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(u16)]
 pub enum MessageType {
@@ -258,24 +271,24 @@ impl WireMessage {
         // borrow ends before the truncate below mutates `buf` again.
         let entry_len = buf.len();
         let result = match self {
-            Self::Hello(value) => postcard::to_extend(value, BufExt(buf)).map(|_| ()),
-            Self::Authenticate(value) => postcard::to_extend(value, BufExt(buf)).map(|_| ()),
-            Self::DeviceSnapshot(value) => postcard::to_extend(value, BufExt(buf)).map(|_| ()),
-            Self::DeviceAdded(value) => postcard::to_extend(value, BufExt(buf)).map(|_| ()),
-            Self::DeviceRemoved(value) => postcard::to_extend(value, BufExt(buf)).map(|_| ()),
-            Self::DisplaySnapshot(value) => postcard::to_extend(value, BufExt(buf)).map(|_| ()),
-            Self::DisplayUpdated(value) => postcard::to_extend(value, BufExt(buf)).map(|_| ()),
-            Self::Input(value) => postcard::to_extend(value, BufExt(buf)).map(|_| ()),
-            Self::PointerEnter(value) => postcard::to_extend(value, BufExt(buf)).map(|_| ()),
-            Self::PointerLeave(value) => postcard::to_extend(value, BufExt(buf)).map(|_| ()),
-            Self::PointerTransitionAck(value) => postcard::to_extend(value, BufExt(buf)).map(|_| ()),
-            Self::PointerTransitionCommit(value) => postcard::to_extend(value, BufExt(buf)).map(|_| ()),
-            Self::Clipboard(value) => postcard::to_extend(value, BufExt(buf)).map(|_| ()),
-            Self::Ping(value) => postcard::to_extend(value, BufExt(buf)).map(|_| ()),
-            Self::Pong(value) => postcard::to_extend(value, BufExt(buf)).map(|_| ()),
-            Self::ReleaseInput(value) => postcard::to_extend(value, BufExt(buf)).map(|_| ()),
-            Self::ReleaseInputV2(value) => postcard::to_extend(value, BufExt(buf)).map(|_| ()),
-            Self::ReleaseAppliedAckV2(value) => postcard::to_extend(value, BufExt(buf)).map(|_| ()),
+            Self::Hello(value) => append_payload(value, buf),
+            Self::Authenticate(value) => append_payload(value, buf),
+            Self::DeviceSnapshot(value) => append_payload(value, buf),
+            Self::DeviceAdded(value) => append_payload(value, buf),
+            Self::DeviceRemoved(value) => append_payload(value, buf),
+            Self::DisplaySnapshot(value) => append_payload(value, buf),
+            Self::DisplayUpdated(value) => append_payload(value, buf),
+            Self::Input(value) => append_payload(value, buf),
+            Self::PointerEnter(value) => append_payload(value, buf),
+            Self::PointerLeave(value) => append_payload(value, buf),
+            Self::PointerTransitionAck(value) => append_payload(value, buf),
+            Self::PointerTransitionCommit(value) => append_payload(value, buf),
+            Self::Clipboard(value) => append_payload(value, buf),
+            Self::Ping(value) => append_payload(value, buf),
+            Self::Pong(value) => append_payload(value, buf),
+            Self::ReleaseInput(value) => append_payload(value, buf),
+            Self::ReleaseInputV2(value) => append_payload(value, buf),
+            Self::ReleaseAppliedAckV2(value) => append_payload(value, buf),
         };
         if result.is_err() {
             // Drop any bytes the failing serialize appended before bailing.
