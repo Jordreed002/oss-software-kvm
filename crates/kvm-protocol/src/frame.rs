@@ -149,26 +149,57 @@ pub fn encode_frame_for_version(
     message: &WireMessage,
     required_version: u16,
 ) -> Result<Vec<u8>, ProtocolError> {
+    let mut frame = Vec::new();
+    encode_frame_for_version_into(message, required_version, &mut frame)?;
+    Ok(frame)
+}
+
+/// Validates and serializes a message, appending exactly one complete frame
+/// onto `out`.
+///
+/// Unlike [`encode_frame_for_version`], this serializes the payload directly
+/// into the caller's buffer (no intermediate allocation), which is what makes
+/// batch framing cheap under a burst: many frames share one growing buffer.
+///
+/// On error the buffer is left at its entry length.
+///
+/// # Errors
+///
+/// Returns [`ProtocolError`] when the requested version is unsupported, the
+/// message requires a newer version, or encoding violates a protocol bound.
+pub fn encode_frame_for_version_into(
+    message: &WireMessage,
+    required_version: u16,
+    out: &mut Vec<u8>,
+) -> Result<(), ProtocolError> {
     require_supported_version(required_version)?;
     require_message_version(message.message_type(), required_version)?;
     message.validate()?;
     let message_type = message.message_type();
-    let payload = message
-        .encode_payload()
+
+    let header_start = out.len();
+    // Reserve a placeholder header; the real length is patched in once the
+    // payload has been serialized so we never need to know its size up front.
+    out.extend_from_slice(&[0_u8; FRAME_HEADER_LEN]);
+    let payload_start = out.len();
+    message
+        .encode_payload_into(out)
         .map_err(|error| ProtocolError::Encode {
             message_type,
             detail: error.to_string(),
         })?;
-    if payload.len() > MAX_FRAME_PAYLOAD {
+    let payload_len = out.len() - payload_start;
+    if payload_len > MAX_FRAME_PAYLOAD {
+        out.truncate(header_start);
         return Err(ProtocolError::PayloadTooLarge {
-            length: payload.len(),
+            length: payload_len,
             maximum: MAX_FRAME_PAYLOAD,
         });
     }
 
     let payload_length =
-        u32::try_from(payload.len()).map_err(|_| ProtocolError::PayloadTooLarge {
-            length: payload.len(),
+        u32::try_from(payload_len).map_err(|_| ProtocolError::PayloadTooLarge {
+            length: payload_len,
             maximum: MAX_FRAME_PAYLOAD,
         })?;
     let header = FrameHeader {
@@ -176,10 +207,8 @@ pub fn encode_frame_for_version(
         message_type,
         payload_length,
     };
-    let mut frame = Vec::with_capacity(FRAME_HEADER_LEN + payload.len());
-    frame.extend_from_slice(&header.encode());
-    frame.extend_from_slice(&payload);
-    Ok(frame)
+    out[header_start..header_start + FRAME_HEADER_LEN].copy_from_slice(&header.encode());
+    Ok(())
 }
 
 /// Decodes exactly one complete frame.

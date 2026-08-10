@@ -697,9 +697,10 @@ impl DaemonCore {
     /// (spec §31). Fills the §35 event-rate and §36 source-side capture→routing
     /// latency portions from this core and composes the caller-supplied §35
     /// injected-event count, the §36 capture→network-send and capture→injection
-    /// latency stats (owned by a peer session coordinator), and §35
-    /// dropped-packets counters (owned by the outbound queue) into one
-    /// wire-ready [`DiagnosticsSnapshot`].
+    /// latency stats (owned by a peer session coordinator), the §35
+    /// dropped-packets counters (owned by the outbound queue), and the §23
+    /// coalesced-move count (a live read of the outbound queue's
+    /// `ObservableSessionStats`) into one wire-ready [`DiagnosticsSnapshot`].
     ///
     /// Only present when the daemon is built with the `diagnostics` feature.
     #[cfg(feature = "diagnostics")]
@@ -711,6 +712,7 @@ impl DaemonCore {
         network_send_latency: Option<kvm_input::LatencyStats>,
         injection_latency: Option<kvm_input::LatencyStats>,
         dropped_packets: kvm_network::DropCounters,
+        coalesced_moves: u64,
     ) -> crate::DiagnosticsSnapshot {
         crate::DiagnosticsSnapshot::from_parts(
             self.event_rate.snapshot(now_ns),
@@ -719,6 +721,7 @@ impl DaemonCore {
             network_send_latency,
             injection_latency,
             dropped_packets,
+            coalesced_moves,
         )
     }
 

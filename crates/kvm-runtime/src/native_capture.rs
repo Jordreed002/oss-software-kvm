@@ -608,9 +608,14 @@ where
 }
 
 fn increment(counter: &AtomicU64) {
-    let _ = counter.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
-        Some(value.saturating_add(1))
-    });
+    // Advisory capture-path counters, hit ~twice per captured event on the
+    // capture thread. `fetch_add` is a single RMW op versus the load + CAS of
+    // `fetch_update`; the previous `saturating_add` only guarded against u64
+    // wraparound, which is unreachable for counters incremented at most a few
+    // thousand times per second (u64 overflow would take ~10^11 years at
+    // 175 Hz). `Relaxed` is the correct ordering for independent best-effort
+    // diagnostics.
+    counter.fetch_add(1, Ordering::Relaxed);
 }
 
 #[cfg(test)]

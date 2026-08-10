@@ -5,14 +5,16 @@ use crate::connection_role::{
 };
 use crate::{
     AuthenticatedConnector, DevelopmentAddress, FrameReader, FrameWriter, HeartbeatAction,
-    HeartbeatConfig, HeartbeatController, NetworkError, OutboundQueue, QueueConfig,
-    ReconnectBackoff, ReconnectPolicy, SecurePeerStream, TrafficClass, TransportPeerIdentity,
+    HeartbeatConfig, HeartbeatController, NetworkError, ObservableSessionStats, OutboundQueue,
+    QueueConfig, ReconnectBackoff, ReconnectPolicy, SecurePeerStream, SessionStats, TrafficClass,
+    TransportPeerIdentity,
 };
 use kvm_protocol::{
-    decode_frame_for_version, encode_frame_for_version, AuthenticateV1, FrameHeader, HelloV1,
-    MessageType, WireMessage, CURRENT_PROTOCOL_VERSION, FRAME_HEADER_LEN,
-    MIN_SUPPORTED_PROTOCOL_VERSION, PROTOCOL_VERSION_V1,
+    decode_frame_for_version, encode_frame_for_version, encode_frame_for_version_into,
+    AuthenticateV1, FrameHeader, HelloV1, MessageType, WireMessage, CURRENT_PROTOCOL_VERSION,
+    FRAME_HEADER_LEN, MIN_SUPPORTED_PROTOCOL_VERSION, PROTOCOL_VERSION_V1,
 };
+use std::sync::Arc;
 use std::time::Duration;
 use subtle::ConstantTimeEq;
 use thiserror::Error;
@@ -39,8 +41,12 @@ pub enum ConnectionState {
 #[derive(Clone, PartialEq)]
 pub struct AdmittedPeer {
     transport_identity: TransportPeerIdentity,
-    local_hello: HelloV1,
-    remote_hello: HelloV1,
+    // The two hellos are immutable after admission and each carry two `String`s
+    // (`host_name`, `daemon_version`). Wrapping them in `Arc` makes cloning an
+    // `AdmittedPeer` — which happens for every inbound `PeerEvent::Message` — a
+    // pair of refcount bumps instead of four heap allocations.
+    local_hello: Arc<HelloV1>,
+    remote_hello: Arc<HelloV1>,
     selected_protocol_version: u16,
     session_id: [u8; 32],
 }
@@ -56,11 +62,11 @@ impl AdmittedPeer {
         &self.transport_identity
     }
 
-    pub const fn hello(&self) -> &HelloV1 {
+    pub fn hello(&self) -> &HelloV1 {
         &self.remote_hello
     }
 
-    pub const fn local_hello(&self) -> &HelloV1 {
+    pub fn local_hello(&self) -> &HelloV1 {
         &self.local_hello
     }
 
@@ -199,6 +205,10 @@ pub enum PeerEvent {
     Disconnected {
         reason: DisconnectReason,
         undelivered: UndeliveredTraffic,
+        /// Cumulative outbound-queue diagnostics (§23 coalescing, §35 drops)
+        /// captured from the session's queue at disconnect time, so the burst
+        /// pressure that preceded the failure is observable by the consumer.
+        stats: SessionStats,
     },
     ReconnectScheduled(Duration),
 }
@@ -689,6 +699,11 @@ struct SessionFailure {
     error: SessionError,
     undelivered: UndeliveredTraffic,
     reset_backoff: bool,
+    /// Cumulative outbound-queue diagnostics (§23 coalescing, §35 drops)
+    /// captured from the queue at failure time, so the burst pressure that
+    /// preceded the disconnect is observable rather than discarded with the
+    /// private queue. `default()` before admission — the queue did not exist yet.
+    stats: SessionStats,
 }
 
 impl SessionFailure {
@@ -697,15 +712,33 @@ impl SessionFailure {
             error,
             undelivered: UndeliveredTraffic::default(),
             reset_backoff: false,
+            stats: SessionStats::default(),
         }
     }
 }
 
-#[derive(Debug)]
+/// Upper bound on one outbound write batch. A batch coalesces every frame the
+/// queue currently holds — up to these caps — into a single progressive write
+/// and a single TLS flush, so a high-rate input burst (high-poll mice, 175 Hz
+/// pointer motion) crosses the transport as a few large writes instead of one
+/// write + one flush per frame. The first frame is always included even when it
+/// alone exceeds the byte cap, so a lone large frame never stalls.
+const OUTBOUND_BATCH_MAX_FRAMES: usize = 64;
+const OUTBOUND_BATCH_MAX_BYTES: usize = 65_536;
+/// Conservative upper bound on one encoded input frame (8-byte header plus a
+/// `PointerMove` payload: two varint scalars, two 16-byte identifiers, and two
+/// `f64` deltas). Used only to pre-size the batch buffer so a burst encodes
+/// into a single allocation instead of growing the `Vec` frame-by-frame.
+const OUTBOUND_BATCH_FRAME_BYTES_ESTIMATE: usize = 96;
+
+#[derive(Debug, Default)]
 struct PendingFrame {
     bytes: Vec<u8>,
     committed: usize,
-    metadata: UndeliveredMessage,
+    /// The batched frames in send order, each paired with its exclusive end
+    /// byte offset within `bytes`, so failure accounting can mark each message
+    /// fully sent, partially sent, or not yet sent relative to `committed`.
+    frames: Vec<(UndeliveredMessage, usize)>,
 }
 
 /// One-shot direction-neutral owner for an already established secure stream.
@@ -718,6 +751,7 @@ pub struct SecurePeerSession<A> {
     config: PersistentPeerConfig,
     outbound: mpsc::Receiver<WireMessage>,
     events: mpsc::Sender<PeerEvent>,
+    observable_stats: Arc<ObservableSessionStats>,
 }
 
 /// One-shot session whose events are cryptographically and affinely bound to
@@ -730,6 +764,7 @@ pub struct GenerationBoundPeerSession<A> {
     internal_event_receiver: mpsc::Receiver<PeerEvent>,
     bound_events: mpsc::Sender<GenerationBoundPeerEvent>,
     pending: PendingConnection,
+    observable_stats: Arc<ObservableSessionStats>,
 }
 
 impl<A> std::fmt::Debug for GenerationBoundPeerSession<A> {
@@ -849,12 +884,22 @@ impl<A: SessionAdmission> SecurePeerSession<A> {
                 config,
                 outbound,
                 events,
+                observable_stats: Arc::new(ObservableSessionStats::default()),
             },
             PeerSender {
                 sender: outbound_sender,
             },
             event_receiver,
         ))
+    }
+
+    /// Returns a shared handle to this session's live outbound-queue diagnostics
+    /// (§23 coalescing, §35 drops), published on the heartbeat tick. Clone it
+    /// before [`run`](Self::run) consumes the session so the diagnostics surface
+    /// can read cumulative counters while the session streams.
+    #[must_use]
+    pub fn observable_stats(&self) -> Arc<ObservableSessionStats> {
+        Arc::clone(&self.observable_stats)
     }
 
     /// Runs exporter-bound admission and application transport over one sealed
@@ -872,13 +917,14 @@ impl<A: SessionAdmission> SecurePeerSession<A> {
         stream: S,
         mut shutdown: watch::Receiver<bool>,
     ) -> Result<SessionEnd, SessionError> {
-        match run_session(
+        match run_session_with_stats(
             stream,
             &self.admission,
             self.config,
             &mut self.outbound,
             &self.events,
             &mut shutdown,
+            Some(self.observable_stats.as_ref()),
         )
         .await
         {
@@ -893,6 +939,7 @@ impl<A: SessionAdmission> SecurePeerSession<A> {
                 let SessionFailure {
                     error,
                     mut undelivered,
+                    stats,
                     ..
                 } = failure;
                 drain_outbound(&mut self.outbound, &mut undelivered);
@@ -906,6 +953,7 @@ impl<A: SessionAdmission> SecurePeerSession<A> {
                     PeerEvent::Disconnected {
                         reason,
                         undelivered,
+                        stats,
                     },
                 )?;
                 Err(error)
@@ -949,12 +997,22 @@ impl<A: SessionAdmission> GenerationBoundPeerSession<A> {
                 internal_event_receiver,
                 bound_events,
                 pending,
+                observable_stats: Arc::new(ObservableSessionStats::default()),
             },
             PeerSender {
                 sender: outbound_sender,
             },
             bound_event_receiver,
         ))
+    }
+
+    /// Returns a shared handle to this session's live outbound-queue diagnostics
+    /// (§23 coalescing, §35 drops), published on the heartbeat tick. Clone it
+    /// before [`run`](Self::run) consumes the session so the diagnostics surface
+    /// can read cumulative counters while the session streams.
+    #[must_use]
+    pub fn observable_stats(&self) -> Arc<ObservableSessionStats> {
+        Arc::clone(&self.observable_stats)
     }
 
     /// Runs exactly one sealed stream and emits only network-minted,
@@ -982,18 +1040,20 @@ impl<A: SessionAdmission> GenerationBoundPeerSession<A> {
             mut internal_event_receiver,
             bound_events,
             pending,
+            observable_stats,
         } = self;
         let generation = pending.generation();
         let mut pending = Some(pending);
         let mut admitted = false;
         let result = {
-            let session = run_session(
+            let session = run_session_with_stats(
                 stream,
                 &admission,
                 config,
                 &mut outbound,
                 &internal_events,
                 &mut shutdown,
+                Some(observable_stats.as_ref()),
             );
             tokio::pin!(session);
 
@@ -1067,6 +1127,7 @@ impl<A: SessionAdmission> GenerationBoundPeerSession<A> {
                 let SessionFailure {
                     error,
                     mut undelivered,
+                    stats,
                     ..
                 } = failure;
                 drain_outbound(&mut outbound, &mut undelivered);
@@ -1101,6 +1162,7 @@ impl<A: SessionAdmission> GenerationBoundPeerSession<A> {
                 let event = PeerEvent::Disconnected {
                     reason: disconnect_reason(&error),
                     undelivered,
+                    stats,
                 };
                 let bound =
                     bind_terminal_generation_event(generation, event, &mut pending, admitted)?;
@@ -1247,6 +1309,8 @@ fn active_termination_event(generation: ConnectionGeneration) -> GenerationBound
                 requires_input_reconciliation: true,
                 ..UndeliveredTraffic::default()
             },
+            // No session queue existed (synthetic termination), so no diagnostics.
+            stats: SessionStats::default(),
         }),
     }
 }
@@ -1257,13 +1321,65 @@ enum FrameWriteProgress {
 }
 
 impl PendingFrame {
-    fn encode(message: &WireMessage, selected_protocol_version: u16) -> Result<Self, SessionError> {
-        Ok(Self {
-            bytes: encode_frame_for_version(message, selected_protocol_version)
-                .map_err(NetworkError::from)?,
-            committed: 0,
-            metadata: undelivered_metadata(message, false),
-        })
+    /// Encodes every frame currently held by `queue` — up to the batch caps —
+    /// into `reusable`, one contiguous, cancellation-safe write buffer whose
+    /// allocation is retained across batches. The returned frame's `frames` list
+    /// is empty when the queue held nothing, so the caller does not spin on an
+    /// empty batch.
+    ///
+    /// A frame that would push the batch past [`OUTBOUND_BATCH_MAX_BYTES`] is
+    /// returned to the front of its lane via [`OutboundQueue::unpop`]; it leads
+    /// the next batch.
+    fn encode_batch(
+        queue: &mut OutboundQueue,
+        selected_protocol_version: u16,
+        mut reusable: Self,
+    ) -> Result<Self, SessionError> {
+        // Reuse the retained allocations (cleared in place) instead of
+        // reallocating a fresh buffer for every batch under sustained throughput.
+        reusable.bytes.clear();
+        reusable.frames.clear();
+        reusable.committed = 0;
+        // Pre-size both buffers to the frames this batch will encode (bounded by
+        // the batch cap) so the burst serializes into the allocation grown once
+        // here, not grown frame-by-frame as each append crosses a power of two.
+        // `Vec::reserve` is a no-op when the retained capacity already covers
+        // the request, so this costs nothing at steady state.
+        let frame_budget = queue.len().min(OUTBOUND_BATCH_MAX_FRAMES);
+        reusable.frames.reserve(frame_budget);
+        reusable
+            .bytes
+            .reserve(frame_budget * OUTBOUND_BATCH_FRAME_BYTES_ESTIMATE);
+        while reusable.frames.len() < OUTBOUND_BATCH_MAX_FRAMES {
+            let Some(message) = queue.pop_next() else {
+                break;
+            };
+            // Serialize the frame directly into the shared batch buffer — no
+            // per-frame allocation. If encoding fails, unwind any partial
+            // append so the buffer stays at its prior boundary.
+            let before = reusable.bytes.len();
+            if let Err(error) = encode_frame_for_version_into(
+                &message,
+                selected_protocol_version,
+                &mut reusable.bytes,
+            ) {
+                reusable.bytes.truncate(before);
+                queue.unpop(message);
+                return Err(NetworkError::from(error).into());
+            }
+            // From the second frame onward, keep the batch under the byte cap by
+            // unwinding this frame. The first frame is always included even when
+            // it alone exceeds the cap, so a lone large frame never stalls.
+            if !reusable.frames.is_empty() && reusable.bytes.len() > OUTBOUND_BATCH_MAX_BYTES {
+                reusable.bytes.truncate(before);
+                queue.unpop(message);
+                break;
+            }
+            reusable
+                .frames
+                .push((undelivered_metadata(&message, false), reusable.bytes.len()));
+        }
+        Ok(reusable)
     }
 
     fn remaining(&self) -> &[u8] {
@@ -1289,6 +1405,7 @@ pub struct PersistentPeer<C, A, J = NoReconnectJitter> {
     config: PersistentPeerConfig,
     outbound: mpsc::Receiver<WireMessage>,
     events: mpsc::Sender<PeerEvent>,
+    observable_stats: Arc<ObservableSessionStats>,
 }
 
 impl<C, A> PersistentPeer<C, A, NoReconnectJitter>
@@ -1338,12 +1455,22 @@ where
                 config,
                 outbound,
                 events,
+                observable_stats: Arc::new(ObservableSessionStats::default()),
             },
             PeerSender {
                 sender: outbound_sender,
             },
             event_receiver,
         ))
+    }
+
+    /// Returns a shared handle to this session's live outbound-queue diagnostics
+    /// (§23 coalescing, §35 drops), published on the heartbeat tick. Clone it
+    /// before [`run`](Self::run) consumes the session so the diagnostics surface
+    /// can read cumulative counters while the session streams.
+    #[must_use]
+    pub fn observable_stats(&self) -> Arc<ObservableSessionStats> {
+        Arc::clone(&self.observable_stats)
     }
 
     /// Runs connection, admission, message transport, heartbeat, and reconnect
@@ -1375,14 +1502,15 @@ where
                 result = self.connector.connect(address) => result,
             };
 
-            let (reason, mut undelivered) = match connected {
-                Ok(stream) => match run_session(
+            let (reason, mut undelivered, stats) = match connected {
+                Ok(stream) => match run_session_with_stats(
                     stream,
                     &self.admission,
                     self.config,
                     &mut self.outbound,
                     &self.events,
                     &mut shutdown,
+                    Some(self.observable_stats.as_ref()),
                 )
                 .await
                 {
@@ -1398,12 +1526,18 @@ where
                         if failure.reset_backoff {
                             backoff.reset();
                         }
-                        (disconnect_reason(&failure.error), failure.undelivered)
+                        (
+                            disconnect_reason(&failure.error),
+                            failure.undelivered,
+                            failure.stats,
+                        )
                     }
                 },
                 Err(error) => (
                     DisconnectReason::ConnectFailed(error.kind()),
                     UndeliveredTraffic::default(),
+                    // No session queue existed (connect failed), so no diagnostics.
+                    SessionStats::default(),
                 ),
             };
             drain_outbound(&mut self.outbound, &mut undelivered);
@@ -1417,6 +1551,7 @@ where
                 PeerEvent::Disconnected {
                     reason,
                     undelivered,
+                    stats,
                 },
             )?;
             let base_delay = backoff.next_delay();
@@ -1435,6 +1570,10 @@ where
     }
 }
 
+/// Test-only entry that mirrors the pre-observability `run_session` signature,
+/// passing `None` so existing tests are unchanged. Production call sites use
+/// [`run_session_with_stats`] with a live [`ObservableSessionStats`].
+#[cfg(test)]
 async fn run_session<S: SecurePeerStream, A: SessionAdmission>(
     stream: S,
     admission: &A,
@@ -1442,6 +1581,19 @@ async fn run_session<S: SecurePeerStream, A: SessionAdmission>(
     outbound: &mut mpsc::Receiver<WireMessage>,
     events: &mpsc::Sender<PeerEvent>,
     shutdown: &mut watch::Receiver<bool>,
+) -> Result<SessionEnd, SessionFailure> {
+    run_session_with_stats(stream, admission, config, outbound, events, shutdown, None).await
+}
+
+#[allow(clippy::too_many_lines)]
+async fn run_session_with_stats<S: SecurePeerStream, A: SessionAdmission>(
+    stream: S,
+    admission: &A,
+    config: PersistentPeerConfig,
+    outbound: &mut mpsc::Receiver<WireMessage>,
+    events: &mpsc::Sender<PeerEvent>,
+    shutdown: &mut watch::Receiver<bool>,
+    stats: Option<&ObservableSessionStats>,
 ) -> Result<SessionEnd, SessionFailure> {
     let admission_result = tokio::time::timeout(
         config.admission_timeout,
@@ -1462,9 +1614,20 @@ async fn run_session<S: SecurePeerStream, A: SessionAdmission>(
     heartbeat_tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
     heartbeat_tick.tick().await;
     let mut queue = OutboundQueue::new(config.queue);
+    // Begin the session with a clean observable so the first heartbeat reflects
+    // only traffic from this run, not values left over from a prior generation.
+    if let Some(stats) = stats {
+        stats.reset();
+    }
     let mut pending = None;
+    // Retains the last flushed batch's `bytes`/`frames` allocations so the next
+    // batch reuses them instead of reallocating under sustained throughput.
+    let mut recycled = None::<PendingFrame>;
     let selected_protocol_version = admitted.selected_protocol_version();
     let mut read_progress = FrameReadProgress::default();
+    // Reused across drains so a multi-frame burst is decoded and dispatched
+    // without per-drain or per-frame allocation.
+    let mut inbound_messages = Vec::<WireMessage>::new();
     let mut outbound_open = true;
     let mut reset_backoff = false;
 
@@ -1474,11 +1637,15 @@ async fn run_session<S: SecurePeerStream, A: SessionAdmission>(
             enqueue(&mut queue, message)?;
         }
         if pending.is_none() {
-            pending = queue
-                .pop_next()
-                .as_ref()
-                .map(|message| PendingFrame::encode(message, selected_protocol_version))
-                .transpose()?;
+            let reusable = recycled.take().unwrap_or_default();
+            let frame =
+                PendingFrame::encode_batch(&mut queue, selected_protocol_version, reusable)?;
+            if frame.frames.is_empty() {
+                // Queue held nothing; keep the cleared allocation for next time.
+                recycled = Some(frame);
+            } else {
+                pending = Some(frame);
+            }
         }
         if !outbound_open && pending.is_none() && queue.is_empty() {
             return Ok(SessionEnd::OutboundClosed);
@@ -1508,11 +1675,16 @@ async fn run_session<S: SecurePeerStream, A: SessionAdmission>(
                             frame.commit(committed);
                         }
                     }
-                    FrameWriteProgress::Flushed => pending = None,
+                    FrameWriteProgress::Flushed => {
+                        // Retain the flushed batch's allocation for reuse by the
+                        // next batch instead of dropping and reallocating it.
+                        recycled = pending.take();
+                    }
                 }
             }
-            result = reader.read_some(&mut read_progress) => {
-                if let Some(message) = result? {
+            read_result = reader.read_and_drain(&mut read_progress, &mut inbound_messages) => {
+                read_result?;
+                for message in inbound_messages.drain(..) {
                     handle_inbound(
                         message,
                         &admitted,
@@ -1531,6 +1703,13 @@ async fn run_session<S: SecurePeerStream, A: SessionAdmission>(
                 }
             }
             _ = heartbeat_tick.tick() => {
+                // Publish a live snapshot of outbound-queue state (drops +
+                // coalescing) on the heartbeat cadence so a pull-model
+                // diagnostics reader can observe the happy path, not just the
+                // forensic Disconnect report.
+                if let Some(stats) = stats {
+                    stats.publish(queue.session_stats());
+                }
                 for action in heartbeat.poll(origin.elapsed()) {
                     handle_heartbeat_action(action, &mut queue, events)?;
                 }
@@ -1570,18 +1749,32 @@ fn collect_session_failure(
         undelivered.messages.push(*rejected);
     }
     if let Some(frame) = pending {
-        let mut metadata = frame.metadata;
-        metadata.partially_sent = frame.committed > 0;
-        undelivered.requires_input_reconciliation |= metadata.traffic_class == TrafficClass::Input;
-        undelivered.messages.push(metadata);
+        let committed = frame.committed;
+        let mut start = 0_usize;
+        for (mut metadata, end) in frame.frames {
+            // Conservative — matches the prior single-frame rule ("any
+            // committed byte counts as partially in flight"): a frame whose
+            // byte range [start, end) begins at or before the committed offset
+            // had at least one byte handed to the transport.
+            metadata.partially_sent = committed > start;
+            undelivered.requires_input_reconciliation |=
+                metadata.traffic_class == TrafficClass::Input;
+            undelivered.messages.push(metadata);
+            start = end;
+        }
     }
     while let Some(message) = queue.pop_next() {
         undelivered.record(&message, false);
     }
+    // Cumulative queue diagnostics survive draining the lane: coalescing and
+    // drop counts are running totals over the session, so a burst that has
+    // already been popped (or coalesced away) is still reflected here.
+    let stats = queue.session_stats();
     SessionFailure {
         error,
         undelivered,
         reset_backoff,
+        stats,
     }
 }
 
@@ -1686,8 +1879,8 @@ async fn perform_admission<S: SecurePeerStream, A: SessionAdmission>(
 
     let admitted = AdmittedPeer {
         transport_identity: transcript.transport_identity,
-        local_hello: transcript.local_hello,
-        remote_hello: transcript.remote_hello,
+        local_hello: Arc::new(transcript.local_hello),
+        remote_hello: Arc::new(transcript.remote_hello),
         selected_protocol_version: transcript.selected_protocol_version,
         session_id: transcript.session_id,
     };
@@ -2115,10 +2308,11 @@ mod tests {
     use super::*;
     use crate::{ConnectionDirection, TransportPeerIdentity};
     use kvm_protocol::{
-        ClipboardV1, InputEventV1, PointerEnterV1, PointerLeaveV1, PointerTransitionCommitV1,
-        ReleaseAppliedAckV2, ReleaseInputV1, ReleaseInputV2, ReleaseReasonV1, ReleaseReasonV2,
-        WireClipboardId, WireDeviceId, WireDisplayId, WireEdge, WireHostId, WireInputPayloadV1,
-        WirePeerId, WirePlatform, PROTOCOL_VERSION_V2,
+        encode_frame_for_version, ClipboardV1, InputEventV1, PointerEnterV1, PointerLeaveV1,
+        PointerTransitionCommitV1, ReleaseAppliedAckV2, ReleaseInputV1, ReleaseInputV2,
+        ReleaseReasonV1, ReleaseReasonV2, WireClipboardId, WireDeviceId, WireDisplayId, WireEdge,
+        WireHostId, WireInputPayloadV1, WirePeerId, WirePlatform, PROTOCOL_VERSION_V1,
+        PROTOCOL_VERSION_V2,
     };
     use sha2::{Digest, Sha256};
     use std::pin::Pin;
@@ -2678,13 +2872,57 @@ mod tests {
         writer.flush().await.unwrap();
     }
 
+    /// A `PointerMove` input frame from `device` for queue-coalescing tests.
+    fn move_from(device: u8, sequence: u64, dx: f64, dy: f64) -> WireMessage {
+        WireMessage::Input(InputEventV1 {
+            sequence,
+            timestamp_ns: sequence,
+            source_host: WireHostId([1; 16]),
+            source_device: WireDeviceId([device; 16]),
+            payload: WireInputPayloadV1::PointerMove { dx, dy },
+        })
+    }
+
+    #[test]
+    fn collect_session_failure_records_queue_diagnostics_in_stats() {
+        // A queue that has both coalesced (same-source moves) and dropped
+        // (capacity-1 input lane overflow on a different-source move) frames.
+        let mut queue = OutboundQueue::new(QueueConfig {
+            input: 1,
+            control: 4,
+            background: 4,
+            maximum_input_burst: 8,
+            coalesce_pointer_moves: true,
+        });
+        queue.try_push(move_from(2, 1, 1.0, 0.0)).unwrap();
+        queue.try_push(move_from(2, 2, 1.0, 0.0)).unwrap(); // coalesced
+        assert!(queue.try_push(move_from(3, 3, 1.0, 0.0)).is_err()); // lane full → drop
+
+        let failure = collect_session_failure(
+            SessionError::NoCompatibleProtocolVersion,
+            None,
+            &mut queue,
+            &FrameReadProgress::default(),
+            false,
+        );
+
+        // The burst pressure that preceded the disconnect is observable on the
+        // failure, even though the queue itself is private and now drained.
+        assert_eq!(failure.stats.coalesced_moves, 1);
+        assert_eq!(failure.stats.dropped.input, 1);
+        assert_eq!(failure.stats.dropped.total(), 1);
+        // collect_session_failure drains the queue into `undelivered`; the one
+        // surviving coalesced frame is reported there, distinct from the stats.
+        assert_eq!(failure.undelivered.messages.len(), 1);
+    }
+
     #[test]
     fn payload_bearing_debug_output_is_redacted() {
         let remote = hello(20);
         let peer = AdmittedPeer {
             transport_identity: identity(&remote),
-            local_hello: hello(1),
-            remote_hello: remote.clone(),
+            local_hello: Arc::new(hello(1)),
+            remote_hello: Arc::new(remote.clone()),
             selected_protocol_version: PROTOCOL_VERSION_V1,
             session_id: [0; 32],
         };
@@ -2732,8 +2970,8 @@ mod tests {
         let transport_identity = identity(&remote);
         let peer = AdmittedPeer {
             transport_identity: transport_identity.clone(),
-            local_hello: local.clone(),
-            remote_hello: remote.clone(),
+            local_hello: Arc::new(local.clone()),
+            remote_hello: Arc::new(remote.clone()),
             selected_protocol_version: PROTOCOL_VERSION_V1,
             session_id: [0; 32],
         };
@@ -2759,12 +2997,34 @@ mod tests {
     }
 
     #[test]
+    fn admitted_peer_clone_shares_hello_allocations() {
+        // `handle_inbound` clones the admitted peer for every inbound
+        // `PeerEvent::Message`. The two hellos each carry two `String`s, so a
+        // deep clone would be four heap allocations per received event. The
+        // hellos are `Arc`-shared, so a clone is a refcount bump: both clones
+        // must point at the same hello allocation.
+        let remote = hello(20);
+        let peer = AdmittedPeer {
+            transport_identity: identity(&remote),
+            local_hello: Arc::new(hello(1)),
+            remote_hello: Arc::new(remote.clone()),
+            selected_protocol_version: PROTOCOL_VERSION_V1,
+            session_id: [0; 32],
+        };
+        let cloned = peer.clone();
+        assert!(Arc::ptr_eq(&peer.local_hello, &cloned.local_hello));
+        assert!(Arc::ptr_eq(&peer.remote_hello, &cloned.remote_hello));
+        // Content equality is preserved (Arc's PartialEq dereferences).
+        assert_eq!(peer, cloned);
+    }
+
+    #[test]
     fn message_identity_validation_rejects_spoofed_sources_and_destinations() {
         let remote = hello(20);
         let peer = AdmittedPeer {
             transport_identity: identity(&remote),
-            local_hello: hello(1),
-            remote_hello: remote,
+            local_hello: Arc::new(hello(1)),
+            remote_hello: Arc::new(remote),
             selected_protocol_version: PROTOCOL_VERSION_V1,
             session_id: [0; 32],
         };
@@ -2821,8 +3081,8 @@ mod tests {
         let remote = hello(20);
         let peer = AdmittedPeer {
             transport_identity: identity(&remote),
-            local_hello: hello(1),
-            remote_hello: remote,
+            local_hello: Arc::new(hello(1)),
+            remote_hello: Arc::new(remote),
             selected_protocol_version: PROTOCOL_VERSION_V2,
             session_id: [6; 32],
         };
@@ -2951,7 +3211,11 @@ mod tests {
 
     #[test]
     fn v1_session_rejects_v2_only_release_before_any_write() {
-        let error = PendingFrame::encode(&release_v2(2), PROTOCOL_VERSION_V1).unwrap_err();
+        let mut queue = OutboundQueue::default();
+        queue.try_push(release_v2(2)).unwrap();
+        let error =
+            PendingFrame::encode_batch(&mut queue, PROTOCOL_VERSION_V1, PendingFrame::default())
+                .unwrap_err();
 
         assert!(matches!(
             error,
@@ -2962,6 +3226,174 @@ mod tests {
                 }
             ))
         ));
+        // The un-encodable frame is returned to the queue, not silently lost.
+        assert!(!queue.is_empty());
+    }
+
+    // --- outbound write batching (spec §37 latency) ---
+
+    fn distinct_move(device: u8, sequence: u64) -> WireMessage {
+        WireMessage::Input(InputEventV1 {
+            sequence,
+            timestamp_ns: sequence,
+            source_host: WireHostId([7; 16]),
+            source_device: WireDeviceId([device; 16]),
+            payload: WireInputPayloadV1::PointerMove { dx: 1.0, dy: 2.0 },
+        })
+    }
+
+    fn batch_queue() -> OutboundQueue {
+        // Coalescing off so every queued move stays a distinct frame; the
+        // batching under test is the write-batch, not pointer-move coalescing.
+        OutboundQueue::new(QueueConfig {
+            coalesce_pointer_moves: false,
+            ..QueueConfig::default()
+        })
+    }
+
+    #[test]
+    fn encode_batch_concatenates_every_queued_frame() {
+        let mut queue = batch_queue();
+        let messages = [
+            distinct_move(2, 1),
+            distinct_move(3, 2),
+            distinct_move(4, 3),
+        ];
+        for message in &messages {
+            queue.try_push(message.clone()).unwrap();
+        }
+
+        let batch =
+            PendingFrame::encode_batch(&mut queue, PROTOCOL_VERSION_V1, PendingFrame::default())
+                .expect("encode");
+        assert!(queue.is_empty());
+        assert_eq!(batch.frames.len(), 3);
+        assert_eq!(batch.committed, 0);
+        assert!(!batch.is_complete());
+
+        // The batch buffer is exactly the concatenation of the individually
+        // encoded frames — one progressive write carries all three.
+        let mut expected = Vec::new();
+        for message in &messages {
+            expected.extend_from_slice(
+                &encode_frame_for_version(message, PROTOCOL_VERSION_V1).unwrap(),
+            );
+        }
+        assert_eq!(batch.bytes, expected);
+
+        // Frame end offsets strictly increase and land on the buffer length.
+        let mut cursor = 0_usize;
+        for (_, end) in &batch.frames {
+            assert!(*end > cursor);
+            cursor = *end;
+        }
+        assert_eq!(cursor, batch.bytes.len());
+    }
+
+    #[test]
+    fn encode_batch_byte_cap_unpops_the_overflow_frame() {
+        let mut queue = batch_queue();
+        // Two ~40 KiB background frames: the first is always included (empty
+        // batch); the second would exceed OUTBOUND_BATCH_MAX_BYTES and is
+        // returned to the front of its lane for the next batch.
+        let big = |update_byte: u8, sequence: u64| {
+            WireMessage::Clipboard(ClipboardV1 {
+                update_id: WireClipboardId([update_byte; 16]),
+                origin_host: WireHostId([7; 16]),
+                sequence,
+                text: "x".repeat(40_000),
+            })
+        };
+        queue.try_push(big(1, 1)).unwrap();
+        queue.try_push(big(2, 2)).unwrap();
+
+        let batch =
+            PendingFrame::encode_batch(&mut queue, PROTOCOL_VERSION_V1, PendingFrame::default())
+                .expect("encode");
+        assert_eq!(batch.frames.len(), 1);
+        assert_eq!(queue.len(), 1); // overflow frame preserved, not lost
+    }
+
+    #[test]
+    fn encode_batch_of_empty_queue_yields_an_empty_reusable_frame() {
+        let mut queue = batch_queue();
+        let batch =
+            PendingFrame::encode_batch(&mut queue, PROTOCOL_VERSION_V1, PendingFrame::default())
+                .expect("encode");
+        assert!(batch.frames.is_empty());
+        assert!(batch.bytes.is_empty());
+    }
+
+    #[test]
+    fn encode_batch_reuses_the_caller_buffer_without_leaking_prior_frames() {
+        let mut queue = batch_queue();
+        // First batch: three frames.
+        for sequence in 1_u64..=3 {
+            queue.try_push(distinct_move(2, sequence)).unwrap();
+        }
+        let first =
+            PendingFrame::encode_batch(&mut queue, PROTOCOL_VERSION_V1, PendingFrame::default())
+                .expect("encode");
+        let first_len = first.bytes.len();
+        let retained_capacity = first.bytes.capacity();
+        assert_eq!(first.frames.len(), 3);
+        assert_eq!(first.committed, 0);
+
+        // Second batch into the SAME allocation: one frame. The buffer must be
+        // cleared (not appended to), committed reset, and capacity retained.
+        queue.try_push(distinct_move(3, 4)).unwrap();
+        let second =
+            PendingFrame::encode_batch(&mut queue, PROTOCOL_VERSION_V1, first).expect("encode");
+        assert_eq!(second.frames.len(), 1);
+        assert_eq!(second.committed, 0);
+        // Holds only the one new frame, not the prior three.
+        assert!(second.bytes.len() < first_len);
+        // Capacity carried over (Vec never shrinks on clear).
+        assert_eq!(second.bytes.capacity(), retained_capacity);
+    }
+
+    #[test]
+    fn encode_batch_reserves_buffer_capacity_proportional_to_queue_depth() {
+        // A cold (default) buffer encodes a multi-frame burst into a single
+        // allocation: both Vecs are pre-sized to the batch's frame budget so the
+        // burst does not grow the buffer frame-by-frame as each append crosses a
+        // power of two.
+        let mut queue = batch_queue();
+        let n = 24_usize;
+        for sequence in 1_u64..=n as u64 {
+            queue
+                .try_push(distinct_move((sequence % 7) as u8 + 2, sequence))
+                .unwrap();
+        }
+        let frame_budget = n.min(OUTBOUND_BATCH_MAX_FRAMES);
+
+        let batch =
+            PendingFrame::encode_batch(&mut queue, PROTOCOL_VERSION_V1, PendingFrame::default())
+                .expect("encode");
+
+        // The reservation guaranteed at least this much capacity before encoding
+        // began, and the actual burst fit within it (input frames are smaller
+        // than the estimate), so no per-frame reallocation was needed.
+        let reserved = frame_budget * OUTBOUND_BATCH_FRAME_BYTES_ESTIMATE;
+        assert!(
+            batch.bytes.capacity() >= reserved,
+            "capacity {} should cover the reserved {} bytes",
+            batch.bytes.capacity(),
+            reserved
+        );
+        assert!(batch.bytes.len() <= batch.bytes.capacity());
+        assert_eq!(batch.frames.len(), n);
+        assert!(
+            batch.frames.capacity() >= frame_budget,
+            "frames capacity {} should cover the frame budget {}",
+            batch.frames.capacity(),
+            frame_budget
+        );
+
+        // Every input frame was smaller than the estimate, so the whole burst
+        // fit inside the reservation with no growth beyond it — i.e. one
+        // allocation, not log(n) of them.
+        assert!(batch.bytes.len() <= reserved);
     }
 
     #[test]
@@ -3145,6 +3577,10 @@ mod tests {
         let mut second_input = first_input.clone();
         if let WireMessage::Input(input) = &mut second_input {
             input.sequence = 2;
+            // Distinct source device so the two moves represent independent
+            // streams and are not pointer-move-coalesced (spec §23); the test
+            // exercises ordering, not coalescing.
+            input.source_device = WireDeviceId([10; 16]);
         }
         outbound_sender.send(background.clone()).await.unwrap();
         outbound_sender.send(first_input.clone()).await.unwrap();
@@ -3189,6 +3625,115 @@ mod tests {
 
         let (result, ()) = tokio::join!(session, peer);
         assert_eq!(result.unwrap(), SessionEnd::Shutdown);
+    }
+
+    /// A live session publishes outbound-queue diagnostics (here: §23 coalesced
+    /// moves) to the shared observable on the heartbeat tick, so a pull-model
+    /// reader can observe the happy path — not only the forensic Disconnect
+    /// report from iteration 7.
+    #[tokio::test(start_paused = true)]
+    async fn live_observable_publishes_coalesced_moves_on_the_heartbeat_tick() {
+        let local_hello = hello(1);
+        let remote_hello = hello(20);
+        let (session_stream, peer_stream) = tokio::io::duplex(8_192);
+        let secure_stream = TestSecureStream {
+            stream: session_stream,
+            identity: identity(&remote_hello),
+        };
+        let admission = TestAdmission {
+            hello: local_hello.clone(),
+        };
+        let (outbound_sender, mut outbound) = mpsc::channel(8);
+        let (events, _event_receiver) = mpsc::channel(16);
+        let (shutdown_sender, mut shutdown) = watch::channel(false);
+
+        // Two same-source PointerMove frames: the second folds into the first
+        // (deltas summed) when the session drains both into the queue before its
+        // first encode, yielding one coalesced move.
+        let source_host = local_hello.host_id;
+        let source_device = WireDeviceId([9; 16]);
+        let first_move = WireMessage::Input(InputEventV1 {
+            sequence: 1,
+            timestamp_ns: 1,
+            source_host,
+            source_device,
+            payload: WireInputPayloadV1::PointerMove { dx: 1.0, dy: 2.0 },
+        });
+        let mut second_move = first_move.clone();
+        if let WireMessage::Input(input) = &mut second_move {
+            input.sequence = 2;
+            input.timestamp_ns = 2;
+        }
+        outbound_sender.send(first_move).await.unwrap();
+        outbound_sender.send(second_move).await.unwrap();
+
+        let config = PersistentPeerConfig {
+            heartbeat: HeartbeatConfig {
+                interval: Duration::from_millis(10),
+                degraded_after: Duration::from_secs(1),
+                disconnect_after: Duration::from_secs(2),
+                maximum_outstanding_pings: 8,
+            },
+            ..test_config()
+        };
+        let observable = ObservableSessionStats::default();
+        let session = run_session_with_stats(
+            secure_stream,
+            &admission,
+            config,
+            &mut outbound,
+            &events,
+            &mut shutdown,
+            Some(&observable),
+        );
+        let peer = async move {
+            let (read, write) = tokio::io::split(peer_stream);
+            let mut reader = FrameReader::new_authenticated(read);
+            let mut writer = FrameWriter::new_authenticated(write);
+            let received_hello = match reader.read_message().await.unwrap() {
+                WireMessage::Hello(hello) => hello,
+                other => panic!("expected hello, got {other:?}"),
+            };
+            writer
+                .write_message(&WireMessage::Hello(remote_hello.clone()))
+                .await
+                .unwrap();
+            assert!(matches!(
+                reader.read_message().await.unwrap(),
+                WireMessage::Authenticate(_)
+            ));
+            writer
+                .write_message(&WireMessage::Authenticate(AuthenticateV1 {
+                    peer_id: remote_hello.peer_id,
+                    scheme: "test-channel-binding-v1".to_owned(),
+                    proof: received_hello.nonce.to_vec(),
+                }))
+                .await
+                .unwrap();
+
+            // Read the single coalesced move, then advance time past the
+            // heartbeat interval and yield so the session's heartbeat-tick arm
+            // fires and publishes the live snapshot BEFORE shutdown. (The select
+            // is biased with shutdown ahead of the heartbeat, so the publish
+            // must complete before the shutdown signal lands.)
+            let received = reader.read_message().await.unwrap();
+            assert!(matches!(received, WireMessage::Input(_)));
+            tokio::time::advance(Duration::from_millis(20)).await;
+            for _ in 0..8 {
+                tokio::task::yield_now().await;
+            }
+            shutdown_sender.send(true).unwrap();
+        };
+
+        let (result, ()) = tokio::join!(session, peer);
+        assert_eq!(result.unwrap(), SessionEnd::Shutdown);
+
+        // The coalesced move was published to the live observable.
+        let snapshot = observable.snapshot();
+        assert_eq!(
+            snapshot.coalesced_moves, 1,
+            "live observable must reflect the single coalesced move"
+        );
     }
 
     #[tokio::test]
@@ -3913,6 +4458,7 @@ mod tests {
                     partial_inbound_bytes: 0,
                     requires_input_reconciliation: true,
                 },
+                stats: SessionStats::default(),
             }
         );
         let mut byte = [0_u8; 1];
@@ -3929,8 +4475,8 @@ mod tests {
         let remote = hello(2);
         let admitted = AdmittedPeer {
             transport_identity: identity(&remote),
-            local_hello: local,
-            remote_hello: remote,
+            local_hello: Arc::new(local),
+            remote_hello: Arc::new(remote),
             selected_protocol_version: PROTOCOL_VERSION_V1,
             session_id: [0; 32],
         };
@@ -4080,8 +4626,8 @@ mod tests {
             state: GenerationBoundPeerEventState::Admission(pending),
             event: Some(PeerEvent::Admitted(AdmittedPeer {
                 transport_identity: identity(&remote),
-                local_hello: hello(1),
-                remote_hello: remote,
+                local_hello: Arc::new(hello(1)),
+                remote_hello: Arc::new(remote),
                 selected_protocol_version: PROTOCOL_VERSION_V1,
                 session_id: [0; 32],
             })),
@@ -4119,8 +4665,8 @@ mod tests {
             state: GenerationBoundPeerEventState::Admission(pending),
             event: Some(PeerEvent::Admitted(AdmittedPeer {
                 transport_identity: identity(&remote),
-                local_hello: hello(1),
-                remote_hello: remote,
+                local_hello: Arc::new(hello(1)),
+                remote_hello: Arc::new(remote),
                 selected_protocol_version: PROTOCOL_VERSION_V1,
                 session_id: [0; 32],
             })),
@@ -4197,6 +4743,7 @@ mod tests {
                     partial_inbound_bytes: 0,
                     requires_input_reconciliation: true,
                 },
+                stats: SessionStats::default(),
             }
         );
         assert_eq!(
@@ -4221,6 +4768,7 @@ mod tests {
             PeerEvent::Disconnected {
                 reason: DisconnectReason::ConnectFailed(std::io::ErrorKind::ConnectionRefused),
                 undelivered: UndeliveredTraffic::default(),
+                stats: SessionStats::default(),
             }
         );
 
@@ -4273,6 +4821,7 @@ mod tests {
             PeerEvent::Disconnected {
                 reason: DisconnectReason::AdmissionTimeout,
                 undelivered: UndeliveredTraffic::default(),
+                stats: SessionStats::default(),
             }
         );
         assert_eq!(

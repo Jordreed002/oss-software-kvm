@@ -2253,6 +2253,21 @@ impl<S, A> PreparedPeerSession<S, A> {
     pub const fn generation(&self) -> ConnectionGeneration {
         self.generation
     }
+
+    /// Returns a shared handle to this session's live outbound-queue diagnostics
+    /// (§23 coalescing, §35 drops), published on the heartbeat tick while the
+    /// session streams. Clone it before [`run`](Self::run) consumes the session
+    /// so the §31 diagnostics surface can read cumulative counters live.
+    ///
+    /// Only present when the daemon is built with the `diagnostics` feature.
+    #[cfg(feature = "diagnostics")]
+    #[must_use]
+    pub fn observable_stats(&self) -> std::sync::Arc<kvm_network::ObservableSessionStats>
+    where
+        A: kvm_network::SessionAdmission,
+    {
+        self.session.observable_stats()
+    }
 }
 
 /// Independently owned session runner and bounded composition channels.

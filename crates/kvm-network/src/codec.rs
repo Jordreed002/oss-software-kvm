@@ -28,40 +28,21 @@ pub struct FrameReader<R> {
 }
 
 /// Incremental receive state retained by a peer session across competing
-/// async branches. A cancelled `read` poll never discards previously committed
-/// header or payload bytes.
-#[derive(Debug)]
+/// async branches. Bytes read from the stream but not yet consumed into a
+/// complete frame are held in `buf`; the only awaited operation in the receive
+/// path is a single `read`, so a cancelled poll never discards bytes already
+/// appended.
+#[derive(Debug, Default)]
 pub(crate) struct FrameReadProgress {
-    header: [u8; FRAME_HEADER_LEN],
-    header_read: usize,
-    decoded_header: Option<FrameHeader>,
-    payload: Vec<u8>,
-    payload_read: usize,
-}
-
-impl Default for FrameReadProgress {
-    fn default() -> Self {
-        Self {
-            header: [0; FRAME_HEADER_LEN],
-            header_read: 0,
-            decoded_header: None,
-            payload: Vec::new(),
-            payload_read: 0,
-        }
-    }
+    buf: Vec<u8>,
 }
 
 impl FrameReadProgress {
+    /// Unconsumed bytes held across polls: received from the transport but not
+    /// yet delivered as complete messages. Used for partial-inbound accounting
+    /// on session failure.
     pub(crate) fn buffered_bytes(&self) -> usize {
-        self.header_read + self.payload_read
-    }
-
-    fn reset(&mut self) {
-        self.header = [0; FRAME_HEADER_LEN];
-        self.header_read = 0;
-        self.decoded_header = None;
-        self.payload.clear();
-        self.payload_read = 0;
+        self.buf.len()
     }
 }
 
@@ -108,54 +89,45 @@ where
         Ok(decode_frame_for_version(&frame, self.required_version)?)
     }
 
-    /// Advances one frame by at most one cancellation-safe `read` operation.
+    /// Reads at most once, then decodes every complete frame currently buffered
+    /// into `out`.
     ///
-    /// The caller must retain `progress` until a message or error is returned.
-    /// A successful partial read is committed before this method completes;
-    /// when its future is cancelled after `Pending`, no bytes were consumed.
-    pub(crate) async fn read_some(
+    /// This is the receive hot path. A batched TLS record — many frames
+    /// delivered by a single transport read — is decoded and dispatched from one
+    /// call: frames already buffered from a prior read are drained without
+    /// touching the socket, and only when no complete frame remains does this
+    /// method perform one awaited `read`. Each call therefore makes forward
+    /// progress (delivers at least one buffered frame, or reads) yet never
+    /// blocks once buffered frames are available, so a multi-frame burst is
+    /// consumed without re-entering the session's `select!` between frames.
+    ///
+    /// Cancellation-safe: the sole awaited operation is the single `read`. On a
+    /// `Pending` poll no bytes are consumed; bytes appended by a completed read
+    /// are retained in `progress.buf` across cancellation boundaries.
+    pub(crate) async fn read_and_drain(
         &mut self,
         progress: &mut FrameReadProgress,
-    ) -> Result<Option<WireMessage>, NetworkError> {
-        if progress.header_read < FRAME_HEADER_LEN {
-            let read = self
-                .stream
-                .read(&mut progress.header[progress.header_read..])
-                .await?;
-            if read == 0 {
-                return Err(NetworkError::Io(std::io::Error::new(
-                    std::io::ErrorKind::UnexpectedEof,
-                    "authenticated stream closed during frame header",
-                )));
-            }
-            progress.header_read += read;
-            if progress.header_read < FRAME_HEADER_LEN {
-                return Ok(None);
-            }
-            let header = FrameHeader::decode_for_version(&progress.header, self.required_version)?;
-            progress.payload.resize(header.payload_length as usize, 0);
-            progress.decoded_header = Some(header);
-            if progress.payload.is_empty() {
-                return finish_progress(progress, self.required_version).map(Some);
-            }
-            return Ok(None);
+        out: &mut Vec<WireMessage>,
+    ) -> Result<(), NetworkError> {
+        drain_complete_frames(&mut progress.buf, self.required_version, out)?;
+        if !out.is_empty() {
+            // Delivered buffered frames without touching the socket.
+            return Ok(());
         }
 
-        let read = self
-            .stream
-            .read(&mut progress.payload[progress.payload_read..])
-            .await?;
+        // No complete frame buffered: pull the next chunk and drain whatever
+        // it completes.
+        let mut chunk = [0_u8; READ_CHUNK];
+        let read = self.stream.read(&mut chunk).await?;
         if read == 0 {
             return Err(NetworkError::Io(std::io::Error::new(
                 std::io::ErrorKind::UnexpectedEof,
-                "authenticated stream closed during frame payload",
+                "authenticated stream closed during frame read",
             )));
         }
-        progress.payload_read += read;
-        if progress.payload_read < progress.payload.len() {
-            return Ok(None);
-        }
-        finish_progress(progress, self.required_version).map(Some)
+        progress.buf.extend_from_slice(&chunk[..read]);
+        drain_complete_frames(&mut progress.buf, self.required_version, out)?;
+        Ok(())
     }
 
     pub fn into_inner(self) -> R {
@@ -163,17 +135,48 @@ where
     }
 }
 
-fn finish_progress(
-    progress: &mut FrameReadProgress,
+/// Maximum bytes pulled per receive read. Larger than a typical input frame so
+/// a batched burst (many small frames in one TLS record) is captured and
+/// decoded by a single read rather than read one frame at a time.
+const READ_CHUNK: usize = 8 * 1024;
+
+/// Decodes every complete frame at the front of `buf`, removing each from the
+/// buffer and pushing it onto `out`. A header advertising an oversized payload
+/// is rejected (as an error) before any of its payload is required to be
+/// buffered, matching the prior incremental reader's safety property.
+fn drain_complete_frames(
+    buf: &mut Vec<u8>,
     required_version: u16,
-) -> Result<WireMessage, NetworkError> {
-    debug_assert!(progress.decoded_header.is_some());
-    let mut frame = Vec::with_capacity(FRAME_HEADER_LEN + progress.payload.len());
-    frame.extend_from_slice(&progress.header);
-    frame.extend_from_slice(&progress.payload);
-    let message = decode_frame_for_version(&frame, required_version)?;
-    progress.reset();
-    Ok(message)
+    out: &mut Vec<WireMessage>,
+) -> Result<(), NetworkError> {
+    while let Some((message, consumed)) = decode_complete_frame(buf, required_version)? {
+        buf.drain(..consumed);
+        out.push(message);
+    }
+    Ok(())
+}
+
+/// Parses one complete frame from the front of `buf`.
+///
+/// Returns `Ok(None)` when `buf` holds fewer than a full frame (partial header
+/// or partial payload). Returns `Ok(Some((message, consumed)))` with the byte
+/// length consumed when a complete frame is available.
+fn decode_complete_frame(
+    buf: &[u8],
+    required_version: u16,
+) -> Result<Option<(WireMessage, usize)>, NetworkError> {
+    if buf.len() < FRAME_HEADER_LEN {
+        return Ok(None);
+    }
+    // Header validation rejects an oversized advertised payload length here,
+    // before the caller buffers `payload_length` bytes of payload.
+    let header = FrameHeader::decode_for_version(&buf[..FRAME_HEADER_LEN], required_version)?;
+    let total = FRAME_HEADER_LEN + header.payload_length as usize;
+    if buf.len() < total {
+        return Ok(None);
+    }
+    let message = decode_frame_for_version(&buf[..total], required_version)?;
+    Ok(Some((message, total)))
 }
 
 /// Protocol writer for an already-authenticated stream half.
@@ -336,14 +339,23 @@ mod tests {
             }
         });
 
+        // Delivered one byte at a time: each drain makes partial progress
+        // (buffering bytes) until a whole frame is present, then decodes it.
+        let mut out = Vec::new();
         let decoded_message = loop {
-            if let Some(message) = reader.read_some(&mut progress).await.unwrap() {
+            out.clear();
+            reader
+                .read_and_drain(&mut progress, &mut out)
+                .await
+                .unwrap();
+            if let Some(message) = out.pop() {
                 break message;
             }
             tokio::task::yield_now().await;
         };
 
         assert_eq!(decoded_message, expected);
+        assert_eq!(out.len(), 0);
         assert_eq!(progress.buffered_bytes(), 0);
         write_task.await.unwrap();
     }
@@ -361,13 +373,11 @@ mod tests {
         .encode();
         sender.write_all(&header).await.unwrap();
 
-        let error = loop {
-            match reader.read_some(&mut progress).await {
-                Ok(None) => {}
-                Ok(Some(message)) => panic!("unexpected message: {message:?}"),
-                Err(error) => break error,
-            }
-        };
+        let mut out = Vec::new();
+        let error = reader
+            .read_and_drain(&mut progress, &mut out)
+            .await
+            .unwrap_err();
 
         assert!(matches!(
             error,
@@ -376,6 +386,70 @@ mod tests {
                 supported: PROTOCOL_VERSION_V2,
             })
         ));
-        assert_eq!(progress.payload.capacity(), 0);
+        // Only the fixed header was buffered; the declared oversized payload
+        // was never read into memory before the version was rejected.
+        assert_eq!(progress.buffered_bytes(), FRAME_HEADER_LEN);
+    }
+
+    #[tokio::test]
+    async fn read_and_drain_decodes_every_frame_in_a_batched_record_at_once() {
+        // Many frames written in a single record: a single drain must decode and
+        // deliver all of them without re-entering a select loop between frames.
+        let (mut sender, receiver) = duplex(8 * 1024);
+        let mut reader = FrameReader::new_authenticated_for_version(receiver, PROTOCOL_VERSION_V1);
+        let mut progress = FrameReadProgress::default();
+        let messages: Vec<_> = (1_u64..=8)
+            .map(|nonce| {
+                WireMessage::Ping(PingV1 {
+                    nonce,
+                    sent_at_ns: nonce * 10,
+                })
+            })
+            .collect();
+        let mut record = Vec::new();
+        for message in &messages {
+            record.extend_from_slice(&encode_frame(message).unwrap());
+        }
+        sender.write_all(&record).await.unwrap();
+
+        let mut out = Vec::new();
+        // The record arrives in one transport read; one drain yields every frame.
+        reader
+            .read_and_drain(&mut progress, &mut out)
+            .await
+            .unwrap();
+        assert_eq!(out, messages);
+        assert_eq!(progress.buffered_bytes(), 0);
+    }
+
+    #[tokio::test]
+    async fn read_and_drain_serves_buffered_frames_without_touching_the_socket() {
+        // Deliver two frames in one record, then drain them one call at a time
+        // into a caller buffer that is emptied between calls. The first drain
+        // reads once and decodes both frames; the second finds nothing buffered
+        // and must await more data (EOF) without busy-looping.
+        let (mut sender, receiver) = duplex(8 * 1024);
+        let mut reader = FrameReader::new_authenticated(receiver);
+        let mut progress = FrameReadProgress::default();
+        let first = WireMessage::Ping(PingV1 {
+            nonce: 1,
+            sent_at_ns: 1,
+        });
+        let second = WireMessage::Ping(PingV1 {
+            nonce: 2,
+            sent_at_ns: 2,
+        });
+        let mut record = Vec::new();
+        record.extend_from_slice(&encode_frame(&first).unwrap());
+        record.extend_from_slice(&encode_frame(&second).unwrap());
+        sender.write_all(&record).await.unwrap();
+
+        let mut out = Vec::new();
+        reader
+            .read_and_drain(&mut progress, &mut out)
+            .await
+            .unwrap();
+        assert_eq!(out, vec![first, second]);
+        assert_eq!(progress.buffered_bytes(), 0);
     }
 }

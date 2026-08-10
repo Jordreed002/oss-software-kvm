@@ -46,6 +46,10 @@ pub struct DiagnosticsSnapshot {
     /// §35 "dropped packets": cumulative outbound-queue backpressure rejections,
     /// per traffic lane.
     pub dropped_packets: kvm_network::DropCounters,
+    /// §23 throughput signal: cumulative same-source `PointerMove` frames folded
+    /// into a preceding frame on the outbound queue. Pairs with `event_rate` to
+    /// show how much input burst pressure coalescing absorbed at this peer.
+    pub coalesced_moves: u64,
 }
 
 impl DiagnosticsSnapshot {
@@ -65,6 +69,7 @@ impl DiagnosticsSnapshot {
         network_send_latency: Option<kvm_input::LatencyStats>,
         injection_latency: Option<kvm_input::LatencyStats>,
         dropped_packets: kvm_network::DropCounters,
+        coalesced_moves: u64,
     ) -> Self {
         Self {
             event_rate,
@@ -73,6 +78,7 @@ impl DiagnosticsSnapshot {
             network_send_latency,
             injection_latency,
             dropped_packets,
+            coalesced_moves,
         }
     }
 }
@@ -118,6 +124,7 @@ mod tests {
             Some(sample_latency()),
             Some(sample_latency()),
             drops,
+            12,
         );
         assert_eq!(snapshot.event_rate.window_events, 42);
         assert_eq!(snapshot.injected_events, 7);
@@ -145,6 +152,7 @@ mod tests {
         assert_eq!(snapshot.dropped_packets.input, 2);
         assert_eq!(snapshot.dropped_packets.control, 1);
         assert_eq!(snapshot.dropped_packets.total(), 3);
+        assert_eq!(snapshot.coalesced_moves, 12);
     }
 
     #[test]
@@ -158,6 +166,7 @@ mod tests {
             None,
             None,
             DropCounters::default(),
+            0,
         );
         assert!(snapshot.source_latency.is_none());
         assert!(snapshot.network_send_latency.is_none());
@@ -178,6 +187,7 @@ mod tests {
             None,
             Some(sample_latency()),
             drops,
+            250,
         );
 
         let json = serde_json::to_string(&snapshot).expect("serialize");
@@ -190,6 +200,7 @@ mod tests {
         assert!(json.contains("\"network_send_latency\""));
         assert!(json.contains("\"injection_latency\""));
         assert!(json.contains("\"dropped_packets\""));
+        assert!(json.contains("\"coalesced_moves\":250"));
         // A None latency serializes to null, not omitted.
         assert!(json.contains("\"network_send_latency\":null"));
     }

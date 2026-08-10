@@ -45,9 +45,8 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
     MOUSEEVENTF_XDOWN, MOUSEEVENTF_XUP, MOUSEINPUT, VIRTUAL_KEY,
 };
 use windows::Win32::UI::Input::{
-    GetCurrentInputMessageSource, GetRawInputData, GetRawInputDeviceInfoW, GetRawInputDeviceList,
-    RegisterRawInputDevices, HRAWINPUT, IMO_HARDWARE, IMO_INJECTED, IMO_SYSTEM,
-    INPUT_MESSAGE_SOURCE, RAWINPUT, RAWINPUTDEVICE, RAWINPUTDEVICELIST, RAWKEYBOARD, RAWMOUSE,
+    GetRawInputData, GetRawInputDeviceInfoW, GetRawInputDeviceList, RegisterRawInputDevices,
+    HRAWINPUT, RAWINPUT, RAWINPUTDEVICE, RAWINPUTDEVICELIST, RAWKEYBOARD, RAWMOUSE,
     RIDEV_DEVNOTIFY, RIDEV_INPUTSINK, RIDEV_REMOVE, RIDI_DEVICEINFO, RIDI_DEVICENAME,
     RID_DEVICE_INFO, RID_INPUT, RIM_TYPEKEYBOARD, RIM_TYPEMOUSE,
 };
@@ -67,8 +66,8 @@ use crate::capture::{
     classify_low_level, classify_raw_input, hooks_can_release_callback_state, is_state_transition,
     translate_keyboard, translate_low_level_keyboard, translate_mouse,
     whole_host_keyboard_device_id, whole_host_pointer_device_id, whole_host_should_suppress,
-    MessageOrigin, RawKeyboardPacket, RawMousePacket, LOW_LEVEL_KEY_EXTENDED,
-    LOW_LEVEL_KEY_INJECTED, LOW_LEVEL_KEY_UP, LOW_LEVEL_MOUSE_INJECTED,
+    RawKeyboardPacket, RawMousePacket, LOW_LEVEL_KEY_EXTENDED, LOW_LEVEL_KEY_INJECTED,
+    LOW_LEVEL_KEY_UP, LOW_LEVEL_MOUSE_INJECTED,
 };
 use crate::identity::{container_scoped_raw_input_identity, usb_ids_from_device_path};
 use crate::mapping::{
@@ -2031,15 +2030,20 @@ fn raw_input_message_loop(
         }
 
         if message.message == WM_INPUT {
-            let origin = current_message_origin();
+            // Stamp the capture time as early as possible — immediately after
+            // `GetMessageW` dequeued the message and before the two
+            // `GetRawInputData` syscalls inside `read_raw_input` — so the §36
+            // source-latency metric accounts for that work instead of
+            // systematically understating it. Same `started.elapsed()` clock as
+            // the previous (later) sample; just measured sooner.
+            let timestamp_ns = u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX);
             let raw_result = read_raw_input(HRAWINPUT(message.lParam.0 as *mut c_void));
             let dispatch_result = if let Ok(raw) = raw_result {
                 dispatch_raw_input(
                     &raw,
-                    origin,
                     host_id,
                     &mut devices,
-                    &started,
+                    timestamp_ns,
                     &mut sequence,
                     sender,
                     counters,
@@ -2081,24 +2085,20 @@ fn raw_input_message_loop(
 #[allow(clippy::too_many_arguments)]
 fn dispatch_raw_input(
     raw: &RAWINPUT,
-    origin: MessageOrigin,
     host_id: HostId,
     devices: &mut HashMap<usize, kvm_types::DeviceId>,
-    started: &Instant,
+    timestamp_ns: u64,
     sequence: &mut u64,
     sender: &SyncSender<CapturedInput>,
     counters: &CaptureCounters,
 ) -> Result<(), WindowsBackendError> {
     let source_device = capture_device_id(raw.header.hDevice, raw.header.dwType, devices);
-    let has_device_handle = !raw.header.hDevice.0.is_null();
-    let timestamp_ns = u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX);
 
     if raw.header.dwType == RIM_TYPEKEYBOARD.0 {
         counters.keyboard_packets.fetch_add(1, Ordering::Relaxed);
         // SAFETY: `dwType` selects the keyboard arm of the RAWINPUT union.
         let keyboard = unsafe { raw.data.keyboard };
-        let classification =
-            classify_raw_input(keyboard.ExtraInformation, origin, has_device_handle);
+        let classification = classify_raw_input(keyboard.ExtraInformation);
         let Some(payload) = translate_keyboard(RawKeyboardPacket {
             scan_code: keyboard.MakeCode,
             flags: keyboard.Flags,
@@ -2129,8 +2129,7 @@ fn dispatch_raw_input(
         // SAFETY: Raw Input documents the button flag/data pair as the active
         // nested union view for ordinary mouse packets.
         let buttons = unsafe { mouse.Anonymous.Anonymous };
-        let classification =
-            classify_raw_input(mouse.ulExtraInformation, origin, has_device_handle);
+        let classification = classify_raw_input(mouse.ulExtraInformation);
         let payloads = translate_mouse(RawMousePacket {
             state_flags: mouse.usFlags.0,
             button_flags: buttons.usButtonFlags,
@@ -2199,24 +2198,6 @@ fn enqueue_captured(
     }
 }
 
-fn current_message_origin() -> MessageOrigin {
-    let mut source = INPUT_MESSAGE_SOURCE::default();
-    // SAFETY: `source` is writable and this is called immediately after
-    // `GetMessageW` returned the current WM_INPUT message on the same thread.
-    if unsafe { GetCurrentInputMessageSource(&raw mut source) }.is_err() {
-        return MessageOrigin::Unavailable;
-    }
-    if source.originId == IMO_HARDWARE {
-        MessageOrigin::Hardware
-    } else if source.originId == IMO_INJECTED {
-        MessageOrigin::Injected
-    } else if source.originId == IMO_SYSTEM {
-        MessageOrigin::System
-    } else {
-        MessageOrigin::Unavailable
-    }
-}
-
 fn read_raw_input(handle: HRAWINPUT) -> Result<RAWINPUT, WindowsBackendError> {
     let native_header_size = size_of::<windows::Win32::UI::Input::RAWINPUTHEADER>();
     let header_size = u32::try_from(native_header_size).expect("RAWINPUTHEADER always fits in u32");
@@ -2234,19 +2215,32 @@ fn read_raw_input(handle: HRAWINPUT) -> Result<RAWINPUT, WindowsBackendError> {
         ));
     }
 
-    let unit_size = size_of::<RAWINPUT>();
-    let units = (byte_count as usize).div_ceil(unit_size);
-    // Keyboard packets can be smaller than the largest RAWINPUT union member.
-    // Zero-initialize the aligned tail so returning the fixed Rust binding is
-    // sound after Windows writes only the active packet variant.
-    let mut storage = (0..units).map(|_| RAWINPUT::default()).collect::<Vec<_>>();
-    // SAFETY: `storage` is correctly aligned and spans at least `byte_count`
-    // writable bytes.
+    // Only Generic Desktop Mouse (page 1, usage 2) and Keyboard (page 1,
+    // usage 6) are registered for capture (see `register_raw_input`), so every
+    // `WM_INPUT` on this thread is a single keyboard or mouse packet whose
+    // total size fits inside one `RAWINPUT` (the Rust binding is sized to the
+    // largest union arm; both registered types are `<=` that arm — pinned by
+    // `registered_packet_types_fit_in_a_single_rawinput`). Refuse anything
+    // larger instead of heap-allocating: such a packet could only come from an
+    // unregistered device type and would be dropped as untranslated regardless.
+    if (byte_count as usize) > size_of::<RAWINPUT>() {
+        return Err(WindowsBackendError::CaptureRuntime(
+            "Raw Input packet exceeded a single RAWINPUT; only keyboard/mouse are registered"
+                .into(),
+        ));
+    }
+
+    // Zero-initialize the whole structure so the trailing bytes of a packet
+    // smaller than the largest union arm (e.g. keyboard) are valid to read back
+    // as the Rust binding after Windows writes only the active variant.
+    let mut storage = RAWINPUT::default();
+    // SAFETY: `storage` is correctly aligned and, by the size check above,
+    // spans at least `byte_count` writable bytes.
     let returned = unsafe {
         GetRawInputData(
             handle,
             RID_INPUT,
-            Some(storage.as_mut_ptr().cast::<c_void>()),
+            Some((&raw mut storage).cast::<c_void>()),
             &raw mut byte_count,
             header_size,
         )
@@ -2259,17 +2253,13 @@ fn read_raw_input(handle: HRAWINPUT) -> Result<RAWINPUT, WindowsBackendError> {
             "GetRawInputData returned a truncated Raw Input header".into(),
         ));
     }
-    let raw = storage
-        .into_iter()
-        .next()
-        .expect("a non-empty Raw Input packet allocates at least one unit");
-    let required = minimum_raw_input_size(raw.header.dwType);
-    if (returned as usize) < required || (raw.header.dwSize as usize) < required {
+    let required = minimum_raw_input_size(storage.header.dwType);
+    if (returned as usize) < required || (storage.header.dwSize as usize) < required {
         return Err(WindowsBackendError::CaptureRuntime(
             "GetRawInputData returned a truncated typed packet".into(),
         ));
     }
-    Ok(raw)
+    Ok(storage)
 }
 
 fn minimum_raw_input_size(device_type: u32) -> usize {
@@ -2678,10 +2668,82 @@ mod tests {
     }
 
     #[test]
+    fn registered_packet_types_fit_in_a_single_rawinput() {
+        // `read_raw_input` decodes each `WM_INPUT` into a single stack
+        // `RAWINPUT` rather than a heap `Vec`. That is sound only because the
+        // capture registration (see `register_raw_input`) is limited to
+        // keyboard and mouse, both of whose packets fit inside one `RAWINPUT`.
+        // Pin that invariant here: if a registered type ever outgrew the
+        // binding's largest union arm, the stack decode would truncate it and
+        // the oversize guard would spuriously reject every packet.
+        let keyboard = minimum_raw_input_size(RIM_TYPEKEYBOARD.0);
+        let mouse = minimum_raw_input_size(RIM_TYPEMOUSE.0);
+        let capacity = size_of::<RAWINPUT>();
+
+        assert!(
+            keyboard <= capacity,
+            "keyboard packet ({keyboard}) must fit in one RAWINPUT ({capacity})"
+        );
+        assert!(
+            mouse <= capacity,
+            "mouse packet ({mouse}) must fit in one RAWINPUT ({capacity})"
+        );
+    }
+
+    #[test]
     fn physical_pixels_convert_to_logical_size_at_recommended_scale() {
         let scale = 144.0 / 96.0;
 
         assert!((3840.0 / scale - 2560.0_f64).abs() < f64::EPSILON);
         assert!((2160.0 / scale - 1440.0_f64).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn dispatch_raw_input_stamps_the_caller_supplied_timestamp() {
+        // Guards the latency-honesty change (iter 14): `dispatch_raw_input` must
+        // stamp the event with the timestamp handed to it — sampled in the
+        // caller before the two `GetRawInputData` syscalls in `read_raw_input`
+        // — rather than recomputing one from a process-clock `Instant`. If this
+        // regresses, the §36 source-latency metric silently understates again.
+        let mut raw = RAWINPUT::default();
+        raw.header.dwType = RIM_TYPEMOUSE.0;
+        raw.header.dwSize =
+            u32::try_from(minimum_raw_input_size(RIM_TYPEMOUSE.0)).expect("mouse size fits u32");
+        // The mouse arm of the RAWINPUT union carries the button flags here.
+        raw.data.mouse.Anonymous.Anonymous.usButtonFlags = crate::capture::RAW_MOUSE_LEFT_DOWN;
+
+        let (sender, receiver) = mpsc::sync_channel::<CapturedInput>(16);
+        let counters = CaptureCounters {
+            captured_events: AtomicU64::new(0),
+            dropped_events: AtomicU64::new(0),
+            untranslated_packets: AtomicU64::new(0),
+            keyboard_packets: AtomicU64::new(0),
+            mouse_packets: AtomicU64::new(0),
+            untranslated_keyboard_packets: AtomicU64::new(0),
+            untranslated_mouse_packets: AtomicU64::new(0),
+            callback_panics: AtomicU64::new(0),
+            suppression_requests_ignored: AtomicU64::new(0),
+            suppressed_events: AtomicU64::new(0),
+            capture_discontinuities: AtomicU64::new(0),
+        };
+        let mut sequence = 0_u64;
+        let mut devices = HashMap::new();
+        let expected_timestamp = 7_000_000_000_u64;
+
+        dispatch_raw_input(
+            &raw,
+            HostId::from_bytes([2; 16]),
+            &mut devices,
+            expected_timestamp,
+            &mut sequence,
+            &sender,
+            &counters,
+        )
+        .expect("left-button-down dispatch enqueues an event");
+
+        let captured = receiver
+            .recv()
+            .expect("a left-button-down event is enqueued on the channel");
+        assert_eq!(captured.event.timestamp_ns, expected_timestamp);
     }
 }
