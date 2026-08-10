@@ -32,8 +32,14 @@ mod tests {
     #[test]
     fn serde_repr_is_stable_snake_case() {
         // This is the on-disk config format; it must not change.
-        assert_eq!(serde_json::to_string(&KeyboardMode::Physical).unwrap(), "\"physical\"");
-        assert_eq!(serde_json::to_string(&KeyboardMode::Semantic).unwrap(), "\"semantic\"");
+        assert_eq!(
+            serde_json::to_string(&KeyboardMode::Physical).unwrap(),
+            "\"physical\""
+        );
+        assert_eq!(
+            serde_json::to_string(&KeyboardMode::Semantic).unwrap(),
+            "\"semantic\""
+        );
         assert_eq!(
             serde_json::from_str::<KeyboardMode>("\"semantic\"").unwrap(),
             KeyboardMode::Semantic

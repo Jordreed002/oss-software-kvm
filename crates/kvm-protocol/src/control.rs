@@ -169,12 +169,22 @@ pub struct ControlDisplaySummary {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum ControlResponse {
     Status(ControlStatus),
-    Peers { peers: Vec<ControlPeerStatus> },
-    Devices { devices: Vec<ControlDeviceSummary> },
-    Displays { displays: Vec<ControlDisplaySummary> },
-    Topology { edges: Vec<ControlTopologyEdge> },
+    Peers {
+        peers: Vec<ControlPeerStatus>,
+    },
+    Devices {
+        devices: Vec<ControlDeviceSummary>,
+    },
+    Displays {
+        displays: Vec<ControlDisplaySummary>,
+    },
+    Topology {
+        edges: Vec<ControlTopologyEdge>,
+    },
     Acknowledged,
-    Error { error: ControlError },
+    Error {
+        error: ControlError,
+    },
 }
 
 // --- Events (spec §31 events) ----------------------------------------------
@@ -243,13 +253,12 @@ pub fn decode_control(bytes: &[u8]) -> Result<ControlFrame, ControlCodecError> {
     if bytes.len() > MAX_CONTROL_FRAME_BYTES {
         return Err(ControlCodecError::Oversized);
     }
-    let (version, payload) = bytes
-        .split_first()
-        .ok_or(ControlCodecError::Malformed)?;
+    let (version, payload) = bytes.split_first().ok_or(ControlCodecError::Malformed)?;
     if *version != CONTROL_PROTOCOL_VERSION {
         return Err(ControlCodecError::UnsupportedVersion);
     }
-    let frame: ControlFrame = postcard::from_bytes(payload).map_err(|_| ControlCodecError::Malformed)?;
+    let frame: ControlFrame =
+        postcard::from_bytes(payload).map_err(|_| ControlCodecError::Malformed)?;
     frame.validate()?;
     Ok(frame)
 }
@@ -259,13 +268,12 @@ impl ControlFrame {
     fn validate(&self) -> Result<(), ControlCodecError> {
         let snapshot_ok = |len: usize| len <= MAX_CONTROL_SNAPSHOT_ITEMS;
         let name_ok = |name: &str| name.len() <= MAX_CONTROL_NAME_BYTES;
-        let require = |cond: bool| {
-            cond.then_some(())
-                .ok_or(ControlCodecError::Invalid)
-        };
+        let require = |cond: bool| cond.then_some(()).ok_or(ControlCodecError::Invalid);
         match self {
             Self::Request(ControlRequest::SetTopology { edges })
-            | Self::Response(ControlResponse::Topology { edges }) => require(snapshot_ok(edges.len())),
+            | Self::Response(ControlResponse::Topology { edges }) => {
+                require(snapshot_ok(edges.len()))
+            }
             Self::Response(ControlResponse::Peers { peers }) => {
                 require(snapshot_ok(peers.len()) && peers.iter().all(|p| name_ok(&p.host_name)))
             }
@@ -500,7 +508,9 @@ mod tests {
             ControlEvent::PeerChanged,
             ControlEvent::DeviceChanged,
             ControlEvent::DisplayChanged,
-            ControlEvent::ActiveHostChanged { active_host: host(1) },
+            ControlEvent::ActiveHostChanged {
+                active_host: host(1),
+            },
             ControlEvent::ActiveDisplayChanged {
                 active_display: display(2),
             },
@@ -542,7 +552,10 @@ mod tests {
         // Encode succeeds (under the frame byte cap because items are small);
         // decode rejects it via validation.
         let bytes = encode_control(&frame).unwrap();
-        assert_eq!(decode_control(&bytes).unwrap_err(), ControlCodecError::Invalid);
+        assert_eq!(
+            decode_control(&bytes).unwrap_err(),
+            ControlCodecError::Invalid
+        );
     }
 
     #[test]
@@ -564,22 +577,21 @@ mod tests {
             .unwrap();
 
         let received = daemon.try_recv().unwrap().unwrap();
-        assert_eq!(
-            received,
-            ControlFrame::Request(ControlRequest::GetStatus)
-        );
+        assert_eq!(received, ControlFrame::Request(ControlRequest::GetStatus));
 
         // Daemon -> panel: the response, through the same codec.
         daemon
-            .send(ControlFrame::Response(ControlResponse::Status(ControlStatus {
-                active_host: host(1),
-                active_display: display(2),
-                kvm_enabled: true,
-                clipboard_enabled: true,
-                protocol_version: 2,
-                round_trip_time_ms: Some(4),
-                peer_state: ControlPeerState::Connected,
-            })))
+            .send(ControlFrame::Response(ControlResponse::Status(
+                ControlStatus {
+                    active_host: host(1),
+                    active_display: display(2),
+                    kvm_enabled: true,
+                    clipboard_enabled: true,
+                    protocol_version: 2,
+                    round_trip_time_ms: Some(4),
+                    peer_state: ControlPeerState::Connected,
+                },
+            )))
             .unwrap();
         let response = panel.try_recv().unwrap().unwrap();
         let ControlFrame::Response(ControlResponse::Status(status)) = response else {

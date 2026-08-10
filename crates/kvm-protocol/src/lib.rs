@@ -10,6 +10,7 @@ mod frame;
 mod message;
 mod wire;
 
+pub use control::*;
 pub use error::{ProtocolError, ValidationError};
 pub use frame::{
     decode_frame, decode_frame_for_version, encode_frame, encode_frame_for_version,
@@ -19,4 +20,3 @@ pub use frame::{
 };
 pub use message::{MessageType, WireMessage};
 pub use wire::*;
-pub use control::*;

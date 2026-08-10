@@ -139,7 +139,10 @@ impl EventRateMeter {
     /// Panics when the configuration fails [`EventRateConfig::validate`].
     #[must_use]
     pub fn new(config: EventRateConfig) -> Self {
-        assert!(config.validate().is_ok(), "invalid event-rate configuration");
+        assert!(
+            config.validate().is_ok(),
+            "invalid event-rate configuration"
+        );
         Self::new_validated(config)
     }
 
@@ -336,8 +339,8 @@ mod tests {
         meter.record(0); // epoch 0 → idx 0, count 1
         meter.record(0); // epoch 0 → idx 0, count 2
         meter.record(200 * MS); // epoch 2 → idx 0 resets to count 1
-        // Now: idx0(epoch2)=1, idx1 empty. Window at 200ms (epoch2) spans
-        // epochs {2,1}; epoch 0 is overwritten, so only the epoch-2 count shows.
+                                // Now: idx0(epoch2)=1, idx1 empty. Window at 200ms (epoch2) spans
+                                // epochs {2,1}; epoch 0 is overwritten, so only the epoch-2 count shows.
         assert_eq!(meter.events_in_window(200 * MS), 1);
         assert_eq!(meter.total_events(), 3);
     }

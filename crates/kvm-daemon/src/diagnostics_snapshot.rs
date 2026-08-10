@@ -122,7 +122,10 @@ mod tests {
         assert_eq!(snapshot.event_rate.window_events, 42);
         assert_eq!(snapshot.injected_events, 7);
         assert_eq!(
-            snapshot.source_latency.expect("source latency present").max_ns,
+            snapshot
+                .source_latency
+                .expect("source latency present")
+                .max_ns,
             4_000_000
         );
         assert_eq!(
@@ -133,7 +136,10 @@ mod tests {
             4_000_000
         );
         assert_eq!(
-            snapshot.injection_latency.expect("injection latency present").max_ns,
+            snapshot
+                .injection_latency
+                .expect("injection latency present")
+                .max_ns,
             4_000_000
         );
         assert_eq!(snapshot.dropped_packets.input, 2);

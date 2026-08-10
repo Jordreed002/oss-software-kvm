@@ -338,10 +338,15 @@ mod tests {
             .with_capture(1_000)
             .with_injection_request(1_430);
         assert_eq!(stamps.capture_to_injection_ns(), Some(430));
-        assert_eq!(stamps.span_ns(LatencyStage::Capture, LatencyStage::RoutingDecision), None);
+        assert_eq!(
+            stamps.span_ns(LatencyStage::Capture, LatencyStage::RoutingDecision),
+            None
+        );
 
         // Non-monotonic timestamps saturate to zero rather than wrapping.
-        let inverted = LatencyStamps::new().with_capture(2_000).with_injection_request(1_000);
+        let inverted = LatencyStamps::new()
+            .with_capture(2_000)
+            .with_injection_request(1_000);
         assert_eq!(inverted.capture_to_injection_ns(), Some(0));
     }
 
@@ -353,13 +358,22 @@ mod tests {
             .with_network_send(1_150)
             .with_network_receive(1_400)
             .with_injection_request(1_430);
-        assert_eq!(stamps.span_ns(LatencyStage::NetworkSend, LatencyStage::NetworkReceive), Some(250));
         assert_eq!(
-            stamps.span_ns(LatencyStage::RoutingDecision, LatencyStage::InjectionRequest),
+            stamps.span_ns(LatencyStage::NetworkSend, LatencyStage::NetworkReceive),
+            Some(250)
+        );
+        assert_eq!(
+            stamps.span_ns(
+                LatencyStage::RoutingDecision,
+                LatencyStage::InjectionRequest
+            ),
             Some(330)
         );
         // Reverse direction saturates to zero.
-        assert_eq!(stamps.span_ns(LatencyStage::InjectionRequest, LatencyStage::Capture), Some(0));
+        assert_eq!(
+            stamps.span_ns(LatencyStage::InjectionRequest, LatencyStage::Capture),
+            Some(0)
+        );
     }
 
     #[test]
@@ -405,7 +419,7 @@ mod tests {
         assert_eq!(stats.min_ns, 1);
         assert_eq!(stats.max_ns, 9);
         assert_eq!(stats.mean_ns, 5); // (7+1+3+9+5)/5 = 25/5
-        // Sorted: [1,3,5,7,9]. rank50 = ceil(0.5*5)=3 -> idx2 -> 5; rank95 = ceil(4.75)=5 -> idx4 -> 9.
+                                      // Sorted: [1,3,5,7,9]. rank50 = ceil(0.5*5)=3 -> idx2 -> 5; rank95 = ceil(4.75)=5 -> idx4 -> 9.
         assert_eq!(stats.p50_ns, 5);
         assert_eq!(stats.p95_ns, 9);
     }
@@ -425,7 +439,11 @@ mod tests {
         history.push_stamps(LatencyStamps::new().with_capture(100));
         assert!(history.is_empty());
         // Complete span -> recorded.
-        history.push_stamps(LatencyStamps::new().with_capture(100).with_injection_request(160));
+        history.push_stamps(
+            LatencyStamps::new()
+                .with_capture(100)
+                .with_injection_request(160),
+        );
         assert_eq!(history.len(), 1);
         assert_eq!(history.stats().unwrap().max_ns, 60);
     }
@@ -489,6 +507,9 @@ mod tests {
         assert_eq!(stamps, back);
         // The end-to-end metric survives the round trip.
         assert_eq!(back.capture_to_injection_ns(), Some(4_080));
-        assert_eq!(back.span_ns(LatencyStage::Capture, LatencyStage::NetworkSend), Some(100));
+        assert_eq!(
+            back.span_ns(LatencyStage::Capture, LatencyStage::NetworkSend),
+            Some(100)
+        );
     }
 }
