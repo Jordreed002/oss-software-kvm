@@ -52,14 +52,15 @@ use windows::Win32::UI::Input::{
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     CallNextHookEx, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetCursorPos,
-    GetMessageW, GetWindowThreadProcessId, PeekMessageW, PostMessageW, PostThreadMessageW,
-    SetCursorPos, SetWindowsHookExW, ShowCursor, TranslateMessage, UnhookWindowsHookEx, HHOOK,
-    HWND_MESSAGE, KBDLLHOOKSTRUCT, LLKHF_EXTENDED, LLKHF_INJECTED, LLKHF_UP, MONITORINFOF_PRIMARY,
-    MSG, MSLLHOOKSTRUCT, PM_NOREMOVE, WH_KEYBOARD_LL, WH_MOUSE_LL, WINDOW_EX_STYLE, WINDOW_STYLE,
-    WM_APP, WM_INPUT, WM_INPUT_DEVICE_CHANGE, WM_KEYDOWN, WM_KEYUP, WM_LBUTTONDBLCLK,
-    WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDBLCLK, WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEHWHEEL,
-    WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_QUIT, WM_RBUTTONDBLCLK, WM_RBUTTONDOWN, WM_RBUTTONUP,
-    WM_SYSKEYDOWN, WM_SYSKEYUP, WM_XBUTTONDBLCLK, WM_XBUTTONDOWN, WM_XBUTTONUP,
+    GetMessageW, GetSystemMetrics, GetWindowThreadProcessId, PeekMessageW, PostMessageW,
+    PostThreadMessageW, SetCursorPos, SetWindowsHookExW, ShowCursor, TranslateMessage,
+    UnhookWindowsHookEx, HHOOK, HWND_MESSAGE, KBDLLHOOKSTRUCT, LLKHF_EXTENDED, LLKHF_INJECTED,
+    LLKHF_UP, MONITORINFOF_PRIMARY, MSG, MSLLHOOKSTRUCT, PM_NOREMOVE, SM_CXVIRTUALSCREEN,
+    SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN, WH_KEYBOARD_LL, WH_MOUSE_LL,
+    WINDOW_EX_STYLE, WINDOW_STYLE, WM_APP, WM_INPUT, WM_INPUT_DEVICE_CHANGE, WM_KEYDOWN, WM_KEYUP,
+    WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDBLCLK, WM_MBUTTONDOWN, WM_MBUTTONUP,
+    WM_MOUSEHWHEEL, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_QUIT, WM_RBUTTONDBLCLK, WM_RBUTTONDOWN,
+    WM_RBUTTONUP, WM_SYSKEYDOWN, WM_SYSKEYUP, WM_XBUTTONDBLCLK, WM_XBUTTONDOWN, WM_XBUTTONUP,
 };
 
 use crate::capture::{
@@ -220,6 +221,8 @@ struct WholeHostCallbackState {
     pointer_initialized: AtomicBool,
     pointer_x: AtomicI32,
     pointer_y: AtomicI32,
+    pointer_anchor_x: AtomicI32,
+    pointer_anchor_y: AtomicI32,
 }
 
 impl WholeHostCallbackState {
@@ -239,6 +242,8 @@ impl WholeHostCallbackState {
             pointer_initialized: AtomicBool::new(false),
             pointer_x: AtomicI32::new(0),
             pointer_y: AtomicI32::new(0),
+            pointer_anchor_x: AtomicI32::new(0),
+            pointer_anchor_y: AtomicI32::new(0),
         }
     }
 
@@ -336,6 +341,23 @@ impl WholeHostCallbackState {
         self.pointer_x.store(x, Ordering::Relaxed);
         self.pointer_y.store(y, Ordering::Relaxed);
         self.pointer_initialized.store(true, Ordering::Release);
+    }
+
+    fn set_pointer_anchor(&self, x: i32, y: i32) {
+        self.pointer_anchor_x.store(x, Ordering::Relaxed);
+        self.pointer_anchor_y.store(y, Ordering::Relaxed);
+    }
+
+    fn recenter_pointer(&self) -> Result<(), WindowsBackendError> {
+        let x = self.pointer_anchor_x.load(Ordering::Relaxed);
+        let y = self.pointer_anchor_y.load(Ordering::Relaxed);
+        // Establish the new baseline before the synthetic move is observed by
+        // the low-level hook, so it cannot be mistaken for physical motion.
+        self.commit_pointer_position(x, y);
+        // SAFETY: Coordinates are the validated centre of the current virtual
+        // desktop and the call retains no pointers.
+        unsafe { SetCursorPos(x, y) }
+            .map_err(|error| binding_error("SetCursorPos(remote pointer anchor)", &error))
     }
 
     fn dispatch(
@@ -1635,11 +1657,17 @@ unsafe extern "system" fn low_level_mouse_hook(
         state.pointer_device,
         Some(Point::new(f64::from(record.pt.x), f64::from(record.pt.y))),
     );
-    if message == WM_MOUSEMOVE && !suppressed {
-        // A suppressed low-level movement never advances the Windows cursor.
-        // Keep the baseline at the last OS-applied position so successive
-        // physical packets continue producing relative movement remotely.
-        state.commit_pointer_position(record.pt.x, record.pt.y);
+    if message == WM_MOUSEMOVE {
+        if suppressed && classification == EventClassification::Physical {
+            if state.recenter_pointer().is_err() {
+                // The current event is already accepted remotely and remains
+                // suppressed to prevent duplication. Fault future capture so
+                // lifecycle reconciliation returns authority locally.
+                state.fault();
+            }
+        } else if !suppressed {
+            state.commit_pointer_position(record.pt.x, record.pt.y);
+        }
     }
     if suppressed {
         LRESULT(1)
@@ -1744,6 +1772,22 @@ fn whole_host_hook_thread(
         return Ok(());
     }
     state.seed_pointer(pointer.x, pointer.y);
+    let Some((anchor_x, anchor_y)) = virtual_desktop_center() else {
+        state.fault();
+        let cleanup = remove_whole_host_hooks(keyboard_hook, mouse_hook, state);
+        let startup = WindowsBackendError::CaptureRuntime(
+            "virtual desktop bounds are unavailable for remote pointer anchoring".into(),
+        );
+        let combined = match cleanup {
+            Ok(()) => startup,
+            Err(cleanup) => WindowsBackendError::CaptureRuntime(format!(
+                "{startup}; native hook cleanup also failed: {cleanup}"
+            )),
+        };
+        let _ = ready_sender.send(Err(combined));
+        return Ok(());
+    };
+    state.set_pointer_anchor(anchor_x, anchor_y);
 
     if ready_sender.send(Ok(())).is_err()
         || ready_ack_receiver
@@ -1758,7 +1802,7 @@ fn whole_host_hook_thread(
         });
     }
 
-    let loop_result = whole_host_message_loop(generation);
+    let loop_result = whole_host_message_loop(generation, state);
     if state.lifecycle() == CaptureLifecycleState::Running {
         state.fault();
     }
@@ -1772,7 +1816,10 @@ fn whole_host_hook_thread(
     }
 }
 
-fn whole_host_message_loop(generation: u32) -> Result<(), WindowsBackendError> {
+fn whole_host_message_loop(
+    generation: u32,
+    state: &WholeHostCallbackState,
+) -> Result<(), WindowsBackendError> {
     let mut message = MSG::default();
     let mut cursor_hide_adjustments = 0_u32;
     let result = loop {
@@ -1790,6 +1837,7 @@ fn whole_host_message_loop(generation: u32) -> Result<(), WindowsBackendError> {
         if message.wParam.0 == generation as usize {
             if message.message == WHOLE_HOST_HIDE_CURSOR_MESSAGE {
                 hide_thread_cursor(&mut cursor_hide_adjustments);
+                state.recenter_pointer()?;
                 continue;
             }
             if message.message == WHOLE_HOST_SHOW_CURSOR_MESSAGE {
@@ -2605,6 +2653,35 @@ fn binding_error(operation: &'static str, error: &windows::core::Error) -> Windo
     }
 }
 
+fn virtual_desktop_center() -> Option<(i32, i32)> {
+    // SAFETY: These fixed system-metric queries take no pointers and have no
+    // ownership side effects.
+    let (left, top, width, height) = unsafe {
+        (
+            GetSystemMetrics(SM_XVIRTUALSCREEN),
+            GetSystemMetrics(SM_YVIRTUALSCREEN),
+            GetSystemMetrics(SM_CXVIRTUALSCREEN),
+            GetSystemMetrics(SM_CYVIRTUALSCREEN),
+        )
+    };
+    center_from_virtual_bounds(left, top, width, height)
+}
+
+const fn center_from_virtual_bounds(
+    left: i32,
+    top: i32,
+    width: i32,
+    height: i32,
+) -> Option<(i32, i32)> {
+    if width <= 0 || height <= 0 {
+        return None;
+    }
+    Some((
+        left.saturating_add(width / 2),
+        top.saturating_add(height / 2),
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2629,6 +2706,16 @@ mod tests {
 
         state.commit_pointer_position(105, 100);
         assert_eq!(state.pointer_delta(105, 100), None);
+    }
+
+    #[test]
+    fn virtual_desktop_anchor_handles_negative_multi_monitor_origins() {
+        assert_eq!(
+            center_from_virtual_bounds(-1920, -1080, 5760, 3240),
+            Some((960, 540))
+        );
+        assert_eq!(center_from_virtual_bounds(0, 0, 0, 1080), None);
+        assert_eq!(center_from_virtual_bounds(0, 0, 1920, -1), None);
     }
 
     #[test]

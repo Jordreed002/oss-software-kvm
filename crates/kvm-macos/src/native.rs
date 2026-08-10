@@ -56,7 +56,7 @@ const IO_OPTION_NONE: u32 = 0;
 const CG_ERROR_SUCCESS: i32 = 0;
 const CG_HID_EVENT_TAP: u32 = 0;
 const CG_EVENT_SOURCE_USER_DATA: u32 = 42;
-const CG_SCROLL_EVENT_UNIT_PIXEL: u32 = 0;
+const CG_SCROLL_EVENT_UNIT_LINE: u32 = 1;
 const CG_HEAD_INSERT_EVENT_TAP: u32 = 0;
 const CG_EVENT_TAP_OPTION_DEFAULT: u32 = 0;
 const CG_KEYBOARD_EVENT_AUTOREPEAT: u32 = 8;
@@ -1001,6 +1001,8 @@ pub struct MacOutputBackend {
     pointer_target: Option<CGPoint>,
     last_pointer_injection: Option<Instant>,
     last_pointer_resync: Option<Instant>,
+    horizontal_scroll_remainder: f64,
+    vertical_scroll_remainder: f64,
 }
 
 impl std::fmt::Debug for MacOutputBackend {
@@ -1023,6 +1025,8 @@ impl MacOutputBackend {
             pointer_target: None,
             last_pointer_injection: None,
             last_pointer_resync: None,
+            horizontal_scroll_remainder: 0.0,
+            vertical_scroll_remainder: 0.0,
         }
     }
 
@@ -1036,6 +1040,8 @@ impl MacOutputBackend {
             pointer_target: None,
             last_pointer_injection: None,
             last_pointer_resync: None,
+            horizontal_scroll_remainder: 0.0,
+            vertical_scroll_remainder: 0.0,
         }
     }
 
@@ -1144,8 +1150,12 @@ impl MacOutputBackend {
                 horizontal,
                 vertical,
             } => {
-                let vertical = rounded_i32(vertical);
-                let horizontal = rounded_i32(horizontal);
+                let vertical = take_scroll_steps(vertical, &mut self.vertical_scroll_remainder)?;
+                let horizontal =
+                    take_scroll_steps(horizontal, &mut self.horizontal_scroll_remainder)?;
+                if vertical == 0 && horizontal == 0 {
+                    return Ok(());
+                }
                 // SAFETY (F-27): the C prototype of CGEventCreateScrollWheelEvent2
                 // is variadic (`...`), but it is declared here with fixed
                 // arguments. This is sound on every supported macOS target:
@@ -1156,12 +1166,15 @@ impl MacOutputBackend {
                 // fixed-arg shape for the same reason). A divergence would only
                 // matter on an ABI whose variadic and non-variadic conventions
                 // differ before the `...`, which no macOS target has.
-                // `wheel_count` is 2 and selects the two populated pixel-unit
-                // axes; the third wheel value is zero.
+                // `wheel_count` is 2 and selects the two populated line-unit
+                // axes; the third wheel value is zero. Windows wheel deltas
+                // arrive normalized to notches, so line units preserve the
+                // host's scroll preference rather than treating a notch as a
+                // single pixel.
                 let event = unsafe {
                     CGEventCreateScrollWheelEvent2(
                         ptr::null(),
-                        CG_SCROLL_EVENT_UNIT_PIXEL,
+                        CG_SCROLL_EVENT_UNIT_LINE,
                         2,
                         vertical,
                         horizontal,
@@ -2219,10 +2232,16 @@ const fn other_button_number(button: PointerButton) -> u32 {
 }
 
 #[allow(clippy::cast_possible_truncation)]
-fn rounded_i32(value: f64) -> i32 {
-    value
-        .round()
-        .clamp(f64::from(i32::MIN), f64::from(i32::MAX)) as i32
+fn take_scroll_steps(value: f64, remainder: &mut f64) -> Result<i32, MacBackendError> {
+    let combined = value + *remainder;
+    if !combined.is_finite() || combined < f64::from(i32::MIN) || combined > f64::from(i32::MAX) {
+        return Err(MacBackendError::UnsupportedInput(
+            "scroll delta is outside representable range",
+        ));
+    }
+    let integral = combined.trunc() as i32;
+    *remainder = combined - f64::from(integral);
+    Ok(integral)
 }
 
 fn enumerate_core_graphics_displays(host_id: HostId) -> Result<Vec<Display>, MacBackendError> {
@@ -2367,6 +2386,19 @@ mod tests {
         let debug = format!("{backend:?}");
         assert!(!debug.contains("12345"));
         assert!(!debug.contains("54321"));
+    }
+
+    #[test]
+    fn high_resolution_scroll_accumulates_without_losing_direction() {
+        let mut remainder = 0.0;
+        assert_eq!(take_scroll_steps(0.4, &mut remainder).unwrap(), 0);
+        assert_eq!(take_scroll_steps(0.4, &mut remainder).unwrap(), 0);
+        assert_eq!(take_scroll_steps(0.4, &mut remainder).unwrap(), 1);
+        assert!((remainder - 0.2).abs() < f64::EPSILON * 4.0);
+
+        assert_eq!(take_scroll_steps(-0.7, &mut remainder).unwrap(), 0);
+        assert_eq!(take_scroll_steps(-0.7, &mut remainder).unwrap(), -1);
+        assert!((remainder + 0.2).abs() < f64::EPSILON * 8.0);
     }
 
     #[test]
