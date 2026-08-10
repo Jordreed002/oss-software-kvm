@@ -513,6 +513,7 @@ name = "kvm-network"
 version = "0.1.0"
 dependencies = [
  "kvm-protocol",
+ "kvm-types",
  "rcgen",
  "serde",
  "serde_json",

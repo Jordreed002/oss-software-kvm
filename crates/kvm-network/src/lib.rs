@@ -11,6 +11,7 @@
 mod codec;
 mod connection_role;
 mod connector;
+mod diagnostics;
 mod heartbeat;
 mod listener;
 mod peer;
@@ -28,6 +29,11 @@ pub use connector::{
     AuthenticatedAcceptor, AuthenticatedConnector, AuthenticatedLanConnector,
     ClientIdentityResolutionError, DevelopmentAddress, PairedClientIdentityResolver,
     SecurePeerStream, TransportPeerIdentity,
+};
+pub use diagnostics::{
+    fetch_report, read_report, spawn_diagnostics_server, write_report, DiagnosticsError,
+    DiagnosticsPublisher, DiagnosticsReport, NetworkDiagnostics, DEFAULT_DIAGNOSTICS_PORT,
+    DIAGNOSTICS_SCHEMA_VERSION, MAX_DIAGNOSTICS_PAYLOAD,
 };
 pub use heartbeat::{
     HeartbeatAction, HeartbeatConfig, HeartbeatConfigError, HeartbeatController, HeartbeatError,
