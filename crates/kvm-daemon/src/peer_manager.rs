@@ -4086,8 +4086,14 @@ mod tests {
         let routing = manager.selected_routing_handle().unwrap().load();
         assert_eq!(routing.workspace.active_host, LOCAL_HOST);
         assert!(!routing.handoff_pending);
+        assert!(!manager
+            .observe_native_pointer(Point::new(99.0, 50.0), 9)
+            .unwrap());
+        assert!(!manager
+            .observe_native_pointer(Point::new(50.0, 50.0), 10)
+            .unwrap());
         let physical_release =
-            manager.route_selected_capture(captured_key(2, KeyCode::KeyA, KeyState::Released), 9);
+            manager.route_selected_capture(captured_key(2, KeyCode::KeyA, KeyState::Released), 11);
         assert_eq!(
             physical_release.disposition(),
             CaptureDisposition::SuppressLocal
@@ -4098,12 +4104,15 @@ mod tests {
             let workspace = manager.workspace.as_mut().unwrap();
             let peer = manager.peers.get_mut(&DIAL_PEER).unwrap();
             peer.supervisor
-                .apply_workspace_test_message(workspace, WireMessage::PointerEnter(enter), 10)
+                .apply_workspace_test_message(workspace, WireMessage::PointerEnter(enter), 12)
                 .unwrap();
         }
         let routing = manager.selected_routing_handle().unwrap().load();
         assert!(!routing.handoff_pending);
         assert_eq!(outbound.messages().len(), before_duplicate + 1);
+        assert!(manager
+            .observe_native_pointer(Point::new(99.0, 50.0), 13)
+            .unwrap());
     }
 
     #[test]
