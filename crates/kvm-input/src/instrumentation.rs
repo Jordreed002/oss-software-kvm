@@ -19,6 +19,8 @@
 //! stamps into the capture/router/network/injector call sites is a separate,
 //! deliberately later step so this slice carries zero hot-path risk.
 
+use serde::{Deserialize, Serialize};
+
 /// The five lifecycle stages a single input event passes through (spec §36).
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum LatencyStage {
@@ -42,7 +44,7 @@ pub enum LatencyStage {
 /// receive → injection. [`LatencyStamps::capture_to_injection_ns`] is available
 /// only once both endpoints have been stitched together (i.e. a combined record
 /// with both `capture` and `injection` present).
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 // Every field is a nanosecond stage reading; the `_ns` postfix documents the
 // unit at the call site and is more valuable than satisfying the linter.
 #[allow(clippy::struct_field_names)]
@@ -155,7 +157,7 @@ impl LatencyStamps {
 
 /// Aggregate latency statistics over a window of samples (spec §36). All values
 /// are nanoseconds.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct LatencyStats {
     /// Number of samples in the window.
     pub count: usize,
@@ -449,5 +451,44 @@ mod tests {
         let history = LatencyHistory::default();
         assert!(history.capacity() > 0);
         assert!(history.is_empty());
+    }
+
+    #[test]
+    fn latency_stats_round_trips_through_serde() {
+        // A diagnostics consumer (eventually the control panel over IPC) reads
+        // LatencyStats off the wire, so the on-disk/wire representation must be
+        // stable and round-trip exactly.
+        let stats = LatencyStats {
+            count: 4,
+            min_ns: 100,
+            max_ns: 900,
+            mean_ns: 400,
+            p50_ns: 350,
+            p95_ns: 880,
+        };
+        let json = serde_json::to_string(&stats).expect("serialize");
+        let back: LatencyStats = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(stats, back);
+        // Pin the field names so a future rename is a deliberate, reviewed change.
+        assert!(json.contains("\"p95_ns\""));
+        assert!(json.contains("\"mean_ns\""));
+    }
+
+    #[test]
+    fn latency_stamps_round_trip_preserving_stage_readings() {
+        let stamps = LatencyStamps::new()
+            .with_capture(1_000)
+            .with_routing_decision(1_050)
+            .with_network_send(1_100)
+            .with_network_receive(5_000)
+            .with_injection_request(5_080);
+        assert_eq!(stamps.capture_to_injection_ns(), Some(4_080));
+
+        let json = serde_json::to_string(&stamps).expect("serialize");
+        let back: LatencyStamps = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(stamps, back);
+        // The end-to-end metric survives the round trip.
+        assert_eq!(back.capture_to_injection_ns(), Some(4_080));
+        assert_eq!(back.span_ns(LatencyStage::Capture, LatencyStage::NetworkSend), Some(100));
     }
 }

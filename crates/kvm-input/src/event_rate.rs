@@ -25,6 +25,7 @@
 // binding site; the ns↔ms distinction is the whole point.
 #![allow(clippy::similar_names)]
 
+use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 const COUNT_MASK: u64 = 0xFFFF_FFFF;
@@ -46,7 +47,7 @@ fn low32(value: u64) -> u32 {
 }
 
 /// Sliding-window configuration for [`EventRateMeter`].
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct EventRateConfig {
     /// Width of each bucket in milliseconds.
     pub bucket_ms: u64,
@@ -103,7 +104,7 @@ impl EventRateConfig {
 }
 
 /// One input-event-rate sample over the configured window.
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub struct EventRateSnapshot {
     /// Events counted within the current window.
     pub window_events: u64,
@@ -394,5 +395,38 @@ mod tests {
             bucket_ms: 0,
             bucket_count: 10,
         });
+    }
+
+    #[test]
+    fn event_rate_snapshot_round_trips_through_serde() {
+        // The snapshot is what a diagnostics consumer reads over the wire; its
+        // representation must round-trip and the float field must survive.
+        let snap = EventRateSnapshot {
+            window_events: 42,
+            total_events: 1_000,
+            window_seconds: 6.0,
+            events_per_second: 7.0,
+        };
+        let json = serde_json::to_string(&snap).expect("serialize");
+        let back: EventRateSnapshot = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(snap, back);
+        assert!(json.contains("\"events_per_second\""));
+    }
+
+    #[test]
+    fn event_rate_config_round_trips_through_serde() {
+        let config = EventRateConfig {
+            bucket_ms: 100,
+            bucket_count: 60,
+        };
+        let json = serde_json::to_string(&config).expect("serialize");
+        let back: EventRateConfig = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(config, back);
+        // Validate still rejects a deserialized-then-corrupted config.
+        let bad = EventRateConfig {
+            bucket_ms: 0,
+            bucket_count: 60,
+        };
+        assert!(bad.validate().is_err());
     }
 }
