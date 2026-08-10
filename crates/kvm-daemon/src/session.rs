@@ -788,7 +788,19 @@ where
                 error: CoordinatorError::Core(error),
             }),
             CaptureDecision::Local(outcome) | CaptureDecision::Inert(outcome) => {
-                self.drain_remote_cleanup(now_ns)
+                // §25 / F-02: the emergency chord failsafe must release
+                // peer-injected inbound modifiers too, not just drain outbound —
+                // otherwise the user regains control of the machine with the
+                // peer's modifiers still physically held. Mirrors
+                // trigger_capture_emergency (the capture-discontinuation path),
+                // which exists for exactly this reason.
+                let inbound_result = if outcome.failsafe_activated() {
+                    self.release_all_inbound(now_ns)
+                } else {
+                    Ok(())
+                };
+                let outbound_result = self.drain_remote_cleanup(now_ns);
+                combine_cleanup_results(inbound_result, outbound_result)
                     .map_err(|error| CoordinatorCaptureFailure {
                         outcome: Some(outcome),
                         error,
@@ -1908,6 +1920,85 @@ mod tests {
             .expect("latency recorded after a dispatched event");
         assert!(stats.count >= 1, "at least one sample: {stats:?}");
         assert_eq!(stats.max_ns, 4_000, "capture→network-send span: {stats:?}");
+    }
+
+    #[test]
+    fn failsafe_chord_releases_peer_injected_inbound_modifiers() {
+        // §25 / F-02: when the local user presses the escape chord while this
+        // host is the destination (active_host == local) and a peer has injected
+        // a held modifier into us, the chord must release that inbound modifier
+        // — not just drain outbound cleanup. The capture-discontinuation path
+        // already does this (trigger_capture_emergency); this test pins the
+        // chord path to the same invariant. Default chord: Ctrl+Alt+Shift+Backspace.
+        let mut coord = coordinator();
+        admit(&mut coord);
+        coord.core.mark_workspace_routing_ready(0).unwrap();
+        // coordinator() starts with active_host == LOCAL: we are the
+        // destination. Have the remote peer inject a held modifier.
+        let injected = InputEvent::new(
+            1,
+            1_000,
+            REMOTE,
+            DEVICE,
+            InputPayload::Key {
+                code: KeyCode::ControlLeft,
+                state: KeyState::Pressed,
+            },
+        );
+        coord.test_hold_inbound(injected, 1_000).unwrap();
+        assert!(
+            !coord.inbound_pressed.is_empty(),
+            "peer-injected modifier is held before the chord"
+        );
+
+        // Local user presses the failsafe chord: the three modifiers build the
+        // physical pressed state, then Backspace completes it.
+        for code in [KeyCode::ControlLeft, KeyCode::AltLeft, KeyCode::ShiftLeft] {
+            coord
+                .route_captured(
+                    CapturedInput::new(
+                        InputEvent::new(
+                            1,
+                            2_000,
+                            LOCAL,
+                            DEVICE,
+                            InputPayload::Key {
+                                code,
+                                state: KeyState::Pressed,
+                            },
+                        ),
+                        crate::EventClassification::Physical,
+                    ),
+                    2_000,
+                )
+                .unwrap();
+        }
+        let outcome = coord
+            .route_captured(
+                CapturedInput::new(
+                    InputEvent::new(
+                        2,
+                        3_000,
+                        LOCAL,
+                        DEVICE,
+                        InputPayload::Key {
+                            code: KeyCode::Backspace,
+                            state: KeyState::Pressed,
+                        },
+                    ),
+                    crate::EventClassification::Physical,
+                ),
+                3_000,
+            )
+            .unwrap();
+        assert!(
+            outcome.failsafe_activated(),
+            "the chord must activate the failsafe"
+        );
+        assert!(
+            coord.inbound_pressed.is_empty(),
+            "failsafe must release the peer-injected inbound modifier (F-02)"
+        );
     }
 
     fn binding_between(local: HostId, remote: HostId, nonce: u8) -> AdmittedSessionBinding {
