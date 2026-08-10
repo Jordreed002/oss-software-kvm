@@ -1,7 +1,13 @@
 use kvm_input::KeyCode;
 
 /// Translates a Windows keyboard's shortcut modifiers to macOS roles.
+///
+/// Only the macOS native backend consumes this (`crates/kvm-macos/src/native.rs`,
+/// which is itself `cfg(target_os = "macos")`). Compiling it on the other CI
+/// targets leaves it without a caller and trips `-D warnings` (dead_code), so
+/// gate the definition to macOS.
 #[must_use]
+#[cfg(target_os = "macos")]
 pub(crate) const fn macos_key_for_windows_source(key: KeyCode) -> KeyCode {
     match key {
         KeyCode::AltLeft => KeyCode::MetaLeft,
@@ -291,6 +297,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_os = "macos")]
     fn windows_shortcut_modifiers_map_to_macos_roles() {
         assert_eq!(
             macos_key_for_windows_source(KeyCode::AltLeft),
