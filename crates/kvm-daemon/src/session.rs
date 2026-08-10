@@ -330,6 +330,9 @@ pub struct PeerSessionCoordinator<I, O> {
     inbound_pressed: BTreeMap<DeviceId, PressedState>,
     synthetic_sequence: u64,
     outbound_sequence: u64,
+    /// §36 capture→injection latency ring; present only with the `diagnostics` feature.
+    #[cfg(feature = "diagnostics")]
+    injection_latency: kvm_input::LatencyHistory,
 }
 
 /// Borrow-only routing composition for one exact current session.
@@ -556,11 +559,23 @@ where
             inbound_pressed: BTreeMap::new(),
             synthetic_sequence: 0,
             outbound_sequence: 1,
+            #[cfg(feature = "diagnostics")]
+            injection_latency: kvm_input::LatencyHistory::default(),
         })
     }
 
     pub(crate) const fn outbound_mut(&mut self) -> &mut O {
         &mut self.outbound
+    }
+
+    /// §36 capture→injection latency statistics for the diagnostics surface.
+    ///
+    /// `None` until at least one injected event has been recorded. Only present
+    /// with the `diagnostics` feature; absent in release builds.
+    #[cfg(feature = "diagnostics")]
+    #[must_use]
+    pub fn injection_latency_stats(&self) -> Option<kvm_input::LatencyStats> {
+        self.injection_latency.stats()
     }
 
     #[must_use]
@@ -1247,6 +1262,16 @@ where
         if self.injection.inject(&event).is_err() {
             return Err(self.fail_session(CoordinatorError::Injection, now_ns));
         }
+        // §36 capture→injection latency: the destination's `now_ns` minus the
+        // event's source-capture timestamp is the end-to-end span. Dev-only;
+        // absent without the `diagnostics` feature. The intermediate routing /
+        // network sub-spans are source-side and not measurable at this host.
+        #[cfg(feature = "diagnostics")]
+        self.injection_latency.push_stamps(
+            kvm_input::LatencyStamps::new()
+                .with_capture(event.timestamp_ns)
+                .with_injection_request(now_ns),
+        );
         if release {
             if let Some(state) = self.inbound_pressed.get_mut(&event.source_device) {
                 state.apply(&event.payload);
@@ -1719,6 +1744,35 @@ mod tests {
 
     fn coordinator() -> PeerSessionCoordinator<RecordingInjection, RecordingOutbound> {
         coordinator_between(LOCAL, REMOTE)
+    }
+
+    #[cfg(feature = "diagnostics")]
+    #[test]
+    fn diagnostics_capture_to_injection_latency_is_recorded() {
+        // §36 wiring smoke test: inject_received stamps capture (event timestamp)
+        // and injection (dest now_ns), so injection_latency_stats reflects the
+        // end-to-end span once at least one event has been injected.
+        let mut coord = coordinator();
+        assert!(coord.injection_latency_stats().is_none());
+
+        // Capture at t=1_000ns; inject at now=5_000ns → 4_000ns span.
+        let event = InputEvent::new(
+            1,
+            1_000,
+            REMOTE,
+            DEVICE,
+            InputPayload::Key {
+                code: KeyCode::KeyA,
+                state: KeyState::Pressed,
+            },
+        );
+        coord.test_hold_inbound(event, 5_000).unwrap();
+
+        let stats = coord
+            .injection_latency_stats()
+            .expect("latency recorded after an injected event");
+        assert!(stats.count >= 1, "at least one sample: {stats:?}");
+        assert_eq!(stats.max_ns, 4_000, "capture→injection span: {stats:?}");
     }
 
     fn binding_between(local: HostId, remote: HostId, nonce: u8) -> AdmittedSessionBinding {
