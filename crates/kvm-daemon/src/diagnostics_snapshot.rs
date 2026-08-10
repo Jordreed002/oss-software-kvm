@@ -18,11 +18,11 @@ use serde::{Deserialize, Serialize};
 /// One wire-ready read of the daemon's §35/§36 diagnostics state.
 ///
 /// Fields are ordered to group the two §35 throughput counters (captured rate
-/// + injected count), then the two §36 latency distributions, then drops. Both
-/// latency fields are `Option`: `source_latency` is `None` until the first
-/// captured event reaches a routing decision, and `injection_latency` is `None`
-/// until the first inbound event is injected at a destination peer. The
-/// counters are always present — they default to zero.
+/// then injected count), then the two §36 latency distributions, then drops.
+/// The two latency fields are `Option`. `source_latency` is `None` until the
+/// first captured event reaches a routing decision. `injection_latency` is
+/// `None` until the first inbound event is injected at a destination peer. The
+/// counters are always present and default to zero.
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub struct DiagnosticsSnapshot {
     /// §35 input-event rate as observed on this host's capture hot path.

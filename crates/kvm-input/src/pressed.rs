@@ -64,6 +64,7 @@ impl PressedState {
     }
 
     /// Returns all held keys in deterministic physical-key order.
+    #[must_use]
     pub fn pressed_keys(&self) -> impl ExactSizeIterator<Item = KeyCode> {
         let mut keys: Vec<_> = self.keys.iter().copied().collect();
         // Releasing non-modifiers first avoids turning a held Ctrl+A into a
@@ -73,6 +74,7 @@ impl PressedState {
     }
 
     /// Returns all held buttons in deterministic order.
+    #[must_use]
     pub fn pressed_buttons(&self) -> impl ExactSizeIterator<Item = PointerButton> {
         let mut buttons: Vec<_> = self.buttons.iter().copied().collect();
         buttons.sort_unstable();
