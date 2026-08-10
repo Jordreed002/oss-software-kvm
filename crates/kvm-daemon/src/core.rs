@@ -571,6 +571,9 @@ pub struct DaemonCore {
     workspace_ready: bool,
     handoff_pending: bool,
     snapshots: Arc<ArcSwap<RoutingSnapshot>>,
+    /// §35 input-event-rate meter; present only with the `diagnostics` feature.
+    #[cfg(feature = "diagnostics")]
+    event_rate: kvm_input::EventRateMeter,
 }
 
 impl fmt::Debug for DaemonCore {
@@ -651,12 +654,24 @@ impl DaemonCore {
             workspace_ready: false,
             handoff_pending: false,
             snapshots: Arc::new(ArcSwap::from_pointee(initial)),
+            #[cfg(feature = "diagnostics")]
+            event_rate: kvm_input::EventRateMeter::default(),
         })
     }
 
     #[must_use]
     pub fn config(&self) -> &Config {
         &self.config
+    }
+
+    /// §35 input-event-rate snapshot for the diagnostics surface (spec §35).
+    ///
+    /// Only present when the daemon is built with the `diagnostics` feature;
+    /// absent (like the meter itself) in release builds.
+    #[cfg(feature = "diagnostics")]
+    #[must_use]
+    pub fn event_rate_snapshot(&self, now_ns: u64) -> kvm_input::EventRateSnapshot {
+        self.event_rate.snapshot(now_ns)
     }
 
     #[must_use]
@@ -1018,6 +1033,10 @@ impl DaemonCore {
     /// back to local control.
     #[must_use]
     pub fn process_captured(&mut self, captured: CapturedInput, now_ns: u64) -> ProcessResult {
+        // §35 input-event-rate: record every captured event by its capture
+        // timestamp (no extra clock read). Dev-only; absent without the feature.
+        #[cfg(feature = "diagnostics")]
+        self.event_rate.record(captured.event.timestamp_ns);
         let decision = self.prepare_captured(captured, now_ns);
         let outcome = match decision {
             Ok(
@@ -2297,6 +2316,38 @@ mod tests {
 
     fn core() -> DaemonCore {
         core_with_routes([])
+    }
+
+    #[cfg(feature = "diagnostics")]
+    #[test]
+    fn diagnostics_event_rate_counts_every_captured_event() {
+        // §35 wiring smoke test: process_captured feeds the meter using the
+        // event's own capture timestamp, so the snapshot reflects the capture rate.
+        let mut core = core();
+        for (seq, ts_ns) in [(1u64, 0u64), (2, 100_000_000), (3, 200_000_000)] {
+            let _ = core.process_captured(
+                CapturedInput::new(
+                    InputEvent::new(
+                        seq,
+                        ts_ns,
+                        LOCAL,
+                        DEVICE,
+                        InputPayload::Key {
+                            code: KeyCode::KeyA,
+                            state: KeyState::Pressed,
+                        },
+                    ),
+                    EventClassification::Physical,
+                ),
+                ts_ns,
+            );
+        }
+        let snap = core.event_rate_snapshot(200_000_000);
+        assert!(
+            snap.total_events >= 3,
+            "meter should count captured events: {snap:?}"
+        );
+        assert!(snap.window_events >= 1, "window should be non-empty: {snap:?}");
     }
 
     fn installed_endpoint(core: &DaemonCore) -> SessionEndpoint {

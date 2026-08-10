@@ -21,5 +21,13 @@ tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "tim
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 
+[features]
+default = []
+## Development-only diagnostics: compiles in the §35 input-event-rate meter and
+## the §36 capture→injection latency instrumentation from kvm-input, and wires
+## them onto the daemon's hot paths. Off by default so release builds pay
+## nothing. Forwards to kvm-input's `event-rate` and `latency` features.
+diagnostics = ["kvm-input/event-rate", "kvm-input/latency"]
+
 [lints]
 workspace = true
