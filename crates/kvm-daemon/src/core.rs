@@ -771,6 +771,30 @@ impl DaemonCore {
         captured: CapturedInput,
         now_ns: u64,
     ) -> Result<CaptureDecision, CoreCaptureError> {
+        // §35 input-event-rate: record every captured event by its capture
+        // timestamp (no extra clock read). This lives in `prepare_captured` —
+        // the single routing entry point shared by the production path
+        // (`PeerSessionCoordinator::route_captured` → here) and the test-facing
+        // `process_captured` — so the meter runs in every build, not just tests.
+        // Dev-only; absent without the `diagnostics` feature.
+        #[cfg(feature = "diagnostics")]
+        self.event_rate.record(captured.event.timestamp_ns);
+        // §36 source-side sub-span: capture→routing-decision. The capture
+        // instant travels on the event; `now_ns` is the routing-decision instant
+        // supplied by the caller, so this needs no extra clock read. Dev-only;
+        // absent without the `diagnostics` feature.
+        #[cfg(feature = "diagnostics")]
+        {
+            let stamps = kvm_input::LatencyStamps::default()
+                .with_capture(captured.event.timestamp_ns)
+                .with_routing_decision(now_ns);
+            if let Some(span) = stamps.span_ns(
+                kvm_input::LatencyStage::Capture,
+                kvm_input::LatencyStage::RoutingDecision,
+            ) {
+                self.source_latency.push(span);
+            }
+        }
         if self.pending_remote.is_some() {
             return Err(CoreCaptureError::Unavailable);
         }
@@ -1081,25 +1105,10 @@ impl DaemonCore {
     /// back to local control.
     #[must_use]
     pub fn process_captured(&mut self, captured: CapturedInput, now_ns: u64) -> ProcessResult {
-        // §35 input-event-rate: record every captured event by its capture
-        // timestamp (no extra clock read). Dev-only; absent without the feature.
-        #[cfg(feature = "diagnostics")]
-        self.event_rate.record(captured.event.timestamp_ns);
-        // §36 source-side sub-span: capture→routing-decision. The capture
-        // instant travels on the event; `now_ns` is the routing-decision
-        // instant supplied by the caller, so this needs no extra clock read.
-        // Dev-only; absent without the feature.
-        #[cfg(feature = "diagnostics")]
-        {
-            let stamps = kvm_input::LatencyStamps::default()
-                .with_capture(captured.event.timestamp_ns)
-                .with_routing_decision(now_ns);
-            if let Some(span) =
-                stamps.span_ns(kvm_input::LatencyStage::Capture, kvm_input::LatencyStage::RoutingDecision)
-            {
-                self.source_latency.push(span);
-            }
-        }
+        // §35/§36 diagnostics stamping now lives in `prepare_captured` (the
+        // single routing entry point shared with the production
+        // `route_captured` path), so it runs in every build configuration —
+        // not just when tests go through this wrapper.
         let decision = self.prepare_captured(captured, now_ns);
         let outcome = match decision {
             Ok(
@@ -2410,7 +2419,10 @@ mod tests {
             snap.total_events >= 3,
             "meter should count captured events: {snap:?}"
         );
-        assert!(snap.window_events >= 1, "window should be non-empty: {snap:?}");
+        assert!(
+            snap.window_events >= 1,
+            "window should be non-empty: {snap:?}"
+        );
     }
 
     #[cfg(feature = "diagnostics")]
@@ -2420,10 +2432,7 @@ mod tests {
         // routing-decision (now_ns) and pushes their span. now_ns deliberately
         // trails the capture timestamp by 4ms so the span is observable.
         let mut core = core();
-        for (seq, ts_ns, now_ns) in [
-            (1u64, 0u64, 4_000_000u64),
-            (2, 100_000_000, 104_000_000),
-        ] {
+        for (seq, ts_ns, now_ns) in [(1u64, 0u64, 4_000_000u64), (2, 100_000_000, 104_000_000)] {
             let _ = core.process_captured(
                 CapturedInput::new(
                     InputEvent::new(

@@ -783,10 +783,31 @@ where
                 error: CoordinatorError::Core(error),
             })?;
         match decision {
-            CaptureDecision::Fault { outcome, error } => Err(CoordinatorCaptureFailure {
-                outcome: Some(outcome),
-                error: CoordinatorError::Core(error),
-            }),
+            CaptureDecision::Fault { outcome, error } => {
+                // §25 / F-02: the chord activation sets `failsafe_activated`
+                // even when `activate_failsafe` itself fails on cleanup
+                // bookkeeping — routing is already suspended by then, so the
+                // user believes they have escaped. Release peer-injected
+                // inbound modifiers (best-effort) exactly as the Local/Inert
+                // arm above, so the same F-02 gap can't hide on this path.
+                // `release_all_inbound` clears `inbound_pressed` for every
+                // successfully-injected release regardless of the returned
+                // error; if it fails, an unreleased held key (injection
+                // backend) is the more dangerous condition, so surface that
+                // over the core cleanup-bookkeeping error.
+                let error = if outcome.failsafe_activated() {
+                    match self.release_all_inbound(now_ns) {
+                        Ok(()) => CoordinatorError::Core(error),
+                        Err(release_error) => release_error,
+                    }
+                } else {
+                    CoordinatorError::Core(error)
+                };
+                Err(CoordinatorCaptureFailure {
+                    outcome: Some(outcome),
+                    error,
+                })
+            }
             CaptureDecision::Local(outcome) | CaptureDecision::Inert(outcome) => {
                 // §25 / F-02: the emergency chord failsafe must release
                 // peer-injected inbound modifiers too, not just drain outbound —
@@ -800,11 +821,12 @@ where
                     Ok(())
                 };
                 let outbound_result = self.drain_remote_cleanup(now_ns);
-                combine_cleanup_results(inbound_result, outbound_result)
-                    .map_err(|error| CoordinatorCaptureFailure {
+                combine_cleanup_results(inbound_result, outbound_result).map_err(|error| {
+                    CoordinatorCaptureFailure {
                         outcome: Some(outcome),
                         error,
-                    })?;
+                    }
+                })?;
                 Ok(outcome)
             }
             CaptureDecision::Remote(effect) => {
@@ -1857,7 +1879,11 @@ mod tests {
         // §35 wiring: inject_received tallies one per successfully injected
         // event, mirroring the capture-side event-rate total.
         let mut coord = coordinator();
-        assert_eq!(coord.injected_events(), 0, "fresh coordinator injects nothing");
+        assert_eq!(
+            coord.injected_events(),
+            0,
+            "fresh coordinator injects nothing"
+        );
 
         for seq in 1..=3 {
             let event = InputEvent::new(
@@ -1920,6 +1946,56 @@ mod tests {
             .expect("latency recorded after a dispatched event");
         assert!(stats.count >= 1, "at least one sample: {stats:?}");
         assert_eq!(stats.max_ns, 4_000, "capture→network-send span: {stats:?}");
+    }
+
+    #[cfg(feature = "diagnostics")]
+    #[test]
+    fn diagnostics_production_path_records_event_rate_and_source_latency() {
+        // Regression for the §35/§36 wiring: event-rate and source-side
+        // capture→routing latency must be stamped on the PRODUCTION path
+        // (`route_captured` → `prepare_captured`), not only the test-facing
+        // `process_captured`. Without this the headline metrics read zero in
+        // the only build configuration where they matter. Mirrors the
+        // network-send test's setup (active host = REMOTE so the event routes
+        // outbound) but inspects the core-owned collectors.
+        let mut coord = coordinator();
+        admit(&mut coord);
+        coord.core.mark_workspace_routing_ready(0).unwrap();
+        coord
+            .core
+            .update_workspace(
+                WorkspaceState::new(LOCAL, REMOTE, LogicalPointer::new(DISPLAY, 1.0, 1.0)),
+                1,
+            )
+            .unwrap();
+
+        // Capture at t=1_000ns; routing decision at now=5_000ns → 4_000ns span.
+        let captured = CapturedInput::new(
+            InputEvent::new(
+                1,
+                1_000,
+                LOCAL,
+                DEVICE,
+                InputPayload::Key {
+                    code: KeyCode::KeyA,
+                    state: KeyState::Pressed,
+                },
+            ),
+            crate::EventClassification::Physical,
+        );
+        coord.route_captured(captured, 5_000).unwrap();
+
+        let rate = coord.core.event_rate_snapshot(5_000);
+        assert!(
+            rate.total_events >= 1,
+            "production path must feed the event-rate meter: {rate:?}"
+        );
+        let latency = coord
+            .core
+            .source_latency_stats()
+            .expect("production path must stamp capture→routing latency");
+        assert!(latency.count >= 1, "at least one span: {latency:?}");
+        assert_eq!(latency.max_ns, 4_000, "capture→routing span: {latency:?}");
     }
 
     #[test]
@@ -2035,7 +2111,10 @@ mod tests {
         );
 
         let outcome = drive_failsafe_chord(&mut coord);
-        assert!(outcome.failsafe_activated(), "the chord must activate the failsafe");
+        assert!(
+            outcome.failsafe_activated(),
+            "the chord must activate the failsafe"
+        );
         assert!(
             coord.inbound_pressed.is_empty(),
             "failsafe must release the peer-injected inbound button (F-02)"
