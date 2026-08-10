@@ -57,14 +57,6 @@ pub(crate) const fn hooks_can_release_callback_state(
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum MessageOrigin {
-    Hardware,
-    Injected,
-    System,
-    Unavailable,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct RawKeyboardPacket {
     pub scan_code: u16,
     pub flags: u16,
@@ -80,18 +72,20 @@ pub(crate) struct RawMousePacket {
     pub dy: i32,
 }
 
-pub(crate) fn classify_raw_input(
-    extra_information: u32,
-    _origin: MessageOrigin,
-    _has_device_handle: bool,
-) -> EventClassification {
+/// Classifies a Raw Input event by its `ExtraInformation` tag alone.
+///
+/// Raw Input's reported origin and device handle are deliberately *not*
+/// consulted here: a hardware (`IMO_HARDWARE`) origin also covers
+/// UIAccess-process injection, and a non-null device handle is attribution
+/// rather than proof of a physical source. The per-`WM_INPUT`
+/// `GetCurrentInputMessageSource` syscall that used to feed the `origin`
+/// argument was removed precisely because this function never used it.
+/// Until a stronger correlation mechanism is validated, every untagged Raw
+/// Input event fails closed to [`EventClassification::Unknown`].
+pub(crate) fn classify_raw_input(extra_information: u32) -> EventClassification {
     if extra_information == KVM_INJECTION_TAG {
         return EventClassification::InjectedByKvm;
     }
-    // `IMO_HARDWARE` also includes UIAccess-process injection, and a non-null
-    // Raw Input device handle is attribution rather than proof of a physical
-    // origin. Until a stronger correlation mechanism is validated, all
-    // untagged Raw Input fails closed.
     EventClassification::Unknown
 }
 
@@ -168,18 +162,17 @@ pub(crate) fn translate_keyboard(packet: RawKeyboardPacket) -> Option<InputPaylo
 
 /// Decodes one Raw Input mouse packet into zero-or-more input payloads.
 ///
-/// # F-20: per-packet allocation (accepted, INFO/perf)
-///
-/// Returns an owned `Vec`, so each mouse packet performs one small heap
-/// allocation (`with_capacity(7)`). At very high mouse poll rates this is a few
-/// thousand short-lived allocations per second. The trade-off is accepted: the
-/// payloads must flow into the generic input channel as owned values anyway, a
-/// fixed-size stack buffer (`ArrayVec`) would require a dependency or a wider
-/// signature change, and the allocator path is not on the network-bound
-/// critical section. Revisit only if profiling on a high-poll-rate device shows
-/// this as a hotspot.
-pub(crate) fn translate_mouse(packet: RawMousePacket) -> Vec<InputPayload> {
-    let mut events = Vec::with_capacity(7);
+/// Returns a fixed-capacity stack buffer ([`MousePayloads`]) rather than a
+/// `Vec`: a mouse packet yields at most one motion, ten button transitions (a
+/// press and a release per button across left/right/middle/back/forward), and
+/// a vertical plus horizontal scroll (thirteen payloads), all carried by the
+/// `Copy` [`InputPayload`]. A high-poll-rate mouse (1–8 kHz) therefore decodes
+/// with no per-packet heap allocation — the buffer lives on the decoder's stack
+/// — instead of the thousands of short-lived `malloc`/`free` pairs a
+/// `Vec::with_capacity(13)` per packet would produce. Payloads flow into the
+/// input channel as owned values via the consuming iterator.
+pub(crate) fn translate_mouse(packet: RawMousePacket) -> MousePayloads {
+    let mut events = MousePayloads::new();
 
     // Absolute Raw Input coordinates are normalized desktop coordinates, not
     // deltas. Converting them requires per-device prior state and virtual-screen
@@ -244,6 +237,83 @@ pub(crate) fn translate_mouse(packet: RawMousePacket) -> Vec<InputPayload> {
     events
 }
 
+/// Maximum payloads one mouse packet can yield: one motion, ten button
+/// transitions (a press and a release per button across left/right/middle/back/
+/// forward — a packet may set both the down and up flags for a button at once),
+/// and a vertical plus horizontal scroll.
+const MOUSE_PAYLOAD_CAPACITY: usize = 13;
+
+/// Fixed-capacity, stack-resident buffer for the payloads decoded from one
+/// mouse packet. Avoids the per-packet heap allocation a `Vec` would impose on
+/// a high-poll-rate mouse; the payloads are owned `Copy` values drained through
+/// the consuming iterator.
+#[derive(Debug, Clone)]
+pub(crate) struct MousePayloads {
+    buf: [Option<InputPayload>; MOUSE_PAYLOAD_CAPACITY],
+    len: usize,
+}
+
+impl MousePayloads {
+    pub(crate) const fn new() -> Self {
+        Self {
+            buf: [None; MOUSE_PAYLOAD_CAPACITY],
+            len: 0,
+        }
+    }
+
+    pub(crate) fn push(&mut self, payload: InputPayload) {
+        if self.len < MOUSE_PAYLOAD_CAPACITY {
+            self.buf[self.len] = Some(payload);
+            self.len += 1;
+        }
+    }
+
+    pub(crate) const fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+}
+
+impl Default for MousePayloads {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Consuming iterator over a [`MousePayloads`] buffer, yielding each decoded
+/// payload by value in native order.
+pub(crate) struct MousePayloadIter {
+    buf: [Option<InputPayload>; MOUSE_PAYLOAD_CAPACITY],
+    pos: usize,
+    len: usize,
+}
+
+impl Iterator for MousePayloadIter {
+    type Item = InputPayload;
+
+    fn next(&mut self) -> Option<InputPayload> {
+        if self.pos < self.len {
+            let payload = self.buf[self.pos].take();
+            self.pos += 1;
+            payload
+        } else {
+            None
+        }
+    }
+}
+
+impl IntoIterator for MousePayloads {
+    type Item = InputPayload;
+    type IntoIter = MousePayloadIter;
+
+    fn into_iter(self) -> Self::IntoIter {
+        MousePayloadIter {
+            buf: self.buf,
+            pos: 0,
+            len: self.len,
+        }
+    }
+}
+
 pub(crate) const fn is_state_transition(payload: InputPayload) -> bool {
     matches!(
         payload,
@@ -252,7 +322,7 @@ pub(crate) const fn is_state_transition(payload: InputPayload) -> bool {
 }
 
 fn push_button(
-    events: &mut Vec<InputPayload>,
+    events: &mut MousePayloads,
     flags: u16,
     down_flag: u16,
     up_flag: u16,
@@ -487,7 +557,7 @@ mod tests {
             dy: -2,
         });
         assert_eq!(
-            events,
+            events.into_iter().collect::<Vec<_>>(),
             vec![
                 InputPayload::PointerMove { dx: 4.0, dy: -2.0 },
                 InputPayload::PointerButton {
@@ -512,7 +582,9 @@ mod tests {
                 button_data: negative_delta,
                 dx: 0,
                 dy: 0,
-            }),
+            })
+            .into_iter()
+            .collect::<Vec<_>>(),
             vec![InputPayload::Scroll {
                 horizontal: -1.0,
                 vertical: 0.0,
@@ -533,31 +605,86 @@ mod tests {
     }
 
     #[test]
+    fn mouse_payloads_decode_without_heap_allocation_and_respect_capacity() {
+        // A maximal packet — motion, a press AND a release for every one of the
+        // five buttons (a packet may set both the down and up flag at once), and
+        // a vertical plus horizontal scroll — yields exactly thirteen payloads,
+        // which is the capacity. With the prior capacity of 8 this packet
+        // silently dropped button transitions past the eighth slot.
+        let all_buttons_down_up = RAW_MOUSE_LEFT_DOWN
+            | RAW_MOUSE_LEFT_UP
+            | RAW_MOUSE_RIGHT_DOWN
+            | RAW_MOUSE_RIGHT_UP
+            | RAW_MOUSE_MIDDLE_DOWN
+            | RAW_MOUSE_MIDDLE_UP
+            | RAW_MOUSE_BACK_DOWN
+            | RAW_MOUSE_BACK_UP
+            | RAW_MOUSE_FORWARD_DOWN
+            | RAW_MOUSE_FORWARD_UP;
+        let events = translate_mouse(RawMousePacket {
+            state_flags: 0,
+            button_flags: all_buttons_down_up | RAW_MOUSE_WHEEL | RAW_MOUSE_HWHEEL,
+            button_data: 120,
+            dx: 1,
+            dy: 1,
+        });
+        let collected = events.into_iter().collect::<Vec<_>>();
+        assert_eq!(collected.len(), MOUSE_PAYLOAD_CAPACITY);
+
+        // Every button produced both a Pressed and a Released transition, in
+        // the decode order translate_mouse emits (left, right, middle, back,
+        // forward — each down before its up).
+        let button = |b: PointerButton| {
+            collected
+                .iter()
+                .filter(|p| matches!(p, InputPayload::PointerButton { button, .. } if *button == b))
+                .count()
+        };
+        for b in [
+            PointerButton::Left,
+            PointerButton::Right,
+            PointerButton::Middle,
+            PointerButton::Back,
+            PointerButton::Forward,
+        ] {
+            assert_eq!(button(b), 2, "button {b:?} lost a transition");
+        }
+
+        // A fresh buffer is empty; pushing the full capacity drains exactly that
+        // many payloads, and a push past capacity saturates (drops the extra)
+        // rather than growing the fixed buffer.
+        let mut buf = MousePayloads::new();
+        assert!(buf.is_empty());
+        for payload in &collected {
+            buf.push(*payload);
+        }
+        assert_eq!(buf.into_iter().count(), MOUSE_PAYLOAD_CAPACITY);
+
+        let mut overflow = MousePayloads::new();
+        for _ in 0..(MOUSE_PAYLOAD_CAPACITY + 3) {
+            overflow.push(InputPayload::PointerMove { dx: 99.0, dy: 99.0 });
+        }
+        assert_eq!(overflow.into_iter().count(), MOUSE_PAYLOAD_CAPACITY);
+    }
+
+    #[test]
     fn only_kvm_tag_gets_a_proven_classification() {
+        // Classification is the `ExtraInformation == KVM_INJECTION_TAG` check
+        // alone: every other value — zero, a foreign tag, or a near-miss —
+        // fails closed to `Unknown`. The origin/device-handle inputs that used
+        // to be passed in were never consulted, so they were removed; this test
+        // pins the resulting single-argument contract.
+        assert_eq!(classify_raw_input(0), EventClassification::Unknown);
         assert_eq!(
-            classify_raw_input(0, MessageOrigin::Hardware, true),
-            EventClassification::Unknown
-        );
-        assert_eq!(
-            classify_raw_input(KVM_INJECTION_TAG, MessageOrigin::Injected, false),
+            classify_raw_input(KVM_INJECTION_TAG),
             EventClassification::InjectedByKvm
         );
+        assert_eq!(classify_raw_input(123), EventClassification::Unknown);
         assert_eq!(
-            classify_raw_input(123, MessageOrigin::Injected, false),
+            classify_raw_input(KVM_INJECTION_TAG.wrapping_add(1)),
             EventClassification::Unknown
         );
-        assert_eq!(
-            classify_raw_input(0, MessageOrigin::Unavailable, true),
-            EventClassification::Unknown
-        );
-        assert_eq!(
-            classify_raw_input(0, MessageOrigin::System, true),
-            EventClassification::Unknown
-        );
-        assert_eq!(
-            classify_raw_input(0, MessageOrigin::Hardware, false),
-            EventClassification::Unknown
-        );
+        assert_eq!(classify_raw_input(u32::MAX), EventClassification::Unknown);
     }
 
     #[test]

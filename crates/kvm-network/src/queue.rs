@@ -1,8 +1,9 @@
-use kvm_protocol::{MessageType, WireMessage};
+use kvm_protocol::{MessageType, WireDeviceId, WireHostId, WireInputPayloadV1, WireMessage};
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
 use std::error::Error;
 use std::fmt;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Conceptual transport lane. Ordering is FIFO within each lane.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -48,6 +49,16 @@ pub struct QueueConfig {
     pub background: usize,
     /// Maximum input frames sent while liveness control is waiting.
     pub maximum_input_burst: usize,
+    /// Coalesces consecutive same-source `PointerMove` input frames in the
+    /// input lane (spec §23). When enabled, a `PointerMove` arriving while the
+    /// newest pending input frame is already a `PointerMove` from the same
+    /// source host and device is folded into it: the deltas are summed and the
+    /// later sequence/timestamp wins. This collapses a high-rate move burst
+    /// (high-poll mice, 175 Hz display driven pointer motion) into one frame
+    /// that always reflects the current accumulated motion, so the queue drains
+    /// at once instead of accumulating per-frame latency. Button, key, release,
+    /// and inventory frames are never coalesced, so their ordering is exact.
+    pub coalesce_pointer_moves: bool,
 }
 
 impl Default for QueueConfig {
@@ -57,6 +68,10 @@ impl Default for QueueConfig {
             control: 128,
             background: 32,
             maximum_input_burst: 64,
+            // Spec §23 permits mouse-move coalescing; it is order-preserving,
+            // position-correct, and monotonic-sequence-safe (the receiver only
+            // rejects regressions, not gaps), so it is on by default.
+            coalesce_pointer_moves: true,
         }
     }
 }
@@ -172,6 +187,79 @@ impl DropCounters {
     }
 }
 
+/// Session-total outbound-queue diagnostics, snapshotted from the queue when a
+/// session ends so the burst pressure that preceded a disconnect is observable
+/// rather than discarded with the private queue.
+///
+/// `dropped` is the §35 "dropped packets" signal (per-lane capacity rejections);
+/// `coalesced_moves` is the §23 throughput signal (same-source `PointerMove`
+/// frames folded into a preceding frame, deltas preserved). The two together
+/// characterize how the queue behaved under load: a high coalescing count with
+/// zero drops means a 175 Hz burst was absorbed cleanly; a rising drop count
+/// means the lane capacities are too small for the offered rate.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct SessionStats {
+    /// Per-lane rejections because the bounded lane was full (spec §35).
+    pub dropped: DropCounters,
+    /// Same-source `PointerMove` frames coalesced into a preceding frame. The
+    /// deltas are preserved, so this is a throughput signal, not a loss signal
+    /// (spec §23).
+    pub coalesced_moves: u64,
+}
+
+/// Shared, lock-free observable mirror of a session's cumulative
+/// [`SessionStats`], so the pull-model diagnostics surface can read *live*
+/// coalescing/drop counters during sustained streaming without owning the
+/// session's private queue.
+///
+/// The session publishes on its heartbeat tick; any reader (e.g.
+/// `diagnostics_snapshot`) snapshots atomically. `Relaxed` ordering suffices:
+/// these are advisory counters, not synchronization signals. The four counters
+/// are published independently, so a concurrent read may observe a torn
+/// combination across two publishes — acceptable for advisory diagnostics of
+/// monotonically non-decreasing counters.
+#[derive(Debug, Default)]
+pub struct ObservableSessionStats {
+    dropped_input: AtomicU64,
+    dropped_control: AtomicU64,
+    dropped_background: AtomicU64,
+    coalesced_moves: AtomicU64,
+}
+
+impl ObservableSessionStats {
+    /// Publishes `stats` so readers observe the current cumulative counters.
+    pub fn publish(&self, stats: SessionStats) {
+        self.dropped_input
+            .store(stats.dropped.input, Ordering::Relaxed);
+        self.dropped_control
+            .store(stats.dropped.control, Ordering::Relaxed);
+        self.dropped_background
+            .store(stats.dropped.background, Ordering::Relaxed);
+        self.coalesced_moves
+            .store(stats.coalesced_moves, Ordering::Relaxed);
+    }
+
+    /// Snapshots the currently published counters.
+    #[must_use]
+    pub fn snapshot(&self) -> SessionStats {
+        SessionStats {
+            dropped: DropCounters {
+                input: self.dropped_input.load(Ordering::Relaxed),
+                control: self.dropped_control.load(Ordering::Relaxed),
+                background: self.dropped_background.load(Ordering::Relaxed),
+            },
+            coalesced_moves: self.coalesced_moves.load(Ordering::Relaxed),
+        }
+    }
+
+    /// Resets every counter to zero. Called at the start of each connection so
+    /// the observable reports the current connection's burst pressure rather
+    /// than a total across reconnects.
+    pub fn reset(&self) {
+        self.publish(SessionStats::default());
+    }
+}
+
 /// Bounded, priority-aware outbound queue.
 ///
 /// Input is normally selected first, but one waiting liveness-control frame is
@@ -184,6 +272,10 @@ pub struct OutboundQueue {
     background: VecDeque<WireMessage>,
     consecutive_input: usize,
     dropped: DropCounters,
+    /// Count of `PointerMove` frames folded into a preceding same-source frame
+    /// (spec §23). Not a drop: the deltas are preserved. Tracked for the
+    /// diagnostics surface alongside [`DropCounters`].
+    coalesced_moves: u64,
 }
 
 impl fmt::Debug for OutboundQueue {
@@ -196,6 +288,7 @@ impl fmt::Debug for OutboundQueue {
             .field("background_len", &self.background.len())
             .field("consecutive_input", &self.consecutive_input)
             .field("dropped", &self.dropped)
+            .field("coalesced_moves", &self.coalesced_moves)
             .finish()
     }
 }
@@ -233,17 +326,31 @@ impl OutboundQueue {
             background: VecDeque::with_capacity(config.background),
             consecutive_input: 0,
             dropped: DropCounters::default(),
+            coalesced_moves: 0,
             config,
         }
     }
 
     /// Enqueues without waiting or dropping.
     ///
+    /// When [`QueueConfig::coalesce_pointer_moves`] is enabled and `message` is
+    /// a `PointerMove` whose source host and device match the newest pending
+    /// input frame, the move is folded into that frame (deltas summed, later
+    /// sequence/timestamp kept) instead of occupying a new queue slot. This
+    /// keeps a high-rate move burst at a single drain-able frame so latency
+    /// does not accumulate per event (spec §23).
+    ///
     /// # Errors
     ///
     /// Returns the original message when its bounded lane is full.
     pub fn try_push(&mut self, message: WireMessage) -> Result<(), EnqueueError> {
         let class = TrafficClass::for_message(&message);
+        if class == TrafficClass::Input
+            && self.config.coalesce_pointer_moves
+            && self.try_coalesce_pointer_move(&message)
+        {
+            return Ok(());
+        }
         let (queue, capacity) = match class {
             TrafficClass::Input => (&mut self.input, self.config.input),
             TrafficClass::Control => (&mut self.control, self.config.control),
@@ -259,6 +366,53 @@ impl OutboundQueue {
         }
         queue.push_back(message);
         Ok(())
+    }
+
+    /// Returns a message to the front of its lane, preserving FIFO order.
+    ///
+    /// This is the inverse of [`Self::pop_next`] for the rare case where a
+    /// caller pops optimistically (e.g. to fill a write batch) and then decides
+    /// a popped frame must wait for the next batch. It bypasses coalescing,
+    /// which only applies to [`Self::try_push`] at the back of a lane.
+    pub(crate) fn unpop(&mut self, message: WireMessage) {
+        match TrafficClass::for_message(&message) {
+            TrafficClass::Input => self.input.push_front(message),
+            TrafficClass::Control => self.control.push_front(message),
+            TrafficClass::Background => self.background.push_front(message),
+        }
+    }
+
+    /// Folds `message` into the newest pending input frame when both are
+    /// same-source `PointerMove`s. Returns `true` when a fold happened (the
+    /// caller must not then enqueue `message`).
+    fn try_coalesce_pointer_move(&mut self, message: &WireMessage) -> bool {
+        let Some(incoming) = pointer_move_view(message) else {
+            return false;
+        };
+        // Read-only check first so the immutable borrow of the tail ends here.
+        let foldable = self
+            .input
+            .back()
+            .and_then(pointer_move_view)
+            .is_some_and(|tail| {
+                tail.source_host == incoming.source_host
+                    && tail.source_device == incoming.source_device
+            });
+        if !foldable {
+            return false;
+        }
+        let Some(WireMessage::Input(tail)) = self.input.back_mut() else {
+            return false;
+        };
+        let WireInputPayloadV1::PointerMove { dx, dy } = &mut tail.payload else {
+            return false;
+        };
+        *dx += incoming.dx;
+        *dy += incoming.dy;
+        tail.sequence = incoming.sequence;
+        tail.timestamp_ns = incoming.timestamp_ns;
+        self.coalesced_moves = self.coalesced_moves.saturating_add(1);
+        true
     }
 
     pub fn pop_next(&mut self) -> Option<WireMessage> {
@@ -301,6 +455,57 @@ impl OutboundQueue {
     pub const fn drop_counters(&self) -> DropCounters {
         self.dropped
     }
+
+    /// Cumulative count of `PointerMove` frames coalesced into a preceding
+    /// same-source frame (spec §23). Unlike [`Self::drop_counters`], the deltas
+    /// of coalesced moves are preserved — this is a throughput signal, not a
+    /// loss signal.
+    #[must_use]
+    pub const fn coalesced_moves(&self) -> u64 {
+        self.coalesced_moves
+    }
+
+    /// Snapshot of this queue's cumulative diagnostics for the diagnostics
+    /// surface: per-lane drops (spec §35) and coalesced moves (spec §23).
+    /// Captured when a session ends so the queue's behaviour under load is
+    /// observable rather than discarded with the private queue.
+    #[must_use]
+    pub const fn session_stats(&self) -> SessionStats {
+        SessionStats {
+            dropped: self.dropped,
+            coalesced_moves: self.coalesced_moves,
+        }
+    }
+}
+
+/// A borrowed view of a `PointerMove` input frame used for coalescing.
+#[derive(Clone, Copy)]
+struct PointerMoveView {
+    source_host: WireHostId,
+    source_device: WireDeviceId,
+    sequence: u64,
+    timestamp_ns: u64,
+    dx: f64,
+    dy: f64,
+}
+
+/// Returns the move's coalescable fields when `message` is an input frame
+/// carrying a `PointerMove` payload, otherwise `None`.
+fn pointer_move_view(message: &WireMessage) -> Option<PointerMoveView> {
+    let WireMessage::Input(event) = message else {
+        return None;
+    };
+    let WireInputPayloadV1::PointerMove { dx, dy } = event.payload else {
+        return None;
+    };
+    Some(PointerMoveView {
+        source_host: event.source_host,
+        source_device: event.source_device,
+        sequence: event.sequence,
+        timestamp_ns: event.timestamp_ns,
+        dx,
+        dy,
+    })
 }
 
 impl Default for OutboundQueue {
@@ -413,9 +618,19 @@ mod tests {
         })
     }
 
+    /// A default-configured queue with pointer-move coalescing disabled, for
+    /// tests that assert exact per-frame ordering of consecutive same-device
+    /// moves (the behaviour coalescing deliberately collapses).
+    fn plain_queue() -> OutboundQueue {
+        OutboundQueue::new(QueueConfig {
+            coalesce_pointer_moves: false,
+            ..QueueConfig::default()
+        })
+    }
+
     #[test]
     fn prioritizes_input_then_control_over_background_and_keeps_lane_order() {
-        let mut queue = OutboundQueue::default();
+        let mut queue = plain_queue();
         queue.try_push(clipboard(1)).unwrap();
         queue
             .try_push(WireMessage::Ping(PingV1 {
@@ -439,6 +654,7 @@ mod tests {
             control: 1,
             background: 1,
             maximum_input_burst: 8,
+            coalesce_pointer_moves: false,
         });
         queue.try_push(input(1)).unwrap();
         queue.try_push(clipboard(2)).unwrap();
@@ -454,6 +670,7 @@ mod tests {
     fn liveness_control_cannot_starve_behind_sustained_input() {
         let mut queue = OutboundQueue::new(QueueConfig {
             maximum_input_burst: 2,
+            coalesce_pointer_moves: false,
             ..QueueConfig::default()
         });
         queue
@@ -546,6 +763,7 @@ mod tests {
             control: 1,
             background: 1,
             maximum_input_burst: 8,
+            coalesce_pointer_moves: false,
         });
         // A fresh queue has rejected nothing.
         assert_eq!(queue.drop_counters(), DropCounters::default());
@@ -596,6 +814,7 @@ mod tests {
             control: 4,
             background: 4,
             maximum_input_burst: 8,
+            coalesce_pointer_moves: false,
         });
         queue.try_push(input(1)).unwrap();
         queue.try_push(clipboard(2)).unwrap();
@@ -626,5 +845,213 @@ mod tests {
         assert!(json.contains("\"input\":12"));
         assert!(json.contains("\"control\":3"));
         assert!(json.contains("\"background\":0"));
+    }
+
+    // --- pointer-move coalescing (spec §23) ---
+
+    fn move_from(device: u8, sequence: u64, dx: f64, dy: f64) -> WireMessage {
+        WireMessage::Input(InputEventV1 {
+            sequence,
+            timestamp_ns: sequence.saturating_mul(1_000_000),
+            source_host: WireHostId([1; 16]),
+            source_device: WireDeviceId([device; 16]),
+            payload: WireInputPayloadV1::PointerMove { dx, dy },
+        })
+    }
+
+    fn scroll_from(device: u8, sequence: u64, vertical: f64) -> WireMessage {
+        WireMessage::Input(InputEventV1 {
+            sequence,
+            timestamp_ns: sequence.saturating_mul(1_000_000),
+            source_host: WireHostId([1; 16]),
+            source_device: WireDeviceId([device; 16]),
+            payload: WireInputPayloadV1::Scroll {
+                horizontal: 0.0,
+                vertical,
+            },
+        })
+    }
+
+    /// Extracts the `(sequence, timestamp_ns, dx, dy)` of a coalescable move.
+    fn move_fields(message: WireMessage) -> (u64, u64, f64, f64) {
+        let WireMessage::Input(event) = message else {
+            panic!("expected an input frame, got {:?}", message.message_type());
+        };
+        let WireInputPayloadV1::PointerMove { dx, dy } = event.payload else {
+            panic!("expected a pointer move payload");
+        };
+        (event.sequence, event.timestamp_ns, dx, dy)
+    }
+
+    #[test]
+    fn same_source_moves_coalesce_summing_deltas_and_latest_wins() {
+        let mut queue = OutboundQueue::default();
+        queue.try_push(move_from(2, 1, 10.0, 0.0)).unwrap();
+        queue.try_push(move_from(2, 2, 5.0, 3.0)).unwrap();
+        queue.try_push(move_from(2, 3, -2.0, 1.0)).unwrap();
+
+        // Three same-source moves collapse to a single pending frame.
+        assert_eq!(queue.len_for(TrafficClass::Input), 1);
+        assert_eq!(queue.coalesced_moves(), 2);
+
+        let (seq, ts, dx, dy) = move_fields(queue.pop_next().unwrap());
+        assert_eq!(seq, 3); // latest sequence wins → monotonic gap, no duplicate
+        assert_eq!(ts, 3 * 1_000_000); // latest timestamp wins → fresh latency signal
+        assert!((dx - 13.0).abs() < 1e-9); // 10 + 5 - 2
+        assert!((dy - 4.0).abs() < 1e-9); // 0 + 3 + 1
+        assert!(queue.is_empty());
+    }
+
+    #[test]
+    fn moves_from_distinct_sources_stay_separate() {
+        let mut queue = OutboundQueue::default();
+        queue.try_push(move_from(2, 1, 10.0, 0.0)).unwrap();
+        queue.try_push(move_from(3, 2, 4.0, 4.0)).unwrap(); // different device
+
+        assert_eq!(queue.len_for(TrafficClass::Input), 2);
+        assert_eq!(queue.coalesced_moves(), 0);
+    }
+
+    #[test]
+    fn a_non_move_input_frame_between_moves_blocks_coalescing() {
+        // Keyboard/button/release/transition frames share the input lane but are
+        // never coalesced, so they preserve exact ordering between moves.
+        let mut queue = OutboundQueue::default();
+        queue.try_push(move_from(2, 1, 1.0, 1.0)).unwrap();
+        queue.try_push(commit(2)).unwrap(); // PointerTransitionCommit: Input lane, not a move
+        queue.try_push(move_from(2, 3, 2.0, 2.0)).unwrap();
+
+        assert_eq!(queue.len_for(TrafficClass::Input), 3);
+        assert_eq!(queue.coalesced_moves(), 0);
+        assert!(matches!(queue.pop_next(), Some(WireMessage::Input(_))));
+        assert!(matches!(
+            queue.pop_next(),
+            Some(WireMessage::PointerTransitionCommit(_))
+        ));
+        assert!(matches!(queue.pop_next(), Some(WireMessage::Input(_))));
+    }
+
+    #[test]
+    fn scroll_frames_are_not_coalesced() {
+        let mut queue = OutboundQueue::default();
+        queue.try_push(scroll_from(2, 1, 3.0)).unwrap();
+        queue.try_push(scroll_from(2, 2, 4.0)).unwrap();
+
+        assert_eq!(queue.len_for(TrafficClass::Input), 2);
+        assert_eq!(queue.coalesced_moves(), 0);
+    }
+
+    #[test]
+    fn disabling_coalescing_preserves_every_move_frame() {
+        let mut queue = plain_queue();
+        queue.try_push(move_from(2, 1, 1.0, 0.0)).unwrap();
+        queue.try_push(move_from(2, 2, 1.0, 0.0)).unwrap();
+        queue.try_push(move_from(2, 3, 1.0, 0.0)).unwrap();
+
+        assert_eq!(queue.len_for(TrafficClass::Input), 3);
+        assert_eq!(queue.coalesced_moves(), 0);
+    }
+
+    #[test]
+    fn high_rate_burst_collapses_to_one_drainable_frame() {
+        // Models a high-poll mouse / 175 Hz display driving many moves before
+        // the drain task runs: the queue must not accumulate per-frame latency.
+        let mut queue = OutboundQueue::default();
+        for i in 1..=200 {
+            queue.try_push(move_from(2, i, 0.5, 0.25)).unwrap();
+        }
+
+        assert_eq!(queue.len_for(TrafficClass::Input), 1);
+        assert_eq!(queue.coalesced_moves(), 199);
+
+        let (seq, _, dx, dy) = move_fields(queue.pop_next().unwrap());
+        assert_eq!(seq, 200);
+        assert!((dx - 100.0).abs() < 1e-9); // 200 * 0.5
+        assert!((dy - 50.0).abs() < 1e-9); // 200 * 0.25
+    }
+
+    #[test]
+    fn coalescing_affects_diagnostics_counter_not_drop_counters() {
+        let mut queue = OutboundQueue::default();
+        queue.try_push(move_from(2, 1, 1.0, 0.0)).unwrap();
+        queue.try_push(move_from(2, 2, 1.0, 0.0)).unwrap();
+
+        assert_eq!(queue.coalesced_moves(), 1);
+        // Coalescing preserves deltas — it is never counted as a drop.
+        assert_eq!(queue.drop_counters(), DropCounters::default());
+    }
+
+    #[test]
+    fn session_stats_snapshots_both_coalescing_and_drops() {
+        // A fresh queue reports a clean slate.
+        let mut queue = OutboundQueue::new(QueueConfig {
+            input: 1,
+            control: 1,
+            background: 1,
+            maximum_input_burst: 8,
+            coalesce_pointer_moves: true,
+        });
+        assert_eq!(
+            queue.session_stats(),
+            SessionStats {
+                dropped: DropCounters::default(),
+                coalesced_moves: 0,
+            }
+        );
+
+        // Same-source moves coalesce into one pending frame; a following
+        // different-source move is rejected because the capacity-1 input lane
+        // is full, tallying one input drop.
+        queue.try_push(move_from(2, 1, 1.0, 0.0)).unwrap();
+        queue.try_push(move_from(2, 2, 1.0, 0.0)).unwrap();
+        assert!(queue.try_push(move_from(3, 3, 1.0, 0.0)).is_err());
+
+        let stats = queue.session_stats();
+        assert_eq!(stats.coalesced_moves, 1);
+        assert_eq!(stats.dropped.input, 1);
+        assert_eq!(stats.dropped.total(), 1);
+
+        // Draining the queue does not reset the cumulative counters: a session
+        // that bursted and then quiesced still reports what happened.
+        while queue.pop_next().is_some() {}
+        assert_eq!(queue.session_stats(), stats);
+    }
+
+    #[test]
+    fn observable_session_stats_publishes_snapshots_and_resets() {
+        let observable = ObservableSessionStats::default();
+        // A fresh observable reports a clean slate.
+        assert_eq!(observable.snapshot(), SessionStats::default());
+
+        // Publish reflects the cumulative counters exactly.
+        observable.publish(SessionStats {
+            dropped: DropCounters {
+                input: 7,
+                control: 2,
+                background: 0,
+            },
+            coalesced_moves: 199,
+        });
+        let snapshot = observable.snapshot();
+        assert_eq!(snapshot.dropped.input, 7);
+        assert_eq!(snapshot.dropped.control, 2);
+        assert_eq!(snapshot.dropped.total(), 9);
+        assert_eq!(snapshot.coalesced_moves, 199);
+
+        // A second publish overwrites (counters are cumulative, not additive).
+        observable.publish(SessionStats {
+            dropped: DropCounters {
+                input: 8,
+                control: 2,
+                background: 1,
+            },
+            coalesced_moves: 201,
+        });
+        assert_eq!(observable.snapshot().dropped.input, 8);
+        assert_eq!(observable.snapshot().coalesced_moves, 201);
+
+        // Reset zeroes every counter, modelling the start of a fresh connection.
+        observable.reset();
+        assert_eq!(observable.snapshot(), SessionStats::default());
     }
 }

@@ -28,7 +28,7 @@ pub use device_inventory::{
     MAX_DEVICE_INVENTORY_TOTAL,
 };
 #[cfg(feature = "diagnostics")]
-pub use diagnostics_snapshot::DiagnosticsSnapshot;
+pub use diagnostics_snapshot::{DiagnosticsParts, DiagnosticsSnapshot};
 pub use display_inventory::{
     DisplayInventory, DisplayInventoryConfig, DisplayInventoryError, DisplayInventorySnapshot,
     HostDisplayInventorySnapshot, MAX_INVENTORY_DISPLAYS_PER_HOST, MAX_INVENTORY_REMOTE_HOSTS,

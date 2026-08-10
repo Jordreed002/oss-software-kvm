@@ -13,6 +13,38 @@ use crate::{
 use serde::de::DeserializeOwned;
 use std::collections::{BTreeSet, HashSet};
 
+/// Zero-cost adapter that lets `postcard::to_extend` append into a borrowed
+/// `Vec<u8>` instead of consuming an owned one.
+///
+/// postcard's `to_extend` takes its writer by value (`W: Extend<u8>`) and
+/// returns it wrapped in `Result`; on a serialize error the writer is dropped.
+/// Passing an owned `Vec` therefore loses the allocation on error. This wrapper
+/// borrows the caller's buffer mutably and implements `Extend<u8>` by
+/// delegating to `Vec::extend` (which specializes for contiguous slices), so it
+/// is allocation-free and is the only value consumed on the error path — the
+/// caller's buffer survives with its prior content intact. Used by
+/// [`WireMessage::encode_payload_into`].
+struct BufExt<'a>(&'a mut Vec<u8>);
+
+impl Extend<u8> for BufExt<'_> {
+    fn extend<T: IntoIterator<Item = u8>>(&mut self, iter: T) {
+        self.0.extend(iter);
+    }
+}
+
+/// Appends the postcard serialization of one variant's inner payload into `buf`
+/// through the borrowing [`BufExt`] adapter, returning `Ok(())` so each match
+/// arm in [`WireMessage::encode_payload_into`] stays short and uniform (the
+/// concrete payload type differs per variant, so the dispatching match cannot
+/// be collapsed). Monomorphized and inlined per payload type — zero overhead
+/// versus inlining the call.
+fn append_payload<T: serde::Serialize>(
+    value: &T,
+    buf: &mut Vec<u8>,
+) -> Result<(), postcard::Error> {
+    postcard::to_extend(value, BufExt(buf)).map(drop)
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(u16)]
 pub enum MessageType {
@@ -216,27 +248,53 @@ impl WireMessage {
         Ok(())
     }
 
-    pub(crate) fn encode_payload(&self) -> Result<Vec<u8>, postcard::Error> {
-        match self {
-            Self::Hello(value) => postcard::to_allocvec(value),
-            Self::Authenticate(value) => postcard::to_allocvec(value),
-            Self::DeviceSnapshot(value) => postcard::to_allocvec(value),
-            Self::DeviceAdded(value) => postcard::to_allocvec(value),
-            Self::DeviceRemoved(value) => postcard::to_allocvec(value),
-            Self::DisplaySnapshot(value) => postcard::to_allocvec(value),
-            Self::DisplayUpdated(value) => postcard::to_allocvec(value),
-            Self::Input(value) => postcard::to_allocvec(value),
-            Self::PointerEnter(value) => postcard::to_allocvec(value),
-            Self::PointerLeave(value) => postcard::to_allocvec(value),
-            Self::PointerTransitionAck(value) => postcard::to_allocvec(value),
-            Self::PointerTransitionCommit(value) => postcard::to_allocvec(value),
-            Self::Clipboard(value) => postcard::to_allocvec(value),
-            Self::Ping(value) => postcard::to_allocvec(value),
-            Self::Pong(value) => postcard::to_allocvec(value),
-            Self::ReleaseInput(value) => postcard::to_allocvec(value),
-            Self::ReleaseInputV2(value) => postcard::to_allocvec(value),
-            Self::ReleaseAppliedAckV2(value) => postcard::to_allocvec(value),
+    /// Serializes the message payload by appending it onto `buf`, reusing the
+    /// buffer's existing allocation instead of allocating a fresh `Vec`.
+    ///
+    /// This is the allocation-free hot path used by batch framing: under a
+    /// high-rate input burst many frames are encoded into one reused buffer
+    /// without a per-frame allocation.
+    ///
+    /// On error the buffer is rewound to its entry length — no partially
+    /// appended bytes and no lost allocation — so the caller can rely on the
+    /// buffer being unchanged across a failed encode.
+    pub(crate) fn encode_payload_into(&self, buf: &mut Vec<u8>) -> Result<(), postcard::Error> {
+        // `postcard::to_extend` takes its writer by value and returns
+        // `Result<W>`: on a serialize error the writer is dropped. Passing the
+        // caller's owned `Vec` directly (the prior `mem::take` form) therefore
+        // destroyed the buffer — and its retained capacity — on the error path,
+        // because `to_extend` consumed the moved-out allocation and never gave
+        // it back. `BufExt` instead borrows `buf` mutably and implements
+        // `Extend<u8>` by delegating to `Vec::extend`, so it is the only value
+        // consumed on error; `buf` keeps its allocation and prior content. Each
+        // arm maps the returned `Result<BufExt>` to `Result<()>` inline so the
+        // borrow ends before the truncate below mutates `buf` again.
+        let entry_len = buf.len();
+        let result = match self {
+            Self::Hello(value) => append_payload(value, buf),
+            Self::Authenticate(value) => append_payload(value, buf),
+            Self::DeviceSnapshot(value) => append_payload(value, buf),
+            Self::DeviceAdded(value) => append_payload(value, buf),
+            Self::DeviceRemoved(value) => append_payload(value, buf),
+            Self::DisplaySnapshot(value) => append_payload(value, buf),
+            Self::DisplayUpdated(value) => append_payload(value, buf),
+            Self::Input(value) => append_payload(value, buf),
+            Self::PointerEnter(value) => append_payload(value, buf),
+            Self::PointerLeave(value) => append_payload(value, buf),
+            Self::PointerTransitionAck(value) => append_payload(value, buf),
+            Self::PointerTransitionCommit(value) => append_payload(value, buf),
+            Self::Clipboard(value) => append_payload(value, buf),
+            Self::Ping(value) => append_payload(value, buf),
+            Self::Pong(value) => append_payload(value, buf),
+            Self::ReleaseInput(value) => append_payload(value, buf),
+            Self::ReleaseInputV2(value) => append_payload(value, buf),
+            Self::ReleaseAppliedAckV2(value) => append_payload(value, buf),
+        };
+        if result.is_err() {
+            // Drop any bytes the failing serialize appended before bailing.
+            buf.truncate(entry_len);
         }
+        result
     }
 
     pub(crate) fn decode_payload(
@@ -1098,6 +1156,60 @@ mod tests {
             decode_frame_for_version(&v2, PROTOCOL_VERSION_V2).unwrap(),
             message
         );
+    }
+
+    #[test]
+    fn encode_frame_for_version_into_appends_in_place_and_matches_standalone_encode() {
+        // Reuse one buffer across several frames: each append must extend it
+        // exactly as a standalone encode would, proving the batch framing path
+        // appends serialized bytes in place rather than allocating per frame.
+        let first = WireMessage::Ping(PingV1 {
+            nonce: 1,
+            sent_at_ns: 2,
+        });
+        let second = WireMessage::Pong(PongV1 {
+            nonce: 1,
+            ping_sent_at_ns: 2,
+            received_at_ns: 9,
+        });
+
+        let mut batch = vec![0xAB, 0xCD];
+        let prefix_len = batch.len();
+        encode_frame_for_version_into(&first, PROTOCOL_VERSION_V1, &mut batch).unwrap();
+        encode_frame_for_version_into(&second, PROTOCOL_VERSION_V1, &mut batch).unwrap();
+
+        // The pre-existing bytes are untouched.
+        assert_eq!(&batch[..prefix_len], &[0xAB, 0xCD]);
+
+        let encoded_first = encode_frame_for_version(&first, PROTOCOL_VERSION_V1).unwrap();
+        let encoded_second = encode_frame_for_version(&second, PROTOCOL_VERSION_V1).unwrap();
+        let first_region = prefix_len..prefix_len + encoded_first.len();
+        let second_region = prefix_len + encoded_first.len()..;
+
+        assert_eq!(&batch[first_region.clone()], encoded_first.as_slice());
+        assert_eq!(&batch[second_region.clone()], encoded_second.as_slice());
+
+        // Each appended frame still round-trips independently.
+        assert_eq!(decode_frame(&batch[first_region]).unwrap(), first);
+        assert_eq!(decode_frame(&batch[second_region]).unwrap(), second);
+    }
+
+    #[test]
+    fn encode_frame_for_version_into_leaves_the_buffer_untouched_on_error() {
+        let invalid = WireMessage::PointerLeave(PointerLeaveV1 {
+            transition_id: 1,
+            workspace_epoch: 1,
+            sequence: 1,
+            source_host: HOST_A,
+            source_display: DISPLAY_A,
+            edge: WireEdge::Bottom,
+            normalized_position: f64::NAN,
+        });
+        let mut batch = vec![0x11, 0x22, 0x33];
+        let len_before = batch.len();
+        assert!(encode_frame_for_version_into(&invalid, PROTOCOL_VERSION_V1, &mut batch).is_err());
+        assert_eq!(batch.len(), len_before);
+        assert_eq!(batch, vec![0x11_u8, 0x22, 0x33]);
     }
 
     #[test]
