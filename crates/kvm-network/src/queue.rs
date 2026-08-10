@@ -135,6 +135,42 @@ impl fmt::Display for EnqueueError {
 
 impl Error for EnqueueError {}
 
+/// Cumulative count of messages rejected by [`OutboundQueue::try_push`] because
+/// their lane was full (spec §35 "dropped packets").
+///
+/// The queue never silently drops a message — a rejected frame is returned in
+/// [`EnqueueError`] so the caller can retry, coalesce, or trigger a safety
+/// response. These counters tally those backpressure rejections per traffic
+/// class, giving the diagnostics surface a queue-pressure signal. Plain
+/// integers suffice because [`OutboundQueue`] methods take `&mut self`.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct DropCounters {
+    /// Input-lane rejections: input events, releases, pointer handoffs, device inventory.
+    pub input: u64,
+    /// Control-lane rejections: hello, authenticate, ping, pong.
+    pub control: u64,
+    /// Background-lane rejections: clipboard, display topology.
+    pub background: u64,
+}
+
+impl DropCounters {
+    /// Total rejections across all lanes.
+    #[must_use]
+    pub const fn total(self) -> u64 {
+        self.input + self.control + self.background
+    }
+
+    /// Increments the counter for `class` by one (saturating, so a runaway
+    /// counter never overflows in a long-running session).
+    pub fn bump(&mut self, class: TrafficClass) {
+        match class {
+            TrafficClass::Input => self.input = self.input.saturating_add(1),
+            TrafficClass::Control => self.control = self.control.saturating_add(1),
+            TrafficClass::Background => self.background = self.background.saturating_add(1),
+        }
+    }
+}
+
 /// Bounded, priority-aware outbound queue.
 ///
 /// Input is normally selected first, but one waiting liveness-control frame is
@@ -146,6 +182,7 @@ pub struct OutboundQueue {
     control: VecDeque<WireMessage>,
     background: VecDeque<WireMessage>,
     consecutive_input: usize,
+    dropped: DropCounters,
 }
 
 impl fmt::Debug for OutboundQueue {
@@ -157,6 +194,7 @@ impl fmt::Debug for OutboundQueue {
             .field("control_len", &self.control.len())
             .field("background_len", &self.background.len())
             .field("consecutive_input", &self.consecutive_input)
+            .field("dropped", &self.dropped)
             .finish()
     }
 }
@@ -193,6 +231,7 @@ impl OutboundQueue {
             control: VecDeque::with_capacity(config.control),
             background: VecDeque::with_capacity(config.background),
             consecutive_input: 0,
+            dropped: DropCounters::default(),
             config,
         }
     }
@@ -210,6 +249,7 @@ impl OutboundQueue {
             TrafficClass::Background => (&mut self.background, self.config.background),
         };
         if queue.len() >= capacity {
+            self.dropped.bump(class);
             return Err(EnqueueError {
                 class,
                 capacity,
@@ -249,6 +289,16 @@ impl OutboundQueue {
             TrafficClass::Control => self.control.len(),
             TrafficClass::Background => self.background.len(),
         }
+    }
+
+    /// Cumulative per-lane rejection counts (spec §35 "dropped packets").
+    ///
+    /// Counts messages returned as [`EnqueueError`] because their lane was full.
+    /// The queue itself never silently drops a frame; this is the backpressure
+    /// signal for the diagnostics surface.
+    #[must_use]
+    pub const fn drop_counters(&self) -> DropCounters {
+        self.dropped
     }
 }
 
@@ -486,5 +536,75 @@ mod tests {
             ..QueueConfig::default()
         };
         assert!(OutboundQueue::try_new(invalid).is_err());
+    }
+
+    #[test]
+    fn drop_counters_tally_full_lane_rejections_per_class() {
+        let mut queue = OutboundQueue::new(QueueConfig {
+            input: 1,
+            control: 1,
+            background: 1,
+            maximum_input_burst: 8,
+        });
+        // A fresh queue has rejected nothing.
+        assert_eq!(queue.drop_counters(), DropCounters::default());
+        assert_eq!(queue.drop_counters().total(), 0);
+
+        // Fill the input lane; the next input is rejected and counted as an Input drop.
+        queue.try_push(input(1)).unwrap();
+        assert!(queue.try_push(input(2)).is_err());
+        assert_eq!(queue.drop_counters().input, 1);
+        assert_eq!(queue.drop_counters().control, 0);
+        assert_eq!(queue.drop_counters().background, 0);
+        assert_eq!(queue.drop_counters().total(), 1);
+
+        // A second rejection of the same lane keeps tallying.
+        assert!(queue.try_push(input(3)).is_err());
+        assert_eq!(queue.drop_counters().input, 2);
+        assert_eq!(queue.drop_counters().total(), 2);
+
+        // Rejections in other lanes are counted against their own class.
+        queue.try_push(clipboard(10)).unwrap();
+        assert!(queue.try_push(clipboard(11)).is_err());
+        assert_eq!(queue.drop_counters().background, 1);
+        assert_eq!(queue.drop_counters().input, 2);
+
+        queue
+            .try_push(WireMessage::Ping(PingV1 {
+                nonce: 20,
+                sent_at_ns: 20,
+            }))
+            .unwrap();
+        assert!(queue
+            .try_push(WireMessage::Ping(PingV1 {
+                nonce: 21,
+                sent_at_ns: 21,
+            }))
+            .is_err());
+        assert_eq!(queue.drop_counters().control, 1);
+        assert_eq!(
+            queue.drop_counters().total(),
+            2 + 1 + 1 // input + background + control
+        );
+    }
+
+    #[test]
+    fn successful_push_does_not_increment_drop_counters() {
+        let mut queue = OutboundQueue::new(QueueConfig {
+            input: 4,
+            control: 4,
+            background: 4,
+            maximum_input_burst: 8,
+        });
+        queue.try_push(input(1)).unwrap();
+        queue.try_push(clipboard(2)).unwrap();
+        queue
+            .try_push(WireMessage::Ping(PingV1 {
+                nonce: 3,
+                sent_at_ns: 3,
+            }))
+            .unwrap();
+        // All pushes succeeded under capacity → no drops recorded.
+        assert_eq!(queue.drop_counters(), DropCounters::default());
     }
 }
