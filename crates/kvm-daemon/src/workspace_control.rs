@@ -125,6 +125,7 @@ pub struct WorkspaceControlPlane {
     selected_inventory_ready: bool,
     device_resync_required: BTreeSet<(kvm_types::HostId, ConnectionGeneration)>,
     pending_local_devices: Option<PendingLocalDeviceInventory>,
+    native_portal_armed: bool,
     shutting_down: bool,
 }
 
@@ -175,6 +176,7 @@ impl fmt::Debug for WorkspaceControlPlane {
                 "local_device_update_pending",
                 &self.pending_local_devices.is_some(),
             )
+            .field("native_portal_armed", &self.native_portal_armed)
             .field("shutting_down", &self.shutting_down)
             .finish_non_exhaustive()
     }
@@ -220,6 +222,7 @@ impl WorkspaceControlPlane {
             selected_inventory_ready: false,
             device_resync_required: BTreeSet::new(),
             pending_local_devices: None,
+            native_portal_armed: true,
             shutting_down: false,
         })
     }
@@ -295,7 +298,18 @@ impl WorkspaceControlPlane {
                 candidate = Some((display.clone(), edge, normalized));
             }
         }
-        let (display, edge, normalized) = candidate?;
+        let Some((display, edge, normalized)) = candidate else {
+            // A portal which has just transferred authority remains disarmed
+            // until the cursor is observed strictly inside the destination.
+            // This prevents its landing coordinate from immediately proposing
+            // the reverse transition on the next native polling tick.
+            self.native_portal_armed = true;
+            return None;
+        };
+        if !self.native_portal_armed {
+            return None;
+        }
+        self.native_portal_armed = false;
         let logical_position = match edge {
             Edge::Left => Point::new(0.0, normalized * display.logical_size.height),
             Edge::Right => Point::new(
@@ -520,6 +534,13 @@ impl WorkspaceControlPlane {
                 self.require_selected(session)?;
                 self.ready_pointer_mut()?
                     .receive_commit(session, message, now_ns)?;
+                if self
+                    .pointer
+                    .as_ref()
+                    .is_some_and(PointerHandoffCoordinator::has_local_authority)
+                {
+                    self.native_portal_armed = false;
+                }
                 self.publish_pointer_workspace(routing, now_ns)?;
             }
             other => return Ok(PeerEventOutcome::Deferred(other.message_type())),

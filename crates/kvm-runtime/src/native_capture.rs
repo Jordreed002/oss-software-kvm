@@ -216,6 +216,7 @@ pub struct NativeCaptureSupervisor<B: InputCaptureBackend, R> {
     metrics: Arc<SharedCaptureMetrics>,
     state: NativeCaptureState,
     cursor_visible: bool,
+    local_warp_pending: bool,
     pointer_observations: u64,
     pointer_transitions: u64,
     pointer_observation_failures: u64,
@@ -272,6 +273,7 @@ where
             metrics: Arc::new(SharedCaptureMetrics::default()),
             state: NativeCaptureState::LocalOnly,
             cursor_visible: true,
+            local_warp_pending: false,
             pointer_observations: 0,
             pointer_transitions: 0,
             pointer_observation_failures: 0,
@@ -370,8 +372,8 @@ where
             return Ok(self.state);
         }
         if self.backend.capture_lifecycle() == CaptureLifecycleState::Running {
-            self.observe_cursor_position(now_ns);
             self.sync_cursor_visibility(now_ns)?;
+            self.observe_cursor_position(now_ns);
             return Ok(self.state);
         }
 
@@ -381,6 +383,7 @@ where
             let _ = self.backend.set_cursor_visible(true);
         }
         self.cursor_visible = true;
+        self.local_warp_pending = false;
         let _ = self.backend.stop_capture();
         self.state = NativeCaptureState::Degraded;
         Err(NativeCaptureError::new(NativeCaptureErrorKind::Lifecycle))
@@ -431,6 +434,7 @@ where
             let _ = self.backend.set_cursor_visible(true);
         }
         self.cursor_visible = true;
+        self.local_warp_pending = false;
         let stop_result = self.backend.stop_capture();
         if stop_result.is_err() {
             self.state = NativeCaptureState::Degraded;
@@ -493,10 +497,20 @@ where
             };
             (local_authority, local_position)
         };
-        if self.cursor_visible == local_authority {
+        if local_authority && local_position.is_none() {
+            // Effective authority fails open locally while an inbound handoff
+            // is still settling, before the committed landing point is
+            // available. Remember that the visible cursor still needs its
+            // destination warp once the coordinator publishes that point.
+            self.local_warp_pending = true;
+        }
+        let should_warp = local_authority
+            && local_position.is_some()
+            && (!self.cursor_visible || self.local_warp_pending);
+        if self.cursor_visible == local_authority && !should_warp {
             return Ok(());
         }
-        let position_result = if local_authority {
+        let position_result = if should_warp {
             local_position.map_or(Ok(()), |position| {
                 self.backend.set_cursor_position(position)
             })
@@ -505,8 +519,10 @@ where
         };
         if position_result.is_ok() && local_authority && local_position.is_some() {
             self.cursor_warps = self.cursor_warps.saturating_add(1);
+            self.local_warp_pending = false;
         }
-        let visibility_result = if position_result.is_ok() {
+        let visibility_changed = self.cursor_visible != local_authority;
+        let visibility_result = if position_result.is_ok() && visibility_changed {
             self.backend.set_cursor_visible(local_authority)
         } else {
             position_result
@@ -516,16 +532,22 @@ where
             let _ = self.gate_router(now_ns);
             let _ = self.backend.set_cursor_visible(true);
             self.cursor_visible = true;
+            self.local_warp_pending = false;
             let _ = self.backend.stop_capture();
             self.state = NativeCaptureState::Degraded;
             return Err(NativeCaptureError::new(NativeCaptureErrorKind::Cursor));
         }
-        if local_authority {
-            self.cursor_shows = self.cursor_shows.saturating_add(1);
-        } else {
-            self.cursor_hides = self.cursor_hides.saturating_add(1);
+        if visibility_changed {
+            if local_authority {
+                self.cursor_shows = self.cursor_shows.saturating_add(1);
+            } else {
+                self.cursor_hides = self.cursor_hides.saturating_add(1);
+            }
         }
         self.cursor_visible = local_authority;
+        if !local_authority {
+            self.local_warp_pending = false;
+        }
         Ok(())
     }
 }
@@ -675,8 +697,9 @@ mod tests {
             Ok(())
         }
 
-        fn set_cursor_position(&mut self, _position: Point) -> Result<(), PlatformError> {
+        fn set_cursor_position(&mut self, position: Point) -> Result<(), PlatformError> {
             lock(&self.events).push("cursor_warp");
+            lock(&self.control).cursor_position = Some(position);
             Ok(())
         }
 
@@ -742,7 +765,7 @@ mod tests {
             _now_ns: u64,
         ) -> Result<bool, Self::Error> {
             self.observed_position = Some(position);
-            Ok(false)
+            Ok(self.local_position.is_some() && position.y <= 1.0)
         }
     }
 
@@ -887,6 +910,42 @@ mod tests {
             *lock(&events),
             vec!["cursor_hide", "cursor_warp", "cursor_show"]
         );
+    }
+
+    #[test]
+    fn delayed_return_warp_precedes_portal_observation() {
+        let (mut supervisor, backend, router, events) = fixture(CaptureDisposition::AllowLocal);
+        supervisor.start(10).unwrap();
+        lock(&events).clear();
+
+        lock(&router).local_authority = false;
+        supervisor.poll_lifecycle(20).unwrap();
+        lock(&backend).cursor_position = Some(Point::new(960.0, 0.0));
+
+        // An inbound handoff fails open locally while its committed landing
+        // position is not published yet. The visible cursor remains at the
+        // stale portal coordinate, so the supervisor must remember to warp it.
+        lock(&router).local_authority = true;
+        supervisor.poll_lifecycle(30).unwrap();
+        assert!(lock(&backend).cursor_visible);
+        assert_eq!(supervisor.metrics().pointer_transitions, 0);
+
+        lock(&router).local_position = Some(Point::new(960.0, 2.0));
+        supervisor.poll_lifecycle(40).unwrap();
+
+        assert_eq!(lock(&backend).cursor_position, Some(Point::new(960.0, 2.0)));
+        assert_eq!(
+            lock(&router).observed_position,
+            Some(Point::new(960.0, 2.0))
+        );
+        assert_eq!(supervisor.metrics().pointer_transitions, 0);
+        assert_eq!(
+            *lock(&events),
+            vec!["cursor_hide", "cursor_show", "cursor_warp"]
+        );
+
+        supervisor.poll_lifecycle(50).unwrap();
+        assert_eq!(supervisor.metrics().cursor_warps, 1);
     }
 
     #[test]

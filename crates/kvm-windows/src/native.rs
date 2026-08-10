@@ -71,7 +71,10 @@ use crate::capture::{
     LOW_LEVEL_KEY_INJECTED, LOW_LEVEL_KEY_UP, LOW_LEVEL_MOUSE_INJECTED,
 };
 use crate::identity::{container_scoped_raw_input_identity, usb_ids_from_device_path};
-use crate::mapping::{key_is_released, mouse_action, scan_code, MouseAction, WHEEL_DELTA};
+use crate::mapping::{
+    key_is_released, mouse_action, scan_code, windows_key_for_macos_source, MouseAction,
+    WHEEL_DELTA,
+};
 use crate::ownership::{ClaimError, RegistrationState};
 use crate::{
     derive_device_id, CapabilityState, CaptureStatistics, SuppressionScope, WindowsBackendError,
@@ -1111,6 +1114,7 @@ pub struct WindowsOutputBackend {
     pointer_remainder_y: f64,
     horizontal_wheel_remainder: f64,
     vertical_wheel_remainder: f64,
+    macos_modifier_roles: bool,
 }
 
 impl WindowsOutputBackend {
@@ -1121,6 +1125,20 @@ impl WindowsOutputBackend {
             pointer_remainder_y: 0.0,
             horizontal_wheel_remainder: 0.0,
             vertical_wheel_remainder: 0.0,
+            macos_modifier_roles: false,
+        }
+    }
+
+    /// Creates an injector that maps macOS Command to Windows Alt and macOS
+    /// Option to the Windows key.
+    #[must_use]
+    pub const fn new_from_macos() -> Self {
+        Self {
+            pointer_remainder_x: 0.0,
+            pointer_remainder_y: 0.0,
+            horizontal_wheel_remainder: 0.0,
+            vertical_wheel_remainder: 0.0,
+            macos_modifier_roles: true,
         }
     }
 
@@ -1133,6 +1151,11 @@ impl WindowsOutputBackend {
 
         match payload {
             InputPayload::Key { code, state } => {
+                let code = if self.macos_modifier_roles {
+                    windows_key_for_macos_source(code)
+                } else {
+                    code
+                };
                 let mapping = scan_code(code).ok_or_else(|| {
                     WindowsBackendError::UnsupportedInput(format!(
                         "key {code:?} has no reliable SendInput scan-code mapping"
