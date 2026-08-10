@@ -571,6 +571,14 @@ pub struct DaemonCore {
     workspace_ready: bool,
     handoff_pending: bool,
     snapshots: Arc<ArcSwap<RoutingSnapshot>>,
+    /// §35 input-event-rate meter; present only with the `diagnostics` feature.
+    #[cfg(feature = "diagnostics")]
+    event_rate: kvm_input::EventRateMeter,
+    /// §36 source-side capture→routing-decision latency history; present only
+    /// with the `diagnostics` feature. The dest-side capture→injection span is
+    /// owned by each peer session coordinator.
+    #[cfg(feature = "diagnostics")]
+    source_latency: kvm_input::LatencyHistory,
 }
 
 impl fmt::Debug for DaemonCore {
@@ -651,12 +659,67 @@ impl DaemonCore {
             workspace_ready: false,
             handoff_pending: false,
             snapshots: Arc::new(ArcSwap::from_pointee(initial)),
+            #[cfg(feature = "diagnostics")]
+            event_rate: kvm_input::EventRateMeter::default(),
+            #[cfg(feature = "diagnostics")]
+            source_latency: kvm_input::LatencyHistory::default(),
         })
     }
 
     #[must_use]
     pub fn config(&self) -> &Config {
         &self.config
+    }
+
+    /// §35 input-event-rate snapshot for the diagnostics surface (spec §35).
+    ///
+    /// Only present when the daemon is built with the `diagnostics` feature;
+    /// absent (like the meter itself) in release builds.
+    #[cfg(feature = "diagnostics")]
+    #[must_use]
+    pub fn event_rate_snapshot(&self, now_ns: u64) -> kvm_input::EventRateSnapshot {
+        self.event_rate.snapshot(now_ns)
+    }
+
+    /// §36 source-side capture→routing-decision latency statistics (spec §36).
+    ///
+    /// The capture→routing-decision span is the source-half of the input
+    /// pipeline: how long after capture the daemon reached its routing
+    /// decision. Returns `None` until the first event is processed. Only
+    /// present when the daemon is built with the `diagnostics` feature.
+    #[cfg(feature = "diagnostics")]
+    #[must_use]
+    pub fn source_latency_stats(&self) -> Option<kvm_input::LatencyStats> {
+        self.source_latency.stats()
+    }
+
+    /// Unified §35/§36 diagnostics snapshot for the local control IPC surface
+    /// (spec §31). Fills the §35 event-rate and §36 source-side capture→routing
+    /// latency portions from this core and composes the caller-supplied §35
+    /// injected-event count, the §36 capture→network-send and capture→injection
+    /// latency stats (owned by a peer session coordinator), and §35
+    /// dropped-packets counters (owned by the outbound queue) into one
+    /// wire-ready [`DiagnosticsSnapshot`].
+    ///
+    /// Only present when the daemon is built with the `diagnostics` feature.
+    #[cfg(feature = "diagnostics")]
+    #[must_use]
+    pub fn diagnostics_snapshot(
+        &self,
+        now_ns: u64,
+        injected_events: u64,
+        network_send_latency: Option<kvm_input::LatencyStats>,
+        injection_latency: Option<kvm_input::LatencyStats>,
+        dropped_packets: kvm_network::DropCounters,
+    ) -> crate::DiagnosticsSnapshot {
+        crate::DiagnosticsSnapshot::from_parts(
+            self.event_rate.snapshot(now_ns),
+            injected_events,
+            self.source_latency_stats(),
+            network_send_latency,
+            injection_latency,
+            dropped_packets,
+        )
     }
 
     #[must_use]
@@ -708,6 +771,30 @@ impl DaemonCore {
         captured: CapturedInput,
         now_ns: u64,
     ) -> Result<CaptureDecision, CoreCaptureError> {
+        // §35 input-event-rate: record every captured event by its capture
+        // timestamp (no extra clock read). This lives in `prepare_captured` —
+        // the single routing entry point shared by the production path
+        // (`PeerSessionCoordinator::route_captured` → here) and the test-facing
+        // `process_captured` — so the meter runs in every build, not just tests.
+        // Dev-only; absent without the `diagnostics` feature.
+        #[cfg(feature = "diagnostics")]
+        self.event_rate.record(captured.event.timestamp_ns);
+        // §36 source-side sub-span: capture→routing-decision. The capture
+        // instant travels on the event; `now_ns` is the routing-decision instant
+        // supplied by the caller, so this needs no extra clock read. Dev-only;
+        // absent without the `diagnostics` feature.
+        #[cfg(feature = "diagnostics")]
+        {
+            let stamps = kvm_input::LatencyStamps::default()
+                .with_capture(captured.event.timestamp_ns)
+                .with_routing_decision(now_ns);
+            if let Some(span) = stamps.span_ns(
+                kvm_input::LatencyStage::Capture,
+                kvm_input::LatencyStage::RoutingDecision,
+            ) {
+                self.source_latency.push(span);
+            }
+        }
         if self.pending_remote.is_some() {
             return Err(CoreCaptureError::Unavailable);
         }
@@ -1018,6 +1105,10 @@ impl DaemonCore {
     /// back to local control.
     #[must_use]
     pub fn process_captured(&mut self, captured: CapturedInput, now_ns: u64) -> ProcessResult {
+        // §35/§36 diagnostics stamping now lives in `prepare_captured` (the
+        // single routing entry point shared with the production
+        // `route_captured` path), so it runs in every build configuration —
+        // not just when tests go through this wrapper.
         let decision = self.prepare_captured(captured, now_ns);
         let outcome = match decision {
             Ok(
@@ -2297,6 +2388,81 @@ mod tests {
 
     fn core() -> DaemonCore {
         core_with_routes([])
+    }
+
+    #[cfg(feature = "diagnostics")]
+    #[test]
+    fn diagnostics_event_rate_counts_every_captured_event() {
+        // §35 wiring smoke test: process_captured feeds the meter using the
+        // event's own capture timestamp, so the snapshot reflects the capture rate.
+        let mut core = core();
+        for (seq, ts_ns) in [(1u64, 0u64), (2, 100_000_000), (3, 200_000_000)] {
+            let _ = core.process_captured(
+                CapturedInput::new(
+                    InputEvent::new(
+                        seq,
+                        ts_ns,
+                        LOCAL,
+                        DEVICE,
+                        InputPayload::Key {
+                            code: KeyCode::KeyA,
+                            state: KeyState::Pressed,
+                        },
+                    ),
+                    EventClassification::Physical,
+                ),
+                ts_ns,
+            );
+        }
+        let snap = core.event_rate_snapshot(200_000_000);
+        assert!(
+            snap.total_events >= 3,
+            "meter should count captured events: {snap:?}"
+        );
+        assert!(
+            snap.window_events >= 1,
+            "window should be non-empty: {snap:?}"
+        );
+    }
+
+    #[cfg(feature = "diagnostics")]
+    #[test]
+    fn diagnostics_source_latency_records_capture_to_routing_span() {
+        // §36 source-side wiring: process_captured stamps capture (event ts) and
+        // routing-decision (now_ns) and pushes their span. now_ns deliberately
+        // trails the capture timestamp by 4ms so the span is observable.
+        let mut core = core();
+        for (seq, ts_ns, now_ns) in [(1u64, 0u64, 4_000_000u64), (2, 100_000_000, 104_000_000)] {
+            let _ = core.process_captured(
+                CapturedInput::new(
+                    InputEvent::new(
+                        seq,
+                        ts_ns,
+                        LOCAL,
+                        DEVICE,
+                        InputPayload::Key {
+                            code: KeyCode::KeyA,
+                            state: KeyState::Pressed,
+                        },
+                    ),
+                    EventClassification::Physical,
+                ),
+                now_ns,
+            );
+        }
+        let stats = core
+            .source_latency_stats()
+            .expect("at least one span recorded");
+        assert_eq!(stats.count, 2, "both events should produce a span");
+        assert_eq!(stats.min_ns, 4_000_000);
+        assert_eq!(stats.max_ns, 4_000_000);
+    }
+
+    #[cfg(feature = "diagnostics")]
+    #[test]
+    fn diagnostics_source_latency_is_none_before_first_event() {
+        let core = core();
+        assert!(core.source_latency_stats().is_none());
     }
 
     fn installed_endpoint(core: &DaemonCore) -> SessionEndpoint {

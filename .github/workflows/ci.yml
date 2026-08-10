@@ -28,3 +28,10 @@ jobs:
         run: cargo clippy --workspace --all-targets -- -D warnings
       - name: Run tests
         run: cargo test --workspace --all-targets
+      # The diagnostics subsystem (spec §35/§36) is feature-gated and off by
+      # default, so the steps above never compile or test it. Mirror the
+      # dev-only feature here so regressions in feature-gated code surface in CI.
+      - name: Check lints (diagnostics feature)
+        run: cargo clippy --workspace --all-targets --features kvm-daemon/diagnostics -- -D warnings
+      - name: Run tests (diagnostics feature)
+        run: cargo test --workspace --all-targets --features kvm-daemon/diagnostics

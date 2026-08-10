@@ -330,6 +330,22 @@ pub struct PeerSessionCoordinator<I, O> {
     inbound_pressed: BTreeMap<DeviceId, PressedState>,
     synthetic_sequence: u64,
     outbound_sequence: u64,
+    /// §36 capture→injection latency ring; present only with the `diagnostics` feature.
+    #[cfg(feature = "diagnostics")]
+    injection_latency: kvm_input::LatencyHistory,
+    /// §36 source-side capture→network-send latency ring; present only with the
+    /// `diagnostics` feature. Spans physical capture to the frame being handed
+    /// to the outbound channel at this host. Together with the core-owned
+    /// capture→routing span it isolates dispatch/queue latency
+    /// (routing→send = capture→send − capture→routing).
+    #[cfg(feature = "diagnostics")]
+    network_send_latency: kvm_input::LatencyHistory,
+    /// §35 cumulative count of inbound events injected at this peer; present
+    /// only with the `diagnostics` feature. Mirrors the capture-side
+    /// input-event-rate total so a diagnostics surface can detect one-way
+    /// delivery asymmetry (events captured but not injected).
+    #[cfg(feature = "diagnostics")]
+    injected_events: u64,
 }
 
 /// Borrow-only routing composition for one exact current session.
@@ -556,11 +572,50 @@ where
             inbound_pressed: BTreeMap::new(),
             synthetic_sequence: 0,
             outbound_sequence: 1,
+            #[cfg(feature = "diagnostics")]
+            injection_latency: kvm_input::LatencyHistory::default(),
+            #[cfg(feature = "diagnostics")]
+            network_send_latency: kvm_input::LatencyHistory::default(),
+            #[cfg(feature = "diagnostics")]
+            injected_events: 0,
         })
     }
 
     pub(crate) const fn outbound_mut(&mut self) -> &mut O {
         &mut self.outbound
+    }
+
+    /// §36 capture→injection latency statistics for the diagnostics surface.
+    ///
+    /// `None` until at least one injected event has been recorded. Only present
+    /// with the `diagnostics` feature; absent in release builds.
+    #[cfg(feature = "diagnostics")]
+    #[must_use]
+    pub fn injection_latency_stats(&self) -> Option<kvm_input::LatencyStats> {
+        self.injection_latency.stats()
+    }
+
+    /// §36 source-side capture→network-send latency statistics for the
+    /// diagnostics surface — the span from physical capture to the frame being
+    /// handed to the outbound channel at this host. `None` until at least one
+    /// remotely-dispatched event has been recorded. Only present with the
+    /// `diagnostics` feature; absent in release builds. Subtracting the
+    /// core-owned capture→routing span from this isolates the dispatch/queue
+    /// latency on the source host.
+    #[cfg(feature = "diagnostics")]
+    #[must_use]
+    pub fn network_send_latency_stats(&self) -> Option<kvm_input::LatencyStats> {
+        self.network_send_latency.stats()
+    }
+
+    /// §35 cumulative count of inbound events injected at this peer. Only
+    /// present with the `diagnostics` feature; absent in release builds.
+    /// Pairs with the capture-side input-event-rate total so a diagnostics
+    /// surface can detect one-way delivery asymmetry.
+    #[cfg(feature = "diagnostics")]
+    #[must_use]
+    pub const fn injected_events(&self) -> u64 {
+        self.injected_events
     }
 
     #[must_use]
@@ -728,31 +783,83 @@ where
                 error: CoordinatorError::Core(error),
             })?;
         match decision {
-            CaptureDecision::Fault { outcome, error } => Err(CoordinatorCaptureFailure {
-                outcome: Some(outcome),
-                error: CoordinatorError::Core(error),
-            }),
+            CaptureDecision::Fault { outcome, error } => {
+                // §25 / F-02: the chord activation sets `failsafe_activated`
+                // even when `activate_failsafe` itself fails on cleanup
+                // bookkeeping — routing is already suspended by then, so the
+                // user believes they have escaped. Release peer-injected
+                // inbound modifiers (best-effort) exactly as the Local/Inert
+                // arm above, so the same F-02 gap can't hide on this path.
+                // `release_all_inbound` clears `inbound_pressed` for every
+                // successfully-injected release regardless of the returned
+                // error; if it fails, an unreleased held key (injection
+                // backend) is the more dangerous condition, so surface that
+                // over the core cleanup-bookkeeping error.
+                let error = if outcome.failsafe_activated() {
+                    match self.release_all_inbound(now_ns) {
+                        Ok(()) => CoordinatorError::Core(error),
+                        Err(release_error) => release_error,
+                    }
+                } else {
+                    CoordinatorError::Core(error)
+                };
+                Err(CoordinatorCaptureFailure {
+                    outcome: Some(outcome),
+                    error,
+                })
+            }
             CaptureDecision::Local(outcome) | CaptureDecision::Inert(outcome) => {
-                self.drain_remote_cleanup(now_ns)
-                    .map_err(|error| CoordinatorCaptureFailure {
+                // §25 / F-02: the emergency chord failsafe must release
+                // peer-injected inbound modifiers too, not just drain outbound —
+                // otherwise the user regains control of the machine with the
+                // peer's modifiers still physically held. Mirrors
+                // trigger_capture_emergency (the capture-discontinuation path),
+                // which exists for exactly this reason.
+                let inbound_result = if outcome.failsafe_activated() {
+                    self.release_all_inbound(now_ns)
+                } else {
+                    Ok(())
+                };
+                let outbound_result = self.drain_remote_cleanup(now_ns);
+                combine_cleanup_results(inbound_result, outbound_result).map_err(|error| {
+                    CoordinatorCaptureFailure {
                         outcome: Some(outcome),
                         error,
-                    })?;
+                    }
+                })?;
                 Ok(outcome)
             }
             CaptureDecision::Remote(effect) => {
                 let dispatch = self.dispatch_remote_effect(&effect);
                 match dispatch {
-                    Ok(accepted_sequence) => self
-                        .core
-                        .confirm_remote_input(effect, accepted_sequence, now_ns)
-                        .map_err(|error| CoordinatorCaptureFailure {
-                            // The frame already entered the exact FIFO. Local
-                            // delivery would duplicate it even if the later
-                            // in-memory confirmation failed.
-                            outcome: Some(CaptureOutcome::remote_queued()),
-                            error: CoordinatorError::Core(error),
-                        }),
+                    Ok(accepted_sequence) => {
+                        // §36 capture→network-send: dispatch just handed the
+                        // frame to the outbound channel, so `now_ns` is the send
+                        // instant and the event's source-capture timestamp is
+                        // the capture instant. Read before `effect` moves into
+                        // confirmation. Dev-only; absent without `diagnostics`.
+                        #[cfg(feature = "diagnostics")]
+                        {
+                            let stamps = kvm_input::LatencyStamps::new()
+                                .with_capture(effect.event().timestamp_ns)
+                                .with_network_send(now_ns);
+                            if let Some(span) = stamps.span_ns(
+                                kvm_input::LatencyStage::Capture,
+                                kvm_input::LatencyStage::NetworkSend,
+                            ) {
+                                self.network_send_latency.push(span);
+                            }
+                        }
+                        self.core
+                            .confirm_remote_input(effect, accepted_sequence, now_ns)
+                            .map_err(|error| CoordinatorCaptureFailure {
+                                // The frame already entered the exact FIFO. Local
+                                // delivery would duplicate it even if the later
+                                // in-memory confirmation failed.
+                                outcome: Some(CaptureOutcome::remote_queued()),
+                                error: CoordinatorError::Core(error),
+                            })
+                    }
                     Err(error) => {
                         let outcome = self.core.fail_remote_input(effect, now_ns).ok();
                         Err(CoordinatorCaptureFailure { outcome, error })
@@ -1247,6 +1354,22 @@ where
         if self.injection.inject(&event).is_err() {
             return Err(self.fail_session(CoordinatorError::Injection, now_ns));
         }
+        // §36 capture→injection latency: the destination's `now_ns` minus the
+        // event's source-capture timestamp is the end-to-end span. Dev-only;
+        // absent without the `diagnostics` feature. The intermediate routing /
+        // network sub-spans are source-side and not measurable at this host.
+        #[cfg(feature = "diagnostics")]
+        self.injection_latency.push_stamps(
+            kvm_input::LatencyStamps::new()
+                .with_capture(event.timestamp_ns)
+                .with_injection_request(now_ns),
+        );
+        // §35 injected-event counter: one per event successfully injected at
+        // this peer. Dev-only; absent without the `diagnostics` feature.
+        #[cfg(feature = "diagnostics")]
+        {
+            self.injected_events = self.injected_events.saturating_add(1);
+        }
         if release {
             if let Some(state) = self.inbound_pressed.get_mut(&event.source_device) {
                 state.apply(&event.payload);
@@ -1719,6 +1842,283 @@ mod tests {
 
     fn coordinator() -> PeerSessionCoordinator<RecordingInjection, RecordingOutbound> {
         coordinator_between(LOCAL, REMOTE)
+    }
+
+    #[cfg(feature = "diagnostics")]
+    #[test]
+    fn diagnostics_capture_to_injection_latency_is_recorded() {
+        // §36 wiring smoke test: inject_received stamps capture (event timestamp)
+        // and injection (dest now_ns), so injection_latency_stats reflects the
+        // end-to-end span once at least one event has been injected.
+        let mut coord = coordinator();
+        assert!(coord.injection_latency_stats().is_none());
+
+        // Capture at t=1_000ns; inject at now=5_000ns → 4_000ns span.
+        let event = InputEvent::new(
+            1,
+            1_000,
+            REMOTE,
+            DEVICE,
+            InputPayload::Key {
+                code: KeyCode::KeyA,
+                state: KeyState::Pressed,
+            },
+        );
+        coord.test_hold_inbound(event, 5_000).unwrap();
+
+        let stats = coord
+            .injection_latency_stats()
+            .expect("latency recorded after an injected event");
+        assert!(stats.count >= 1, "at least one sample: {stats:?}");
+        assert_eq!(stats.max_ns, 4_000, "capture→injection span: {stats:?}");
+    }
+
+    #[cfg(feature = "diagnostics")]
+    #[test]
+    fn diagnostics_injected_events_counts_each_injected_event() {
+        // §35 wiring: inject_received tallies one per successfully injected
+        // event, mirroring the capture-side event-rate total.
+        let mut coord = coordinator();
+        assert_eq!(
+            coord.injected_events(),
+            0,
+            "fresh coordinator injects nothing"
+        );
+
+        for seq in 1..=3 {
+            let event = InputEvent::new(
+                seq,
+                1_000,
+                REMOTE,
+                DEVICE,
+                InputPayload::Key {
+                    code: KeyCode::KeyA,
+                    state: KeyState::Pressed,
+                },
+            );
+            coord.test_hold_inbound(event, 5_000).unwrap();
+        }
+        assert_eq!(coord.injected_events(), 3, "three events injected");
+    }
+
+    #[cfg(feature = "diagnostics")]
+    #[test]
+    fn diagnostics_capture_to_network_send_latency_is_recorded() {
+        // §36 wiring: route_captured stamps capture (event timestamp) and
+        // network-send (dispatch now_ns) when a captured event is dispatched to
+        // the admitted remote peer, so network_send_latency_stats reflects the
+        // source-side pipeline span once at least one event has been sent.
+        let mut coord = coordinator();
+        assert!(
+            coord.network_send_latency_stats().is_none(),
+            "no samples before the first dispatched event"
+        );
+        admit(&mut coord);
+        coord.core.mark_workspace_routing_ready(0).unwrap();
+        // Active host = REMOTE so a default FollowActiveHost device routes
+        // outbound to the admitted peer.
+        coord
+            .core
+            .update_workspace(
+                WorkspaceState::new(LOCAL, REMOTE, LogicalPointer::new(DISPLAY, 1.0, 1.0)),
+                1,
+            )
+            .unwrap();
+
+        // Capture at t=1_000ns; dispatch at now=5_000ns → 4_000ns span.
+        let captured = CapturedInput::new(
+            InputEvent::new(
+                1,
+                1_000,
+                LOCAL,
+                DEVICE,
+                InputPayload::Key {
+                    code: KeyCode::KeyA,
+                    state: KeyState::Pressed,
+                },
+            ),
+            crate::EventClassification::Physical,
+        );
+        coord.route_captured(captured, 5_000).unwrap();
+
+        let stats = coord
+            .network_send_latency_stats()
+            .expect("latency recorded after a dispatched event");
+        assert!(stats.count >= 1, "at least one sample: {stats:?}");
+        assert_eq!(stats.max_ns, 4_000, "capture→network-send span: {stats:?}");
+    }
+
+    #[cfg(feature = "diagnostics")]
+    #[test]
+    fn diagnostics_production_path_records_event_rate_and_source_latency() {
+        // Regression for the §35/§36 wiring: event-rate and source-side
+        // capture→routing latency must be stamped on the PRODUCTION path
+        // (`route_captured` → `prepare_captured`), not only the test-facing
+        // `process_captured`. Without this the headline metrics read zero in
+        // the only build configuration where they matter. Mirrors the
+        // network-send test's setup (active host = REMOTE so the event routes
+        // outbound) but inspects the core-owned collectors.
+        let mut coord = coordinator();
+        admit(&mut coord);
+        coord.core.mark_workspace_routing_ready(0).unwrap();
+        coord
+            .core
+            .update_workspace(
+                WorkspaceState::new(LOCAL, REMOTE, LogicalPointer::new(DISPLAY, 1.0, 1.0)),
+                1,
+            )
+            .unwrap();
+
+        // Capture at t=1_000ns; routing decision at now=5_000ns → 4_000ns span.
+        let captured = CapturedInput::new(
+            InputEvent::new(
+                1,
+                1_000,
+                LOCAL,
+                DEVICE,
+                InputPayload::Key {
+                    code: KeyCode::KeyA,
+                    state: KeyState::Pressed,
+                },
+            ),
+            crate::EventClassification::Physical,
+        );
+        coord.route_captured(captured, 5_000).unwrap();
+
+        let rate = coord.core.event_rate_snapshot(5_000);
+        assert!(
+            rate.total_events >= 1,
+            "production path must feed the event-rate meter: {rate:?}"
+        );
+        let latency = coord
+            .core
+            .source_latency_stats()
+            .expect("production path must stamp capture→routing latency");
+        assert!(latency.count >= 1, "at least one span: {latency:?}");
+        assert_eq!(latency.max_ns, 4_000, "capture→routing span: {latency:?}");
+    }
+
+    #[test]
+    fn failsafe_chord_releases_peer_injected_inbound_modifiers() {
+        // §25 / F-02: when the local user presses the escape chord while this
+        // host is the destination (active_host == local) and a peer has injected
+        // a held modifier into us, the chord must release that inbound modifier
+        // — not just drain outbound cleanup. The capture-discontinuation path
+        // already does this (trigger_capture_emergency); this test pins the
+        // chord path to the same invariant. Default chord: Ctrl+Alt+Shift+Backspace.
+        let mut coord = coordinator();
+        admit(&mut coord);
+        coord.core.mark_workspace_routing_ready(0).unwrap();
+        // coordinator() starts with active_host == LOCAL: we are the
+        // destination. Have the remote peer inject a held modifier.
+        let injected = InputEvent::new(
+            1,
+            1_000,
+            REMOTE,
+            DEVICE,
+            InputPayload::Key {
+                code: KeyCode::ControlLeft,
+                state: KeyState::Pressed,
+            },
+        );
+        coord.test_hold_inbound(injected, 1_000).unwrap();
+        assert!(
+            !coord.inbound_pressed.is_empty(),
+            "peer-injected modifier is held before the chord"
+        );
+
+        // Local user presses the failsafe chord (helper presses
+        // Ctrl+Alt+Shift, then Backspace) and returns the outcome.
+        let outcome = drive_failsafe_chord(&mut coord);
+        assert!(
+            outcome.failsafe_activated(),
+            "the chord must activate the failsafe"
+        );
+        assert!(
+            coord.inbound_pressed.is_empty(),
+            "failsafe must release the peer-injected inbound modifier (F-02)"
+        );
+    }
+
+    /// Presses the default failsafe chord (Ctrl+Alt+Shift+Backspace) on the
+    /// local device through `route_captured` and returns the final outcome.
+    /// Used by the §25 failsafe-chord inbound-release tests.
+    fn drive_failsafe_chord(
+        coord: &mut PeerSessionCoordinator<RecordingInjection, RecordingOutbound>,
+    ) -> CaptureOutcome {
+        for code in [KeyCode::ControlLeft, KeyCode::AltLeft, KeyCode::ShiftLeft] {
+            coord
+                .route_captured(
+                    CapturedInput::new(
+                        InputEvent::new(
+                            1,
+                            2_000,
+                            LOCAL,
+                            DEVICE,
+                            InputPayload::Key {
+                                code,
+                                state: KeyState::Pressed,
+                            },
+                        ),
+                        crate::EventClassification::Physical,
+                    ),
+                    2_000,
+                )
+                .unwrap();
+        }
+        coord
+            .route_captured(
+                CapturedInput::new(
+                    InputEvent::new(
+                        2,
+                        3_000,
+                        LOCAL,
+                        DEVICE,
+                        InputPayload::Key {
+                            code: KeyCode::Backspace,
+                            state: KeyState::Pressed,
+                        },
+                    ),
+                    crate::EventClassification::Physical,
+                ),
+                3_000,
+            )
+            .unwrap()
+    }
+
+    #[test]
+    fn failsafe_chord_releases_peer_injected_inbound_pointer_button() {
+        // §25 also covers pointer buttons, not just keys: a peer-injected held
+        // button must be released when the chord fires. Mirrors the key variant
+        // but injects a PointerButton press.
+        let mut coord = coordinator();
+        admit(&mut coord);
+        coord.core.mark_workspace_routing_ready(0).unwrap();
+        let injected = InputEvent::new(
+            1,
+            1_000,
+            REMOTE,
+            DEVICE,
+            InputPayload::PointerButton {
+                button: kvm_input::PointerButton::Left,
+                state: ButtonState::Pressed,
+            },
+        );
+        coord.test_hold_inbound(injected, 1_000).unwrap();
+        assert!(
+            !coord.inbound_pressed.is_empty(),
+            "peer-injected button is held before the chord"
+        );
+
+        let outcome = drive_failsafe_chord(&mut coord);
+        assert!(
+            outcome.failsafe_activated(),
+            "the chord must activate the failsafe"
+        );
+        assert!(
+            coord.inbound_pressed.is_empty(),
+            "failsafe must release the peer-injected inbound button (F-02)"
+        );
     }
 
     fn binding_between(local: HostId, remote: HostId, nonce: u8) -> AdmittedSessionBinding {

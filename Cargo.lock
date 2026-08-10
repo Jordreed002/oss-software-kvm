@@ -458,6 +458,8 @@ dependencies = [
  "kvm-security",
  "kvm-topology",
  "kvm-types",
+ "serde",
+ "serde_json",
  "thiserror",
  "tokio",
  "tracing",
@@ -512,6 +514,8 @@ version = "0.1.0"
 dependencies = [
  "kvm-protocol",
  "rcgen",
+ "serde",
+ "serde_json",
  "sha2",
  "subtle",
  "thiserror",

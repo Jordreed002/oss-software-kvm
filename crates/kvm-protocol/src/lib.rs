@@ -4,11 +4,13 @@
 //! model. Callers must deliberately translate to and from `kvm-types` and
 //! `kvm-input`; this keeps the public wire format independently versionable.
 
+mod control;
 mod error;
 mod frame;
 mod message;
 mod wire;
 
+pub use control::*;
 pub use error::{ProtocolError, ValidationError};
 pub use frame::{
     decode_frame, decode_frame_for_version, encode_frame, encode_frame_for_version,

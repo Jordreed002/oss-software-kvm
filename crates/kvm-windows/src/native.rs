@@ -1142,6 +1142,7 @@ impl WindowsOutputBackend {
         }
     }
 
+    #[allow(clippy::too_many_lines)]
     fn inject_payload(&mut self, payload: InputPayload) -> Result<(), WindowsBackendError> {
         if !payload.is_finite() {
             return Err(WindowsBackendError::InvalidInput(
