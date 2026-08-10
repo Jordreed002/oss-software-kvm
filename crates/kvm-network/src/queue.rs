@@ -1,4 +1,5 @@
 use kvm_protocol::{MessageType, WireMessage};
+use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
 use std::error::Error;
 use std::fmt;
@@ -143,7 +144,7 @@ impl Error for EnqueueError {}
 /// response. These counters tally those backpressure rejections per traffic
 /// class, giving the diagnostics surface a queue-pressure signal. Plain
 /// integers suffice because [`OutboundQueue`] methods take `&mut self`.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub struct DropCounters {
     /// Input-lane rejections: input events, releases, pointer handoffs, device inventory.
     pub input: u64,
@@ -606,5 +607,24 @@ mod tests {
             .unwrap();
         // All pushes succeeded under capacity → no drops recorded.
         assert_eq!(queue.drop_counters(), DropCounters::default());
+    }
+
+    #[test]
+    fn drop_counters_round_trip_through_serde() {
+        // §35 "dropped packets" ships over the diagnostics surface, so the wire
+        // representation must be stable and round-trip exactly.
+        let counters = DropCounters {
+            input: 12,
+            control: 3,
+            background: 0,
+        };
+        let json = serde_json::to_string(&counters).expect("serialize");
+        let back: DropCounters = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(counters, back);
+        assert_eq!(back.total(), 15);
+        // Pin the per-lane field names.
+        assert!(json.contains("\"input\":12"));
+        assert!(json.contains("\"control\":3"));
+        assert!(json.contains("\"background\":0"));
     }
 }
