@@ -674,6 +674,28 @@ impl DaemonCore {
         self.event_rate.snapshot(now_ns)
     }
 
+    /// Unified §35/§36 diagnostics snapshot for the local control IPC surface
+    /// (spec §31). Fills the §35 event-rate portion from this core and composes
+    /// the caller-supplied §36 injection-latency stats (owned by a peer session
+    /// coordinator) and §35 dropped-packets counters (owned by the outbound
+    /// queue) into one wire-ready [`DiagnosticsSnapshot`].
+    ///
+    /// Only present when the daemon is built with the `diagnostics` feature.
+    #[cfg(feature = "diagnostics")]
+    #[must_use]
+    pub fn diagnostics_snapshot(
+        &self,
+        now_ns: u64,
+        injection_latency: Option<kvm_input::LatencyStats>,
+        dropped_packets: kvm_network::DropCounters,
+    ) -> crate::DiagnosticsSnapshot {
+        crate::DiagnosticsSnapshot::from_parts(
+            self.event_rate.snapshot(now_ns),
+            injection_latency,
+            dropped_packets,
+        )
+    }
+
     #[must_use]
     pub const fn workspace(&self) -> WorkspaceState {
         self.workspace

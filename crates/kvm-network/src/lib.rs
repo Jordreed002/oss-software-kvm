@@ -46,7 +46,7 @@ pub use peer::{
     PersistentPeer, PersistentPeerConfig, ReconnectJitter, SecurePeerSession, SessionAdmission,
     SessionEnd, SessionError, UndeliveredMessage, UndeliveredTraffic,
 };
-pub use queue::{EnqueueError, OutboundQueue, QueueConfig, QueueConfigError, TrafficClass};
+pub use queue::{DropCounters, EnqueueError, OutboundQueue, QueueConfig, QueueConfigError, TrafficClass};
 pub use reconnect::{ReconnectBackoff, ReconnectPolicy, ReconnectPolicyError};
 pub use rustls_acceptor::{
     RustlsAcceptedPeerStream, RustlsAcceptorConfig, RustlsAcceptorConfigError, RustlsClientTrust,

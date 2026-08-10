@@ -6,6 +6,8 @@
 
 mod core;
 mod device_inventory;
+#[cfg(feature = "diagnostics")]
+mod diagnostics_snapshot;
 mod display_inventory;
 mod peer_manager;
 mod platform;
@@ -25,6 +27,8 @@ pub use device_inventory::{
     HostDeviceInventorySnapshot, MAX_DEVICE_INVENTORY_PER_HOST, MAX_DEVICE_INVENTORY_REMOTE_HOSTS,
     MAX_DEVICE_INVENTORY_TOTAL,
 };
+#[cfg(feature = "diagnostics")]
+pub use diagnostics_snapshot::DiagnosticsSnapshot;
 pub use display_inventory::{
     DisplayInventory, DisplayInventoryConfig, DisplayInventoryError, DisplayInventorySnapshot,
     HostDisplayInventorySnapshot, MAX_INVENTORY_DISPLAYS_PER_HOST, MAX_INVENTORY_REMOTE_HOSTS,
