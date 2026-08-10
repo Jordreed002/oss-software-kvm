@@ -739,6 +739,11 @@ struct PendingFrame {
     /// byte offset within `bytes`, so failure accounting can mark each message
     /// fully sent, partially sent, or not yet sent relative to `committed`.
     frames: Vec<(UndeliveredMessage, usize)>,
+    /// The messages popped from the queue for this batch, in pop order.
+    /// Retained across batches (cleared, not reallocated) so a failure mid-batch
+    /// can hand every already-popped-but-not-yet-returned message back to the
+    /// queue via `unpop`. Mirrors the reuse strategy of `bytes`/`frames`.
+    popped: Vec<WireMessage>,
 }
 
 /// One-shot direction-neutral owner for an already established secure stream.
@@ -1339,6 +1344,7 @@ impl PendingFrame {
         // reallocating a fresh buffer for every batch under sustained throughput.
         reusable.bytes.clear();
         reusable.frames.clear();
+        reusable.popped.clear();
         reusable.committed = 0;
         // Pre-size both buffers to the frames this batch will encode (bounded by
         // the batch cap) so the burst serializes into the allocation grown once
@@ -1347,6 +1353,7 @@ impl PendingFrame {
         // the request, so this costs nothing at steady state.
         let frame_budget = queue.len().min(OUTBOUND_BATCH_MAX_FRAMES);
         reusable.frames.reserve(frame_budget);
+        reusable.popped.reserve(frame_budget);
         reusable
             .bytes
             .reserve(frame_budget * OUTBOUND_BATCH_FRAME_BYTES_ESTIMATE);
@@ -1364,7 +1371,17 @@ impl PendingFrame {
                 &mut reusable.bytes,
             ) {
                 reusable.bytes.truncate(before);
+                // Hand every message popped for this batch back to the queue in
+                // reverse pop order so the original send order is restored: the
+                // failing message first, then the messages already successfully
+                // encoded ahead of it. Previously only the failing message was
+                // returned, dropping every earlier-popped message on the floor
+                // (they were popped off the queue but never encoded into a
+                // committed batch).
                 queue.unpop(message);
+                for prior in reusable.popped.drain(..).rev() {
+                    queue.unpop(prior);
+                }
                 return Err(NetworkError::from(error).into());
             }
             // From the second frame onward, keep the batch under the byte cap by
@@ -1372,12 +1389,17 @@ impl PendingFrame {
             // it alone exceeds the cap, so a lone large frame never stalls.
             if !reusable.frames.is_empty() && reusable.bytes.len() > OUTBOUND_BATCH_MAX_BYTES {
                 reusable.bytes.truncate(before);
+                // The byte-cap break is not an error: the messages popped so far
+                // (including this one) form a valid batch's worth, and this
+                // message leads the next batch. Only `message` returns to the
+                // queue; the messages already in `popped` belong to this batch.
                 queue.unpop(message);
                 break;
             }
             reusable
                 .frames
                 .push((undelivered_metadata(&message, false), reusable.bytes.len()));
+            reusable.popped.push(message);
         }
         Ok(reusable)
     }
@@ -1684,6 +1706,16 @@ async fn run_session_with_stats<S: SecurePeerStream, A: SessionAdmission>(
             }
             read_result = reader.read_and_drain(&mut read_progress, &mut inbound_messages) => {
                 read_result?;
+                // `read_and_drain` makes forward progress on every successful
+                // call: it either decodes at least one buffered frame into
+                // `inbound_messages`, or performs a transport read. A completed
+                // call that leaves `inbound_messages` empty while no bytes
+                // remain buffered would mean neither happened — a regression in
+                // the receive hot path worth catching in debug builds.
+                debug_assert!(
+                    !inbound_messages.is_empty() || read_progress.buffered_bytes() > 0,
+                    "read_and_drain made no forward progress"
+                );
                 for message in inbound_messages.drain(..) {
                     handle_inbound(
                         message,

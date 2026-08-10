@@ -52,6 +52,34 @@ pub struct DiagnosticsSnapshot {
     pub coalesced_moves: u64,
 }
 
+/// Named inputs to [`DiagnosticsSnapshot::from_parts`].
+///
+/// The seven collectors are owned by different components (the §35 meter and
+/// §36 source-side history on `DaemonCore`; the §35 injected count, §36 send /
+/// injection histories on a peer session; §35 drops and §23 coalescing on the
+/// outbound queue), so `from_parts` still takes them as one bundle. Bundling
+/// them as *named fields* — rather than positional parameters — removes the
+/// silent-transposition risk between the two bare `u64` counters
+/// (`injected_events` and `coalesced_moves`): a call site spells each field by
+/// name and the compiler rejects a swapped pair.
+#[derive(Clone, Copy, Debug)]
+pub struct DiagnosticsParts {
+    /// §35 input-event rate as observed on this host's capture hot path.
+    pub event_rate: kvm_input::EventRateSnapshot,
+    /// §35 cumulative count of inbound events injected at this peer.
+    pub injected_events: u64,
+    /// §36 source-side capture→routing-decision latency distribution.
+    pub source_latency: Option<kvm_input::LatencyStats>,
+    /// §36 source-side capture→network-send latency distribution.
+    pub network_send_latency: Option<kvm_input::LatencyStats>,
+    /// §36 capture→injection latency distribution.
+    pub injection_latency: Option<kvm_input::LatencyStats>,
+    /// §35 "dropped packets": per-lane outbound backpressure rejections.
+    pub dropped_packets: kvm_network::DropCounters,
+    /// §23 cumulative same-source `PointerMove` frames coalesced on enqueue.
+    pub coalesced_moves: u64,
+}
+
 impl DiagnosticsSnapshot {
     /// Assembles a snapshot from its independently-owned collectors.
     ///
@@ -60,17 +88,19 @@ impl DiagnosticsSnapshot {
     /// injected-event count, the §36 capture→network-send history and the §36
     /// injection history on a peer session coordinator, and the §35 drop
     /// counters on the outbound queue. [`DaemonCore::diagnostics_snapshot`]
-    /// fills the two core-owned portions and forwards the rest.
+    /// fills the two core-owned portions and forwards the rest as a named
+    /// [`DiagnosticsParts`] bundle.
     #[must_use]
-    pub fn from_parts(
-        event_rate: kvm_input::EventRateSnapshot,
-        injected_events: u64,
-        source_latency: Option<kvm_input::LatencyStats>,
-        network_send_latency: Option<kvm_input::LatencyStats>,
-        injection_latency: Option<kvm_input::LatencyStats>,
-        dropped_packets: kvm_network::DropCounters,
-        coalesced_moves: u64,
-    ) -> Self {
+    pub fn from_parts(parts: DiagnosticsParts) -> Self {
+        let DiagnosticsParts {
+            event_rate,
+            injected_events,
+            source_latency,
+            network_send_latency,
+            injection_latency,
+            dropped_packets,
+            coalesced_moves,
+        } = parts;
         Self {
             event_rate,
             injected_events,
@@ -117,15 +147,15 @@ mod tests {
         drops.bump(TrafficClass::Input);
         drops.bump(TrafficClass::Control);
 
-        let snapshot = DiagnosticsSnapshot::from_parts(
-            sample_event_rate(),
-            7,
-            Some(sample_latency()),
-            Some(sample_latency()),
-            Some(sample_latency()),
-            drops,
-            12,
-        );
+        let snapshot = DiagnosticsSnapshot::from_parts(DiagnosticsParts {
+            event_rate: sample_event_rate(),
+            injected_events: 7,
+            source_latency: Some(sample_latency()),
+            network_send_latency: Some(sample_latency()),
+            injection_latency: Some(sample_latency()),
+            dropped_packets: drops,
+            coalesced_moves: 12,
+        });
         assert_eq!(snapshot.event_rate.window_events, 42);
         assert_eq!(snapshot.injected_events, 7);
         assert_eq!(
@@ -159,15 +189,15 @@ mod tests {
     fn latency_fields_are_optional_before_first_event() {
         // No event processed locally and no peer has injected yet → all three
         // §36 latency distributions are absent.
-        let snapshot = DiagnosticsSnapshot::from_parts(
-            sample_event_rate(),
-            0,
-            None,
-            None,
-            None,
-            DropCounters::default(),
-            0,
-        );
+        let snapshot = DiagnosticsSnapshot::from_parts(DiagnosticsParts {
+            event_rate: sample_event_rate(),
+            injected_events: 0,
+            source_latency: None,
+            network_send_latency: None,
+            injection_latency: None,
+            dropped_packets: DropCounters::default(),
+            coalesced_moves: 0,
+        });
         assert!(snapshot.source_latency.is_none());
         assert!(snapshot.network_send_latency.is_none());
         assert!(snapshot.injection_latency.is_none());
@@ -180,15 +210,15 @@ mod tests {
         // stable and round-trip exactly. Pin the six top-level field names.
         let mut drops = DropCounters::default();
         drops.bump(TrafficClass::Background);
-        let snapshot = DiagnosticsSnapshot::from_parts(
-            sample_event_rate(),
-            99,
-            Some(sample_latency()),
-            None,
-            Some(sample_latency()),
-            drops,
-            250,
-        );
+        let snapshot = DiagnosticsSnapshot::from_parts(DiagnosticsParts {
+            event_rate: sample_event_rate(),
+            injected_events: 99,
+            source_latency: Some(sample_latency()),
+            network_send_latency: None,
+            injection_latency: Some(sample_latency()),
+            dropped_packets: drops,
+            coalesced_moves: 250,
+        });
 
         let json = serde_json::to_string(&snapshot).expect("serialize");
         let back: DiagnosticsSnapshot = serde_json::from_str(&json).expect("deserialize");

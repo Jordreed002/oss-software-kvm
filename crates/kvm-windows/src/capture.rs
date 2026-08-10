@@ -163,13 +163,14 @@ pub(crate) fn translate_keyboard(packet: RawKeyboardPacket) -> Option<InputPaylo
 /// Decodes one Raw Input mouse packet into zero-or-more input payloads.
 ///
 /// Returns a fixed-capacity stack buffer ([`MousePayloads`]) rather than a
-/// `Vec`: a mouse packet yields at most one motion, five button transitions, and
-/// two scrolls (eight payloads), all carried by the `Copy` [`InputPayload`]. A
-/// high-poll-rate mouse (1–8 kHz) therefore decodes with no per-packet heap
-/// allocation — the buffer lives on the decoder's stack — instead of the
-/// thousands of short-lived `malloc`/`free` pairs a `Vec::with_capacity(7)` per
-/// packet would produce. Payloads flow into the input channel as owned values
-/// via the consuming iterator.
+/// `Vec`: a mouse packet yields at most one motion, ten button transitions (a
+/// press and a release per button across left/right/middle/back/forward), and
+/// a vertical plus horizontal scroll (thirteen payloads), all carried by the
+/// `Copy` [`InputPayload`]. A high-poll-rate mouse (1–8 kHz) therefore decodes
+/// with no per-packet heap allocation — the buffer lives on the decoder's stack
+/// — instead of the thousands of short-lived `malloc`/`free` pairs a
+/// `Vec::with_capacity(13)` per packet would produce. Payloads flow into the
+/// input channel as owned values via the consuming iterator.
 pub(crate) fn translate_mouse(packet: RawMousePacket) -> MousePayloads {
     let mut events = MousePayloads::new();
 
@@ -236,10 +237,11 @@ pub(crate) fn translate_mouse(packet: RawMousePacket) -> MousePayloads {
     events
 }
 
-/// Maximum payloads one mouse packet can yield: one motion, five button
-/// transitions (down/up per button across left/right/middle/back/forward), and
-/// a vertical plus horizontal scroll.
-const MOUSE_PAYLOAD_CAPACITY: usize = 8;
+/// Maximum payloads one mouse packet can yield: one motion, ten button
+/// transitions (a press and a release per button across left/right/middle/back/
+/// forward — a packet may set both the down and up flags for a button at once),
+/// and a vertical plus horizontal scroll.
+const MOUSE_PAYLOAD_CAPACITY: usize = 13;
 
 /// Fixed-capacity, stack-resident buffer for the payloads decoded from one
 /// mouse packet. Avoids the per-packet heap allocation a `Vec` would impose on
@@ -604,23 +606,49 @@ mod tests {
 
     #[test]
     fn mouse_payloads_decode_without_heap_allocation_and_respect_capacity() {
-        // A maximal packet (motion + every button down + both wheels) yields
-        // exactly the capacity and never overflows the fixed buffer.
+        // A maximal packet — motion, a press AND a release for every one of the
+        // five buttons (a packet may set both the down and up flag at once), and
+        // a vertical plus horizontal scroll — yields exactly thirteen payloads,
+        // which is the capacity. With the prior capacity of 8 this packet
+        // silently dropped button transitions past the eighth slot.
+        let all_buttons_down_up = RAW_MOUSE_LEFT_DOWN
+            | RAW_MOUSE_LEFT_UP
+            | RAW_MOUSE_RIGHT_DOWN
+            | RAW_MOUSE_RIGHT_UP
+            | RAW_MOUSE_MIDDLE_DOWN
+            | RAW_MOUSE_MIDDLE_UP
+            | RAW_MOUSE_BACK_DOWN
+            | RAW_MOUSE_BACK_UP
+            | RAW_MOUSE_FORWARD_DOWN
+            | RAW_MOUSE_FORWARD_UP;
         let events = translate_mouse(RawMousePacket {
             state_flags: 0,
-            button_flags: RAW_MOUSE_LEFT_DOWN
-                | RAW_MOUSE_RIGHT_DOWN
-                | RAW_MOUSE_MIDDLE_DOWN
-                | RAW_MOUSE_BACK_DOWN
-                | RAW_MOUSE_FORWARD_DOWN
-                | RAW_MOUSE_WHEEL
-                | RAW_MOUSE_HWHEEL,
+            button_flags: all_buttons_down_up | RAW_MOUSE_WHEEL | RAW_MOUSE_HWHEEL,
             button_data: 120,
             dx: 1,
             dy: 1,
         });
         let collected = events.into_iter().collect::<Vec<_>>();
         assert_eq!(collected.len(), MOUSE_PAYLOAD_CAPACITY);
+
+        // Every button produced both a Pressed and a Released transition, in
+        // the decode order translate_mouse emits (left, right, middle, back,
+        // forward — each down before its up).
+        let button = |b: PointerButton| {
+            collected
+                .iter()
+                .filter(|p| matches!(p, InputPayload::PointerButton { button, .. } if *button == b))
+                .count()
+        };
+        for b in [
+            PointerButton::Left,
+            PointerButton::Right,
+            PointerButton::Middle,
+            PointerButton::Back,
+            PointerButton::Forward,
+        ] {
+            assert_eq!(button(b), 2, "button {b:?} lost a transition");
+        }
 
         // A fresh buffer is empty; pushing the full capacity drains exactly that
         // many payloads, and a push past capacity saturates (drops the extra)

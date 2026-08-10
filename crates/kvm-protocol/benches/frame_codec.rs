@@ -53,7 +53,13 @@ fn main() {
         "encode_frame_for_version (fresh Vec per frame)",
         |_| {
             for _ in 0..FRAMES_PER_RUN {
-                let _ = encode_frame_for_version(&message, CURRENT_PROTOCOL_VERSION);
+                // black_box the message (prevent constant-folding the input)
+                // and the returned frame (prevent dead-code elimination of the
+                // encode, whose dropped Vec the optimizer could otherwise skip).
+                let _ = std::hint::black_box(encode_frame_for_version(
+                    std::hint::black_box(&message),
+                    CURRENT_PROTOCOL_VERSION,
+                ));
             }
         },
     );
@@ -68,7 +74,14 @@ fn main() {
             let mut buf = Vec::with_capacity(4 * 1024);
             for _ in 0..FRAMES_PER_RUN {
                 buf.clear();
-                let _ = encode_frame_for_version_into(&message, CURRENT_PROTOCOL_VERSION, &mut buf);
+                let _ = encode_frame_for_version_into(
+                    std::hint::black_box(&message),
+                    CURRENT_PROTOCOL_VERSION,
+                    &mut buf,
+                );
+                // Force the buffer writes to be observable so the encode cannot
+                // be elided just because `buf` is cleared next iteration.
+                std::hint::black_box(&buf);
             }
         },
     );
@@ -82,7 +95,10 @@ fn main() {
         "decode_frame_for_version (inbound per-frame deserialize)",
         |_| {
             for _ in 0..FRAMES_PER_RUN {
-                let _ = decode_frame_for_version(&encoded, CURRENT_PROTOCOL_VERSION);
+                let _ = std::hint::black_box(decode_frame_for_version(
+                    std::hint::black_box(&encoded),
+                    CURRENT_PROTOCOL_VERSION,
+                ));
             }
         },
     );
@@ -96,9 +112,16 @@ fn main() {
             let mut buf = Vec::with_capacity(4 * 1024);
             for _ in 0..FRAMES_PER_RUN {
                 buf.clear();
-                encode_frame_for_version_into(&message, CURRENT_PROTOCOL_VERSION, &mut buf)
-                    .expect("encode");
-                let _ = decode_frame_for_version(&buf, CURRENT_PROTOCOL_VERSION).expect("decode");
+                encode_frame_for_version_into(
+                    std::hint::black_box(&message),
+                    CURRENT_PROTOCOL_VERSION,
+                    &mut buf,
+                )
+                .expect("encode");
+                let _ = std::hint::black_box(
+                    decode_frame_for_version(std::hint::black_box(&buf), CURRENT_PROTOCOL_VERSION)
+                        .expect("decode"),
+                );
             }
         },
     );

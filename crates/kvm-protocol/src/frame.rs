@@ -182,12 +182,18 @@ pub fn encode_frame_for_version_into(
     // payload has been serialized so we never need to know its size up front.
     out.extend_from_slice(&[0_u8; FRAME_HEADER_LEN]);
     let payload_start = out.len();
-    message
-        .encode_payload_into(out)
-        .map_err(|error| ProtocolError::Encode {
+    // `encode_payload_into` already rewinds its payload region on failure, but
+    // we also drop the placeholder header so the whole frame entry is removed:
+    // on error `out` is restored to its `header_start` length, exactly as the
+    // `PayloadTooLarge` branch below does, keeping the buffer usable for the
+    // caller's next frame.
+    if let Err(error) = message.encode_payload_into(out) {
+        out.truncate(header_start);
+        return Err(ProtocolError::Encode {
             message_type,
             detail: error.to_string(),
-        })?;
+        });
+    }
     let payload_len = out.len() - payload_start;
     if payload_len > MAX_FRAME_PAYLOAD {
         out.truncate(header_start);

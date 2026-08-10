@@ -13,6 +13,25 @@ use crate::{
 use serde::de::DeserializeOwned;
 use std::collections::{BTreeSet, HashSet};
 
+/// Zero-cost adapter that lets `postcard::to_extend` append into a borrowed
+/// `Vec<u8>` instead of consuming an owned one.
+///
+/// postcard's `to_extend` takes its writer by value (`W: Extend<u8>`) and
+/// returns it wrapped in `Result`; on a serialize error the writer is dropped.
+/// Passing an owned `Vec` therefore loses the allocation on error. This wrapper
+/// borrows the caller's buffer mutably and implements `Extend<u8>` by
+/// delegating to `Vec::extend` (which specializes for contiguous slices), so it
+/// is allocation-free and is the only value consumed on the error path — the
+/// caller's buffer survives with its prior content intact. Used by
+/// [`WireMessage::encode_payload_into`].
+struct BufExt<'a>(&'a mut Vec<u8>);
+
+impl Extend<u8> for BufExt<'_> {
+    fn extend<T: IntoIterator<Item = u8>>(&mut self, iter: T) {
+        self.0.extend(iter);
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(u16)]
 pub enum MessageType {
@@ -222,34 +241,47 @@ impl WireMessage {
     /// This is the allocation-free hot path used by batch framing: under a
     /// high-rate input burst many frames are encoded into one reused buffer
     /// without a per-frame allocation.
+    ///
+    /// On error the buffer is rewound to its entry length — no partially
+    /// appended bytes and no lost allocation — so the caller can rely on the
+    /// buffer being unchanged across a failed encode.
     pub(crate) fn encode_payload_into(&self, buf: &mut Vec<u8>) -> Result<(), postcard::Error> {
-        // `mem::take` moves the existing allocation into `owned`, appends the
-        // serialized payload into it via `to_extend`, then restores it. The
-        // empty `Vec` left by `take` never allocates, so this is allocation-free
-        // whenever `buf` already holds sufficient capacity.
-        let mut owned = std::mem::take(buf);
-        owned = match self {
-            Self::Hello(value) => postcard::to_extend(value, owned),
-            Self::Authenticate(value) => postcard::to_extend(value, owned),
-            Self::DeviceSnapshot(value) => postcard::to_extend(value, owned),
-            Self::DeviceAdded(value) => postcard::to_extend(value, owned),
-            Self::DeviceRemoved(value) => postcard::to_extend(value, owned),
-            Self::DisplaySnapshot(value) => postcard::to_extend(value, owned),
-            Self::DisplayUpdated(value) => postcard::to_extend(value, owned),
-            Self::Input(value) => postcard::to_extend(value, owned),
-            Self::PointerEnter(value) => postcard::to_extend(value, owned),
-            Self::PointerLeave(value) => postcard::to_extend(value, owned),
-            Self::PointerTransitionAck(value) => postcard::to_extend(value, owned),
-            Self::PointerTransitionCommit(value) => postcard::to_extend(value, owned),
-            Self::Clipboard(value) => postcard::to_extend(value, owned),
-            Self::Ping(value) => postcard::to_extend(value, owned),
-            Self::Pong(value) => postcard::to_extend(value, owned),
-            Self::ReleaseInput(value) => postcard::to_extend(value, owned),
-            Self::ReleaseInputV2(value) => postcard::to_extend(value, owned),
-            Self::ReleaseAppliedAckV2(value) => postcard::to_extend(value, owned),
-        }?;
-        *buf = owned;
-        Ok(())
+        // `postcard::to_extend` takes its writer by value and returns
+        // `Result<W>`: on a serialize error the writer is dropped. Passing the
+        // caller's owned `Vec` directly (the prior `mem::take` form) therefore
+        // destroyed the buffer — and its retained capacity — on the error path,
+        // because `to_extend` consumed the moved-out allocation and never gave
+        // it back. `BufExt` instead borrows `buf` mutably and implements
+        // `Extend<u8>` by delegating to `Vec::extend`, so it is the only value
+        // consumed on error; `buf` keeps its allocation and prior content. Each
+        // arm maps the returned `Result<BufExt>` to `Result<()>` inline so the
+        // borrow ends before the truncate below mutates `buf` again.
+        let entry_len = buf.len();
+        let result = match self {
+            Self::Hello(value) => postcard::to_extend(value, BufExt(buf)).map(|_| ()),
+            Self::Authenticate(value) => postcard::to_extend(value, BufExt(buf)).map(|_| ()),
+            Self::DeviceSnapshot(value) => postcard::to_extend(value, BufExt(buf)).map(|_| ()),
+            Self::DeviceAdded(value) => postcard::to_extend(value, BufExt(buf)).map(|_| ()),
+            Self::DeviceRemoved(value) => postcard::to_extend(value, BufExt(buf)).map(|_| ()),
+            Self::DisplaySnapshot(value) => postcard::to_extend(value, BufExt(buf)).map(|_| ()),
+            Self::DisplayUpdated(value) => postcard::to_extend(value, BufExt(buf)).map(|_| ()),
+            Self::Input(value) => postcard::to_extend(value, BufExt(buf)).map(|_| ()),
+            Self::PointerEnter(value) => postcard::to_extend(value, BufExt(buf)).map(|_| ()),
+            Self::PointerLeave(value) => postcard::to_extend(value, BufExt(buf)).map(|_| ()),
+            Self::PointerTransitionAck(value) => postcard::to_extend(value, BufExt(buf)).map(|_| ()),
+            Self::PointerTransitionCommit(value) => postcard::to_extend(value, BufExt(buf)).map(|_| ()),
+            Self::Clipboard(value) => postcard::to_extend(value, BufExt(buf)).map(|_| ()),
+            Self::Ping(value) => postcard::to_extend(value, BufExt(buf)).map(|_| ()),
+            Self::Pong(value) => postcard::to_extend(value, BufExt(buf)).map(|_| ()),
+            Self::ReleaseInput(value) => postcard::to_extend(value, BufExt(buf)).map(|_| ()),
+            Self::ReleaseInputV2(value) => postcard::to_extend(value, BufExt(buf)).map(|_| ()),
+            Self::ReleaseAppliedAckV2(value) => postcard::to_extend(value, BufExt(buf)).map(|_| ()),
+        };
+        if result.is_err() {
+            // Drop any bytes the failing serialize appended before bailing.
+            buf.truncate(entry_len);
+        }
+        result
     }
 
     pub(crate) fn decode_payload(

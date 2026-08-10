@@ -117,9 +117,14 @@ async fn main() {
         &client_config,
         &frame,
         |mut client, bytes| async move {
-            let batches = FRAMES_PER_RUN / BATCH_FRAMES;
-            for _ in 0..batches {
-                for _ in 0..BATCH_FRAMES {
+            // Step through exactly FRAMES_PER_RUN frames in BATCH_FRAMES-sized
+            // chunks, flushing once per chunk. The prior `FRAMES_PER_RUN /
+            // BATCH_FRAMES` form dropped the final partial batch (10_000 / 64 =
+            // 156 batches = 9984 frames) and silently wrote fewer frames than
+            // the throughput denominator assumed.
+            for batch_start in (0..FRAMES_PER_RUN).step_by(BATCH_FRAMES) {
+                let batch_len = (FRAMES_PER_RUN - batch_start).min(BATCH_FRAMES);
+                for _ in 0..batch_len {
                     client.write_all(bytes).await.unwrap();
                 }
                 client.flush().await.unwrap();
@@ -213,8 +218,9 @@ async fn make_session(
     let domain = ServerName::try_from("kvm.test").unwrap();
     let client = connector.connect(domain, client_io).await.unwrap();
 
-    // Detach the drain task so it lives as long as the connection.
-    std::mem::forget(server);
+    // Drop the JoinHandle: the drain task runs detached on the runtime and ends
+    // naturally when the client side is dropped (its read returns Ok(0)).
+    drop(server);
 
     client
 }

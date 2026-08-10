@@ -714,15 +714,15 @@ impl DaemonCore {
         dropped_packets: kvm_network::DropCounters,
         coalesced_moves: u64,
     ) -> crate::DiagnosticsSnapshot {
-        crate::DiagnosticsSnapshot::from_parts(
-            self.event_rate.snapshot(now_ns),
+        crate::DiagnosticsSnapshot::from_parts(crate::DiagnosticsParts {
+            event_rate: self.event_rate.snapshot(now_ns),
             injected_events,
-            self.source_latency_stats(),
+            source_latency: self.source_latency_stats(),
             network_send_latency,
             injection_latency,
             dropped_packets,
             coalesced_moves,
-        )
+        })
     }
 
     #[must_use]

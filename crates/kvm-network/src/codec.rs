@@ -104,6 +104,12 @@ where
     /// Cancellation-safe: the sole awaited operation is the single `read`. On a
     /// `Pending` poll no bytes are consumed; bytes appended by a completed read
     /// are retained in `progress.buf` across cancellation boundaries.
+    ///
+    /// `out` must be empty on entry (the caller drains it fully between calls).
+    /// This method treats a non-empty `out` as a signal that buffered frames are
+    /// still being processed and returns immediately without reading or decoding
+    /// — so passing a stale, non-empty `out` would silently stall the receive
+    /// path instead of appending the next frames.
     pub(crate) async fn read_and_drain(
         &mut self,
         progress: &mut FrameReadProgress,
@@ -144,14 +150,37 @@ const READ_CHUNK: usize = 8 * 1024;
 /// buffer and pushing it onto `out`. A header advertising an oversized payload
 /// is rejected (as an error) before any of its payload is required to be
 /// buffered, matching the prior incremental reader's safety property.
+///
+/// Decoding advances a cumulative `offset` and performs a single `drain` once
+/// the whole contiguous run of complete frames is decoded, rather than
+/// `drain(..consumed)` per frame (which memmoves the remaining tail on every
+/// iteration — O(n²) over a large batched record). On error the buffer stays
+/// consistent with the per-frame-drain behaviour: frames already decoded this
+/// call are removed, and the offending (or still-incomplete) bytes stay at the
+/// front.
 fn drain_complete_frames(
     buf: &mut Vec<u8>,
     required_version: u16,
     out: &mut Vec<WireMessage>,
 ) -> Result<(), NetworkError> {
-    while let Some((message, consumed)) = decode_complete_frame(buf, required_version)? {
-        buf.drain(..consumed);
-        out.push(message);
+    let mut offset = 0_usize;
+    loop {
+        match decode_complete_frame(&buf[offset..], required_version) {
+            Ok(Some((message, consumed))) => {
+                offset += consumed;
+                out.push(message);
+            }
+            Ok(None) => break,
+            Err(error) => {
+                // Drop the bytes belonging to frames already decoded this call;
+                // the offending frame's bytes remain at the front.
+                buf.drain(..offset);
+                return Err(error);
+            }
+        }
+    }
+    if offset > 0 {
+        buf.drain(..offset);
     }
     Ok(())
 }
