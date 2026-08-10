@@ -333,6 +333,13 @@ pub struct PeerSessionCoordinator<I, O> {
     /// §36 capture→injection latency ring; present only with the `diagnostics` feature.
     #[cfg(feature = "diagnostics")]
     injection_latency: kvm_input::LatencyHistory,
+    /// §36 source-side capture→network-send latency ring; present only with the
+    /// `diagnostics` feature. Spans physical capture to the frame being handed
+    /// to the outbound channel at this host. Together with the core-owned
+    /// capture→routing span it isolates dispatch/queue latency
+    /// (routing→send = capture→send − capture→routing).
+    #[cfg(feature = "diagnostics")]
+    network_send_latency: kvm_input::LatencyHistory,
     /// §35 cumulative count of inbound events injected at this peer; present
     /// only with the `diagnostics` feature. Mirrors the capture-side
     /// input-event-rate total so a diagnostics surface can detect one-way
@@ -568,6 +575,8 @@ where
             #[cfg(feature = "diagnostics")]
             injection_latency: kvm_input::LatencyHistory::default(),
             #[cfg(feature = "diagnostics")]
+            network_send_latency: kvm_input::LatencyHistory::default(),
+            #[cfg(feature = "diagnostics")]
             injected_events: 0,
         })
     }
@@ -584,6 +593,19 @@ where
     #[must_use]
     pub fn injection_latency_stats(&self) -> Option<kvm_input::LatencyStats> {
         self.injection_latency.stats()
+    }
+
+    /// §36 source-side capture→network-send latency statistics for the
+    /// diagnostics surface — the span from physical capture to the frame being
+    /// handed to the outbound channel at this host. `None` until at least one
+    /// remotely-dispatched event has been recorded. Only present with the
+    /// `diagnostics` feature; absent in release builds. Subtracting the
+    /// core-owned capture→routing span from this isolates the dispatch/queue
+    /// latency on the source host.
+    #[cfg(feature = "diagnostics")]
+    #[must_use]
+    pub fn network_send_latency_stats(&self) -> Option<kvm_input::LatencyStats> {
+        self.network_send_latency.stats()
     }
 
     /// §35 cumulative count of inbound events injected at this peer. Only
@@ -776,16 +798,34 @@ where
             CaptureDecision::Remote(effect) => {
                 let dispatch = self.dispatch_remote_effect(&effect);
                 match dispatch {
-                    Ok(accepted_sequence) => self
-                        .core
-                        .confirm_remote_input(effect, accepted_sequence, now_ns)
-                        .map_err(|error| CoordinatorCaptureFailure {
-                            // The frame already entered the exact FIFO. Local
-                            // delivery would duplicate it even if the later
-                            // in-memory confirmation failed.
-                            outcome: Some(CaptureOutcome::remote_queued()),
-                            error: CoordinatorError::Core(error),
-                        }),
+                    Ok(accepted_sequence) => {
+                        // §36 capture→network-send: dispatch just handed the
+                        // frame to the outbound channel, so `now_ns` is the send
+                        // instant and the event's source-capture timestamp is
+                        // the capture instant. Read before `effect` moves into
+                        // confirmation. Dev-only; absent without `diagnostics`.
+                        #[cfg(feature = "diagnostics")]
+                        {
+                            let stamps = kvm_input::LatencyStamps::new()
+                                .with_capture(effect.event().timestamp_ns)
+                                .with_network_send(now_ns);
+                            if let Some(span) = stamps.span_ns(
+                                kvm_input::LatencyStage::Capture,
+                                kvm_input::LatencyStage::NetworkSend,
+                            ) {
+                                self.network_send_latency.push(span);
+                            }
+                        }
+                        self.core
+                            .confirm_remote_input(effect, accepted_sequence, now_ns)
+                            .map_err(|error| CoordinatorCaptureFailure {
+                                // The frame already entered the exact FIFO. Local
+                                // delivery would duplicate it even if the later
+                                // in-memory confirmation failed.
+                                outcome: Some(CaptureOutcome::remote_queued()),
+                                error: CoordinatorError::Core(error),
+                            })
+                    }
                     Err(error) => {
                         let outcome = self.core.fail_remote_input(effect, now_ns).ok();
                         Err(CoordinatorCaptureFailure { outcome, error })
@@ -1821,6 +1861,53 @@ mod tests {
             coord.test_hold_inbound(event, 5_000).unwrap();
         }
         assert_eq!(coord.injected_events(), 3, "three events injected");
+    }
+
+    #[cfg(feature = "diagnostics")]
+    #[test]
+    fn diagnostics_capture_to_network_send_latency_is_recorded() {
+        // §36 wiring: route_captured stamps capture (event timestamp) and
+        // network-send (dispatch now_ns) when a captured event is dispatched to
+        // the admitted remote peer, so network_send_latency_stats reflects the
+        // source-side pipeline span once at least one event has been sent.
+        let mut coord = coordinator();
+        assert!(
+            coord.network_send_latency_stats().is_none(),
+            "no samples before the first dispatched event"
+        );
+        admit(&mut coord);
+        coord.core.mark_workspace_routing_ready(0).unwrap();
+        // Active host = REMOTE so a default FollowActiveHost device routes
+        // outbound to the admitted peer.
+        coord
+            .core
+            .update_workspace(
+                WorkspaceState::new(LOCAL, REMOTE, LogicalPointer::new(DISPLAY, 1.0, 1.0)),
+                1,
+            )
+            .unwrap();
+
+        // Capture at t=1_000ns; dispatch at now=5_000ns → 4_000ns span.
+        let captured = CapturedInput::new(
+            InputEvent::new(
+                1,
+                1_000,
+                LOCAL,
+                DEVICE,
+                InputPayload::Key {
+                    code: KeyCode::KeyA,
+                    state: KeyState::Pressed,
+                },
+            ),
+            crate::EventClassification::Physical,
+        );
+        coord.route_captured(captured, 5_000).unwrap();
+
+        let stats = coord
+            .network_send_latency_stats()
+            .expect("latency recorded after a dispatched event");
+        assert!(stats.count >= 1, "at least one sample: {stats:?}");
+        assert_eq!(stats.max_ns, 4_000, "capture→network-send span: {stats:?}");
     }
 
     fn binding_between(local: HostId, remote: HostId, nonce: u8) -> AdmittedSessionBinding {
