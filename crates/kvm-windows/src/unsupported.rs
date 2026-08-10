@@ -83,6 +83,11 @@ impl WindowsOutputBackend {
     pub const fn new() -> Self {
         Self
     }
+
+    #[must_use]
+    pub const fn new_from_macos() -> Self {
+        Self
+    }
 }
 
 #[derive(Debug)]

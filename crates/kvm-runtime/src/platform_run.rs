@@ -107,6 +107,11 @@ async fn run_windows(
     let prepared = prepare(profile_path)
         .map_err(|_| NativeRuntimeError::new(NativeRuntimeErrorKind::Preparation))?;
     let local_host = prepared.local_host_id();
+    let output = if prepared.selected_peer_platform() == Some(kvm_types::Platform::MacOS) {
+        WindowsOutputBackend::new_from_macos()
+    } else {
+        WindowsOutputBackend::new()
+    };
     let input = WindowsInputBackend::new_whole_host_alpha(local_host);
     let devices = input
         .enumerate_devices()
@@ -115,7 +120,7 @@ async fn run_windows(
         .enumerate_displays()
         .map_err(|_| NativeRuntimeError::new(NativeRuntimeErrorKind::Inventory))?;
     let runtime = prepared
-        .compose(WindowsOutputBackend::new(), displays, devices)
+        .compose(output, displays, devices)
         .map_err(|_| NativeRuntimeError::new(NativeRuntimeErrorKind::Composition))?;
     runtime
         .run_with_capture_status(
@@ -137,6 +142,11 @@ async fn run_macos(
     let prepared = prepare(profile_path)
         .map_err(|_| NativeRuntimeError::new(NativeRuntimeErrorKind::Preparation))?;
     let local_host = prepared.local_host_id();
+    let output = if prepared.selected_peer_platform() == Some(kvm_types::Platform::Windows) {
+        MacOutputBackend::new_from_windows()
+    } else {
+        MacOutputBackend::new()
+    };
     let input = MacInputBackend::new_whole_host_alpha(local_host);
     let devices = input
         .enumerate_devices()
@@ -145,7 +155,7 @@ async fn run_macos(
         .enumerate_displays()
         .map_err(|_| NativeRuntimeError::new(NativeRuntimeErrorKind::Inventory))?;
     let runtime = prepared
-        .compose(MacOutputBackend::new(), displays, devices)
+        .compose(output, displays, devices)
         .map_err(|_| NativeRuntimeError::new(NativeRuntimeErrorKind::Composition))?;
     runtime
         .run_with_capture_status(

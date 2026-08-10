@@ -1,5 +1,17 @@
 use kvm_input::KeyCode;
 
+/// Translates a Windows keyboard's shortcut modifiers to macOS roles.
+#[must_use]
+pub(crate) const fn macos_key_for_windows_source(key: KeyCode) -> KeyCode {
+    match key {
+        KeyCode::AltLeft => KeyCode::MetaLeft,
+        KeyCode::AltRight => KeyCode::MetaRight,
+        KeyCode::MetaLeft => KeyCode::AltLeft,
+        KeyCode::MetaRight => KeyCode::AltRight,
+        other => other,
+    }
+}
+
 /// Maps a physical key position to the corresponding macOS virtual key code.
 ///
 /// Media keys and PC-only positions intentionally return `None`; synthesizing
@@ -276,6 +288,27 @@ mod tests {
         assert_eq!(mac_virtual_key(KeyCode::Digit1), Some(0x12));
         assert_eq!(mac_virtual_key(KeyCode::MetaLeft), Some(0x37));
         assert_eq!(mac_virtual_key(KeyCode::ArrowUp), Some(0x7e));
+    }
+
+    #[test]
+    fn windows_shortcut_modifiers_map_to_macos_roles() {
+        assert_eq!(
+            macos_key_for_windows_source(KeyCode::AltLeft),
+            KeyCode::MetaLeft
+        );
+        assert_eq!(
+            macos_key_for_windows_source(KeyCode::AltRight),
+            KeyCode::MetaRight
+        );
+        assert_eq!(
+            macos_key_for_windows_source(KeyCode::MetaLeft),
+            KeyCode::AltLeft
+        );
+        assert_eq!(
+            macos_key_for_windows_source(KeyCode::MetaRight),
+            KeyCode::AltRight
+        );
+        assert_eq!(macos_key_for_windows_source(KeyCode::Tab), KeyCode::Tab);
     }
 
     #[test]

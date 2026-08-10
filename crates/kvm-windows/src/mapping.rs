@@ -3,6 +3,19 @@ use kvm_input::KeyState;
 #[cfg(any(windows, test))]
 use kvm_input::{ButtonState, KeyCode, PointerButton};
 
+/// Translates a macOS keyboard's shortcut modifiers to Windows roles.
+#[cfg(any(windows, test))]
+#[must_use]
+pub(crate) const fn windows_key_for_macos_source(key: KeyCode) -> KeyCode {
+    match key {
+        KeyCode::MetaLeft => KeyCode::AltLeft,
+        KeyCode::MetaRight => KeyCode::AltRight,
+        KeyCode::AltLeft => KeyCode::MetaLeft,
+        KeyCode::AltRight => KeyCode::MetaRight,
+        other => other,
+    }
+}
+
 #[cfg(windows)]
 pub(crate) const WHEEL_DELTA: f64 = 120.0;
 
@@ -222,6 +235,27 @@ mod tests {
             })
         );
         assert!(scan_code(KeyCode::AltRight).unwrap().extended);
+    }
+
+    #[test]
+    fn macos_shortcut_modifiers_map_to_windows_roles() {
+        assert_eq!(
+            windows_key_for_macos_source(KeyCode::MetaLeft),
+            KeyCode::AltLeft
+        );
+        assert_eq!(
+            windows_key_for_macos_source(KeyCode::MetaRight),
+            KeyCode::AltRight
+        );
+        assert_eq!(
+            windows_key_for_macos_source(KeyCode::AltLeft),
+            KeyCode::MetaLeft
+        );
+        assert_eq!(
+            windows_key_for_macos_source(KeyCode::AltRight),
+            KeyCode::MetaRight
+        );
+        assert_eq!(windows_key_for_macos_source(KeyCode::Tab), KeyCode::Tab);
     }
 
     #[test]

@@ -29,6 +29,7 @@ use crate::{
     },
     derive_device_id,
     identity::{derive_whole_host_device_id, WholeHostDeviceKind},
+    keymap::macos_key_for_windows_source,
     mac_virtual_key, CaptureHealth, CaptureStatistics, DeviceIdentityMaterial, MacBackendError,
     MacCaptureMode, PermissionStatus, SuppressionScope, KVM_EVENT_TAG,
 };
@@ -994,6 +995,7 @@ impl InputCaptureBackend for MacInputBackend {
 #[derive(Debug, Default)]
 pub struct MacOutputBackend {
     pressed_buttons: BTreeSet<PointerButton>,
+    windows_modifier_roles: bool,
 }
 
 impl MacOutputBackend {
@@ -1001,6 +1003,17 @@ impl MacOutputBackend {
     pub const fn new() -> Self {
         Self {
             pressed_buttons: BTreeSet::new(),
+            windows_modifier_roles: false,
+        }
+    }
+
+    /// Creates an injector that maps Windows Alt to macOS Command and the
+    /// Windows key to macOS Option.
+    #[must_use]
+    pub const fn new_from_windows() -> Self {
+        Self {
+            pressed_buttons: BTreeSet::new(),
+            windows_modifier_roles: true,
         }
     }
 
@@ -1022,6 +1035,11 @@ impl MacOutputBackend {
 
         match payload {
             InputPayload::Key { code, state } => {
+                let code = if self.windows_modifier_roles {
+                    macos_key_for_windows_source(code)
+                } else {
+                    code
+                };
                 let key = mac_virtual_key(code).ok_or(MacBackendError::UnsupportedInput(
                     "key has no Quartz virtual-key mapping",
                 ))?;

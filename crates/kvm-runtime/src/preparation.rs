@@ -106,6 +106,15 @@ impl PreparedTwoHostAlpha {
         self.parts.local_identity.host_id()
     }
 
+    #[cfg(any(target_os = "macos", windows))]
+    pub(crate) fn selected_peer_platform(&self) -> Option<kvm_types::Platform> {
+        self.parts
+            .config
+            .paired_hosts
+            .first()
+            .map(|peer| peer.platform)
+    }
+
     /// Transfers all validated components to the later runtime composer.
     #[must_use]
     pub fn into_parts(self) -> PreparedTwoHostAlphaParts {

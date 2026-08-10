@@ -103,6 +103,11 @@ impl MacOutputBackend {
     pub const fn new() -> Self {
         Self
     }
+
+    #[must_use]
+    pub const fn new_from_windows() -> Self {
+        Self
+    }
 }
 
 impl OutputInjectionBackend for MacOutputBackend {
