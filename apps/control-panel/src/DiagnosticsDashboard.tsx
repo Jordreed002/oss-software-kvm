@@ -1,11 +1,18 @@
 import { useEffect, useRef, useState } from "react";
-import { Activity, Laptop, Monitor, WifiOff } from "lucide-react";
+import { Activity, Laptop, Monitor } from "lucide-react";
 import { api } from "./bridge";
+import { type ChartSeries, TimeSeriesChart, useHistory } from "./DashChart";
 import type { DiagnosticsReport, DropCounters, NetworkDiagnostics, Platform, SetupSnapshot } from "./types";
 
 const POLL_INTERVAL_MS = 1500;
+const HISTORY_MAX_SAMPLES = 60;
+const CHART_WINDOW_MS = 90_000;
 const LANES = ["input", "control", "background"] as const;
 type Lane = (typeof LANES)[number];
+
+/** Mint = this computer, signal = paired computer, matching the console palette. */
+const LOCAL_COLOR = "#a9e5c8";
+const PEER_COLOR = "#ff6b35";
 
 /** Derived per-second rates between two consecutive telemetry snapshots. */
 interface NetRate {
@@ -13,6 +20,18 @@ interface NetRate {
   inBps: number;
   outFps: number;
   inFps: number;
+}
+
+interface SampleHost {
+  rttMs: number | null;
+  outBps: number | null;
+  inBps: number | null;
+}
+
+interface DashSample {
+  t: number;
+  local: SampleHost | null;
+  peer: SampleHost | null;
 }
 
 function hostIp(address: string | undefined): string {
@@ -74,6 +93,7 @@ export function DiagnosticsDashboard({ snapshot }: { snapshot: SetupSnapshot }) 
   const [localRate, setLocalRate] = useState<NetRate | null>(null);
   const [peerRate, setPeerRate] = useState<NetRate | null>(null);
   const [updatedAt, setUpdatedAt] = useState<number | null>(null);
+  const [history, appendSample] = useHistory<DashSample>(HISTORY_MAX_SAMPLES);
 
   const prevRef = useRef<{ at: number; local: NetworkDiagnostics | null; peer: NetworkDiagnostics | null } | null>(null);
 
@@ -90,9 +110,17 @@ export function DiagnosticsDashboard({ snapshot }: { snapshot: SetupSnapshot }) 
 
       const now = Date.now();
       const prev = prevRef.current;
-      setLocalRate(deriveRate(prev?.local ?? null, local?.network ?? null, prev ? now - prev.at : 0));
-      setPeerRate(deriveRate(prev?.peer ?? null, peer?.network ?? null, prev ? now - prev.at : 0));
+      const localDerived = deriveRate(prev?.local ?? null, local?.network ?? null, prev ? now - prev.at : 0);
+      const peerDerived = deriveRate(prev?.peer ?? null, peer?.network ?? null, prev ? now - prev.at : 0);
+      setLocalRate(localDerived);
+      setPeerRate(peerDerived);
       prevRef.current = { at: now, local: local?.network ?? null, peer: peer?.network ?? null };
+
+      appendSample({
+        t: now,
+        local: local ? { rttMs: local.network?.lastRttMs ?? null, outBps: localDerived?.outBps ?? null, inBps: localDerived?.inBps ?? null } : null,
+        peer: peer ? { rttMs: peer.network?.lastRttMs ?? null, outBps: peerDerived?.outBps ?? null, inBps: peerDerived?.inBps ?? null } : null,
+      });
 
       setLocalReport(local);
       setPeerReport(peer);
@@ -105,11 +133,24 @@ export function DiagnosticsDashboard({ snapshot }: { snapshot: SetupSnapshot }) 
       cancelled = true;
       window.clearInterval(timer);
     };
-  }, [localIp, peerIp]);
+  }, [localIp, peerIp, appendSample]);
 
   const localName = snapshot.local?.displayName ?? "This computer";
   const peerName = snapshot.peer?.displayName ?? "Paired computer";
   const peerPlatform: Platform = snapshot.peer?.platform ?? (snapshot.platform === "macos" ? "windows" : "macos");
+
+  const rttSeries: ChartSeries[] = [
+    { id: "rtt-local", label: localName, color: LOCAL_COLOR, points: history.map((sample) => ({ t: sample.t, y: sample.local?.rttMs ?? null })) },
+    { id: "rtt-peer", label: peerName, color: PEER_COLOR, points: history.map((sample) => ({ t: sample.t, y: sample.peer?.rttMs ?? null })) },
+  ];
+  const outboundSeries: ChartSeries[] = [
+    { id: "out-local", label: localName, color: LOCAL_COLOR, points: history.map((sample) => ({ t: sample.t, y: sample.local?.outBps ?? null })) },
+    { id: "out-peer", label: peerName, color: PEER_COLOR, points: history.map((sample) => ({ t: sample.t, y: sample.peer?.outBps ?? null })) },
+  ];
+  const inboundSeries: ChartSeries[] = [
+    { id: "in-local", label: localName, color: LOCAL_COLOR, points: history.map((sample) => ({ t: sample.t, y: sample.local?.inBps ?? null })) },
+    { id: "in-peer", label: peerName, color: PEER_COLOR, points: history.map((sample) => ({ t: sample.t, y: sample.peer?.inBps ?? null })) },
+  ];
 
   return (
     <section className="dashboard enter" aria-label="Live diagnostics dashboard">
@@ -144,6 +185,29 @@ export function DiagnosticsDashboard({ snapshot }: { snapshot: SetupSnapshot }) 
           report={peerReport}
           rate={peerRate}
           hasPeer={!!snapshot.peer}
+        />
+      </div>
+
+      <div className="dash-charts-grid">
+        <div className="dash-chart-wide">
+          <TimeSeriesChart
+            title="Round-trip latency"
+            windowMs={CHART_WINDOW_MS}
+            series={rttSeries}
+            yFormat={(value) => `${Math.round(value)} ms`}
+          />
+        </div>
+        <TimeSeriesChart
+          title="Outbound throughput"
+          windowMs={CHART_WINDOW_MS}
+          series={outboundSeries}
+          yFormat={(value) => formatBytes(value)}
+        />
+        <TimeSeriesChart
+          title="Inbound throughput"
+          windowMs={CHART_WINDOW_MS}
+          series={inboundSeries}
+          yFormat={(value) => formatBytes(value)}
         />
       </div>
 
