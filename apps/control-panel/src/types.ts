@@ -111,3 +111,40 @@ export interface DeveloperDiagnostics {
   recentEvents: string[];
   peerRecentEvents: string[];
 }
+
+/** Per-traffic-lane counters. Single-word lanes serialize identically in any
+ *  case style. Mirrors `kvm_network::DropCounters`. */
+export interface DropCounters {
+  input: number;
+  control: number;
+  background: number;
+}
+
+/** Serializable view of the live session network telemetry. Mirrors
+ *  `kvm_network::NetworkDiagnostics` (served over the separate §31 channel). */
+export interface NetworkDiagnostics {
+  outboundBytes: number;
+  outboundFrames: number;
+  inboundBytes: number;
+  inboundFrames: number;
+  /** Last ping/pong RTT in ms, or null before the first pong. */
+  lastRttMs: number | null;
+  dropped: DropCounters;
+  channelRejections: DropCounters;
+  coalescedMoves: number;
+}
+
+/** One redacted, versioned read of a host's diagnostics state. Mirrors
+ *  `kvm_network::DiagnosticsReport`, pulled over the separate diagnostics
+ *  connection (port 24801), distinct from the active KVM switch (24800). */
+export interface DiagnosticsReport {
+  schemaVersion: number;
+  hostId: string;
+  peerId: string | null;
+  platform: Platform;
+  hostName: string | null;
+  capturedAtUnixMs: number | null;
+  uptimeMs: number;
+  /** Live session telemetry, or null when no session is active. */
+  network: NetworkDiagnostics | null;
+}

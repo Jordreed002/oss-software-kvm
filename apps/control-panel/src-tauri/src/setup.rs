@@ -33,6 +33,10 @@ use crate::nearby::{
 };
 
 const KVM_PORT: u16 = 24_800;
+/// Separate diagnostics channel port (spec §31): one above the KVM switch so
+/// the control panel polls telemetry over a different connection than the
+/// active input stream. Mirrors `kvm_network::DEFAULT_DIAGNOSTICS_PORT`.
+const DIAGNOSTICS_PORT: u16 = 24_801;
 const PAIRING_VERSION: u16 = 3;
 const CREDENTIAL_VERSION: u16 = 2;
 const STATE_FILE: &str = "setup-state.json";
@@ -1089,6 +1093,25 @@ fn restore_windows_app_data_acl(path: &Path) -> Result<(), std::io::Error> {
 #[tauri::command]
 pub(crate) fn setup_status(service: State<'_, SetupService>) -> Result<SetupSnapshot, String> {
     service.snapshot().map_err(|()| coarse_error())
+}
+
+/// Pulls one diagnostics report over the separate §31 channel — a TCP
+/// connection on `DIAGNOSTICS_PORT` distinct from the active KVM switch on
+/// `KVM_PORT`. `host` is the reporting host's LAN IP (local or remote peer).
+///
+/// Returns `Ok(None)` when the host is unreachable or slow so the dashboard can
+/// mark it offline instead of surfacing a hard error on every poll. A malformed
+/// `host` is the only hard error.
+#[tauri::command]
+pub(crate) fn fetch_diagnostics(
+    host: String,
+    port: Option<u16>,
+) -> Result<Option<kvm_network::DiagnosticsReport>, String> {
+    let ip: IpAddr = host.parse().map_err(|_| coarse_error())?;
+    let port = port.unwrap_or(DIAGNOSTICS_PORT);
+    let addr = SocketAddr::new(ip, port);
+    let report = kvm_network::fetch_report(addr, std::time::Duration::from_secs(1));
+    Ok(report.ok())
 }
 
 #[tauri::command]

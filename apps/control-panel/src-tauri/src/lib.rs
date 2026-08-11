@@ -18,6 +18,7 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             setup::setup_status,
+            setup::fetch_diagnostics,
             setup::create_local_identity,
             setup::import_peer_bundle,
             setup::request_nearby_pairing,

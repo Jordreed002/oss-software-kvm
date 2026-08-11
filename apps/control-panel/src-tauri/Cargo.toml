@@ -23,6 +23,7 @@ hostname = "0.4"
 if-addrs = "0.14"
 kvm-config = { path = "../../../crates/kvm-config" }
 kvm-daemon = { path = "../../../crates/kvm-daemon" }
+kvm-network = { path = "../../../crates/kvm-network" }
 kvm-runtime = { path = "../../../crates/kvm-runtime" }
 kvm-types = { path = "../../../crates/kvm-types" }
 rcgen = "0.14"

@@ -1,5 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
-import type { DisplayPlacement, Placement, SetupSnapshot } from "./types";
+import type { DiagnosticsReport, DisplayPlacement, Placement, SetupSnapshot } from "./types";
 
 const inTauri = () => "__TAURI_INTERNALS__" in window;
 
@@ -148,6 +148,36 @@ const invokeOrPreview = async <T>(command: string, args?: Record<string, unknown
     previewState.runtimeFault = null;
     previewState.inputAuthority = { owner: "unavailable", linkReady: false, sessionActive: false };
   }
+  if (command === "fetch_diagnostics") {
+    // Preview: synthesize a live-looking report so the dashboard can be built
+    // in the web preview without a real runtime. Returns null when the runtime
+    // is not running, matching the Tauri command's unreachable -> null contract.
+    if (previewState.runtime !== "running") return null as T;
+    const host = String(args?.host ?? "local");
+    const isLocal = host === "local";
+    const peerPlatform = previewState.platform === "macos" ? "windows" : "macos";
+    const seed = isLocal ? 1 : 2;
+    const t = Date.now() / 1000;
+    return {
+      schemaVersion: 1,
+      hostId: `0000000${seed}-0000-4000-8000-00000000000${seed}`,
+      peerId: `0000000${seed}-0000-4000-8000-00000000000${seed}`,
+      platform: isLocal ? previewState.platform : peerPlatform,
+      hostName: isLocal ? (previewState.local?.displayName ?? "This computer") : (previewState.peer?.displayName ?? "Peer"),
+      capturedAtUnixMs: Date.now(),
+      uptimeMs: Math.floor(60_000 + (Math.sin(t / 3) + 1) * 30_000),
+      network: {
+        outboundBytes: Math.floor(1_200_000 + (Math.sin(t) + 1) * 240_000),
+        outboundFrames: Math.floor(8_400 + (Math.sin(t / 1.3) + 1) * 2_000),
+        inboundBytes: Math.floor(980_000 + (Math.cos(t) + 1) * 180_000),
+        inboundFrames: Math.floor(7_600 + (Math.cos(t / 1.1) + 1) * 1_800),
+        lastRttMs: Math.floor(2 + (Math.sin(t / 2) + 1) * 3),
+        dropped: { input: Math.floor((Math.sin(t / 7) + 1) * 3), control: 0, background: 0 },
+        channelRejections: { input: 0, control: 0, background: 0 },
+        coalescedMoves: Math.floor(400 + (Math.cos(t / 4) + 1) * 250),
+      },
+    } as DiagnosticsReport as T;
+  }
   return structuredClone(previewState) as T;
 };
 
@@ -167,4 +197,8 @@ export const api = {
   validate: () => invokeOrPreview<SetupSnapshot>("validate_setup"),
   start: () => invokeOrPreview<SetupSnapshot>("start_runtime"),
   stop: () => invokeOrPreview<SetupSnapshot>("stop_runtime"),
+  /** Pulls one diagnostics report over the separate §31 channel (port 24801).
+   *  Pass "local" for this host, or a peer LAN IP. Returns null when offline. */
+  fetchDiagnostics: (host: string, port?: number) =>
+    invokeOrPreview<DiagnosticsReport | null>("fetch_diagnostics", { host, port }),
 };

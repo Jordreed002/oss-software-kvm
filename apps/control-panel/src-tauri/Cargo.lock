@@ -1864,6 +1864,7 @@ dependencies = [
  "kvm-security",
  "kvm-topology",
  "kvm-types",
+ "serde",
  "thiserror 2.0.20",
  "tokio",
  "tracing",
@@ -1904,6 +1905,9 @@ name = "kvm-network"
 version = "0.1.0"
 dependencies = [
  "kvm-protocol",
+ "kvm-types",
+ "serde",
+ "serde_json",
  "sha2 0.11.0",
  "subtle",
  "thiserror 2.0.20",
@@ -3398,6 +3402,7 @@ dependencies = [
  "kvm-config",
  "kvm-daemon",
  "kvm-macos",
+ "kvm-network",
  "kvm-runtime",
  "kvm-types",
  "kvm-windows",

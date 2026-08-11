@@ -54,6 +54,7 @@ pub const MAX_DIAGNOSTICS_PAYLOAD: usize = 1024 * 1024;
 /// flattens RTT to an integer millisecond field and reuses the already-serializable
 /// [`DropCounters`] for the per-lane drop and channel-rejection tallies.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct NetworkDiagnostics {
     /// Cumulative framed application bytes flushed to the TLS stream.
     pub outbound_bytes: u64,
@@ -108,6 +109,7 @@ impl NetworkDiagnostics {
 /// distributions) are layered onto this envelope in later revisions; each is an
 /// optional field so older control panels tolerate a report that omits it.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct DiagnosticsReport {
     /// Wire schema version, currently [`DIAGNOSTICS_SCHEMA_VERSION`].
     pub schema_version: u16,
@@ -400,12 +402,12 @@ mod tests {
     #[test]
     fn report_serializes_stable_field_names() {
         let json = serde_json::to_string(&sample_report()).expect("serialize");
-        assert!(json.contains("\"schema_version\""));
-        assert!(json.contains("\"host_id\""));
+        assert!(json.contains("\"schemaVersion\""));
+        assert!(json.contains("\"hostId\""));
         assert!(json.contains("\"platform\":\"windows\""));
         assert!(json.contains("\"network\""));
-        assert!(json.contains("\"last_rtt_ms\":5"));
-        assert!(json.contains("\"coalesced_moves\":42"));
+        assert!(json.contains("\"lastRttMs\":5"));
+        assert!(json.contains("\"coalescedMoves\":42"));
     }
 
     #[test]
