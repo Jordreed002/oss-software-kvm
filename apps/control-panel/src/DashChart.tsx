@@ -83,7 +83,7 @@ export function TimeSeriesChart({ title, badge = "LIVE", windowMs, series, yForm
     for (const point of points) {
       if (point.y == null) {
         if (segment.length > 0 && start != null) {
-          const lastX = xOf(segmentX(segment[segment.length - 1]));
+          const lastX = segmentX(segment[segment.length - 1]);
           segments.push(`M${xOf(start).toFixed(2)} ${yOf(yMin).toFixed(2)} ${segment.join(" ")} L${lastX.toFixed(2)} ${yOf(yMin).toFixed(2)} Z`);
         }
         segment = [];
@@ -94,7 +94,7 @@ export function TimeSeriesChart({ title, badge = "LIVE", windowMs, series, yForm
       segment.push(`L${xOf(point.t).toFixed(2)} ${yOf(point.y).toFixed(2)}`);
     }
     if (segment.length > 0 && start != null) {
-      const lastX = xOf(segmentX(segment[segment.length - 1]));
+      const lastX = segmentX(segment[segment.length - 1]);
       segments.push(`M${xOf(start).toFixed(2)} ${yOf(yMin).toFixed(2)} ${segment.join(" ")} L${lastX.toFixed(2)} ${yOf(yMin).toFixed(2)} Z`);
     }
     return segments.join(" ");
@@ -289,6 +289,79 @@ export function CompositionBar({ title, badge = "SPLIT", hosts, valueFormat }: C
             ))}
           </div>
         )}
+      </div>
+    </div>
+  );
+}
+
+type Severity = "healthy" | "watch" | "degraded" | "critical";
+
+interface SeverityMeta {
+  color: string;
+  label: string;
+  /** 1..4 — drives the gauge fill width so coarser bands still read. */
+  tier: number;
+}
+
+const SEVERITY_META: Record<Severity, SeverityMeta> = {
+  healthy: { color: "#a9e5c8", label: "Healthy", tier: 1 },
+  watch: { color: "#e0b056", label: "Watch", tier: 2 },
+  degraded: { color: "#ff8e5a", label: "Degraded", tier: 3 },
+  critical: { color: "#ff5a3a", label: "Critical", tier: 4 },
+};
+
+/** Maps a 0..1 drop fraction to a coarse severity band. Thresholds are
+ *  deliberately conservative: even 0.1% of frames dropped to backpressure on a
+ *  LAN input stream is worth attention, and 5% is a degraded experience. */
+function severityFor(fraction: number): Severity {
+  if (fraction >= 0.05) return "critical";
+  if (fraction >= 0.01) return "degraded";
+  if (fraction >= 0.001) return "watch";
+  return "healthy";
+}
+
+interface HealthMeterProps {
+  title: string;
+  badge?: string;
+  /** One gauge row per host. `fraction` is clamped to 0..1. */
+  hosts: Array<{ name: string; fraction: number; detail: string }>;
+}
+
+/** A status gauge — a fourth display type alongside line charts, tables, and
+ *  stacked bars. Each host's drop rate maps to a severity band whose color and
+ *  fill width convey health at a glance; the raw percentage and a short
+ *  detail (drops vs. frames) anchor the visual to real counts. */
+export function HealthMeter({ title, badge = "HEALTH", hosts }: HealthMeterProps) {
+  return (
+    <div className="dash-chart-card">
+      <div className="dash-chart-head">
+        <span>{title}</span>
+        <em>{badge}</em>
+      </div>
+      <div className="dash-health">
+        {hosts.length === 0 && <div className="dash-chart-empty">No session telemetry yet.</div>}
+        {hosts.map((host) => {
+          const fraction = Math.max(0, Math.min(1, host.fraction));
+          const meta = SEVERITY_META[severityFor(fraction)];
+          const pct = fraction * 100;
+          const pctText = pct < 0.01 ? pct.toFixed(4) : pct < 1 ? pct.toFixed(3) : pct.toFixed(2);
+          return (
+            <div className="dash-health-row" key={host.name}>
+              <div className="dash-health-label" title={host.name}>{host.name}</div>
+              <div className="dash-health-meter" role="meter" aria-valuemin={0} aria-valuemax={100} aria-valuenow={Number(pct.toFixed(3))} aria-label={`${host.name} drop rate`}>
+                <div className="dash-health-fill" style={{ width: `${(meta.tier / 4) * 100}%`, background: meta.color }} />
+                {[1, 2, 3, 4].map((band) => (
+                  <span key={band} className="dash-health-tick" aria-hidden="true" />
+                ))}
+              </div>
+              <div className="dash-health-readout">
+                <strong style={{ color: meta.color }}>{pctText}%</strong>
+                <span style={{ color: meta.color }}>{meta.label}</span>
+              </div>
+              <div className="dash-health-detail">{host.detail}</div>
+            </div>
+          );
+        })}
       </div>
     </div>
   );

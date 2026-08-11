@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { Activity, Download, Laptop, Monitor, Pause, Play, RefreshCw } from "lucide-react";
 import { api } from "./bridge";
-import { type ChartSeries, CompositionBar, type CompositionSegment, TimeSeriesChart, useHistory } from "./DashChart";
+import { type ChartSeries, CompositionBar, type CompositionSegment, HealthMeter, TimeSeriesChart, useHistory } from "./DashChart";
 import type { CaptureDiagnostics, DiagnosticsReport, DropCounters, NetworkDiagnostics, Platform, SetupSnapshot } from "./types";
 
 const POLL_INTERVAL_MS = 1500;
@@ -197,6 +197,20 @@ export function DiagnosticsDashboard({ snapshot }: { snapshot: SetupSnapshot }) 
     ...(peerReport?.capture ? [{ name: peerName, segments: routingSegments(peerReport.capture) }] : []),
   ];
 
+  // Frame drop rate per host: of all frames the host tried to push through its
+  // outbound queue, the fraction rejected by backpressure. A headline health
+  // signal that the gauge surfaces at a glance.
+  const dropFraction = (net: NetworkDiagnostics | null): number => {
+    if (!net) return 0;
+    const drops = totalDrops(net.dropped);
+    const denom = drops + net.outboundFrames;
+    return denom > 0 ? drops / denom : 0;
+  };
+  const healthHosts = [
+    ...(localReport?.network ? [{ name: localName, fraction: dropFraction(localReport.network), detail: `${formatNumber(totalDrops(localReport.network.dropped))} drops · ${formatNumber(localReport.network.outboundFrames)} frames` }] : []),
+    ...(peerReport?.network ? [{ name: peerName, fraction: dropFraction(peerReport.network), detail: `${formatNumber(totalDrops(peerReport.network.dropped))} drops · ${formatNumber(peerReport.network.outboundFrames)} frames` }] : []),
+  ];
+
   return (
     <section className="dashboard enter" aria-label="Live diagnostics dashboard">
       <header className="dashboard-head">
@@ -261,6 +275,8 @@ export function DiagnosticsDashboard({ snapshot }: { snapshot: SetupSnapshot }) 
           hasPeer={!!snapshot.peer}
         />
       </div>
+
+      <HealthMeter title="Outbound drop health" badge="QUEUE" hosts={healthHosts} />
 
       <div className="dash-charts-grid">
         <div className="dash-chart-wide">
