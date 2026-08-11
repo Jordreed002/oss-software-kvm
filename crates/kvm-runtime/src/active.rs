@@ -13,9 +13,11 @@ use kvm_daemon::{
     SupervisorEventOutcome, WorkspaceControlPlane,
 };
 use kvm_network::{
-    AuthenticatedLanConnector, BoundedLanListener, ConnectionGenerationGate, ConnectionRole,
-    LanListenerConfig, LanListenerEvent, LanListenerReport, LanPeerAddress, PersistentPeerConfig,
-    RustlsPeerStream, RustlsTcpConnector, SecurePeerStream, SessionTelemetry,
+    spawn_diagnostics_server, AuthenticatedLanConnector, BoundedLanListener,
+    ConnectionGenerationGate, ConnectionRole, DiagnosticsPublisher, DiagnosticsReport,
+    LanListenerConfig, LanListenerEvent, LanListenerReport, LanPeerAddress, NetworkDiagnostics,
+    PersistentPeerConfig, RustlsPeerStream, RustlsTcpConnector, SecurePeerStream, SessionTelemetry,
+    DEFAULT_DIAGNOSTICS_PORT, DIAGNOSTICS_SCHEMA_VERSION,
 };
 use kvm_protocol::WirePeerId;
 use kvm_security::PairedPeer;
@@ -215,6 +217,66 @@ where
     pub(crate) acceptor: PreparedAcceptor,
     pub(crate) admission_factory: PreparedAdmissionFactory,
     pub(crate) listen_addresses: Vec<std::net::SocketAddr>,
+    pub(crate) host_identity: LocalHostIdentity,
+}
+
+/// The local host's identity, carried from composition into the active runtime
+/// so the separate diagnostics channel (spec §31) can stamp every published
+/// [`DiagnosticsReport`] with the reporting host without re-reading credentials.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct LocalHostIdentity {
+    pub host_id: kvm_types::HostId,
+    pub peer_id: kvm_types::PeerId,
+    pub platform: kvm_types::Platform,
+}
+
+/// The platform this crate was compiled for. The runtime only goes active on
+/// Windows or macOS; the neutral fallback only applies to host-neutral builds
+/// (unit tests) that never bind a real diagnostics socket.
+#[cfg(windows)]
+const LOCAL_PLATFORM: kvm_types::Platform = kvm_types::Platform::Windows;
+#[cfg(target_os = "macos")]
+const LOCAL_PLATFORM: kvm_types::Platform = kvm_types::Platform::MacOS;
+#[cfg(not(any(windows, target_os = "macos")))]
+const LOCAL_PLATFORM: kvm_types::Platform = kvm_types::Platform::Windows;
+
+/// Shared, read-only context for spawning session tasks inside the transport
+/// loop, so the inbound-accept and dial-finish branches do not repeat the six
+/// shared arguments to [`drive_session`]. Built once per transport run.
+struct SessionSpawnCtx<'a, I>
+where
+    I: OutputInjectionBackend,
+{
+    manager: &'a Arc<Mutex<PeerManager<I, ManagedSessionOutbound>>>,
+    receiver: tokio::sync::watch::Receiver<bool>,
+    started: Instant,
+    publisher: DiagnosticsPublisher,
+    identity: LocalHostIdentity,
+}
+
+impl<I> SessionSpawnCtx<'_, I>
+where
+    I: OutputInjectionBackend + 'static,
+{
+    /// Spawns one session-driving task that shares the diagnostics publisher so
+    /// every active session publishes telemetry onto the separate channel.
+    fn spawn<S, A>(
+        &self,
+        tasks: &mut tokio::task::JoinSet<Result<(), RuntimeTransportError>>,
+        installed: InstalledPeerSessionParts<S, A>,
+    ) where
+        S: SecurePeerStream + 'static,
+        A: kvm_network::SessionAdmission + 'static,
+    {
+        tasks.spawn(drive_session(
+            Arc::clone(self.manager),
+            installed,
+            self.receiver.clone(),
+            self.started,
+            self.publisher.clone(),
+            self.identity,
+        ));
+    }
 }
 
 impl<I> fmt::Debug for TwoHostAlphaRuntime<I>
@@ -405,6 +467,10 @@ where
         started: Instant,
         status: Option<RuntimeStatusPublisher>,
     ) -> Result<(), RuntimeTransportError> {
+        // Bind the separate diagnostics channel (spec §31) before the KVM
+        // listener consumes `listen_addresses` by move; see `bind_diagnostics_server`.
+        let diagnostics_publisher =
+            bind_diagnostics_server(&self.listen_addresses, self.host_identity, started);
         let (listener, mut accepted) = BoundedLanListener::bind(
             self.acceptor,
             self.listen_addresses,
@@ -420,6 +486,13 @@ where
         let mut session_tasks = tokio::task::JoinSet::new();
         let mut tick = tokio::time::interval(TRANSPORT_SERVICE_TICK);
         let mut last_manager_snapshot = None;
+        let session_ctx = SessionSpawnCtx {
+            manager: &self.manager,
+            receiver: internal_receiver.clone(),
+            started,
+            publisher: diagnostics_publisher.clone(),
+            identity: self.host_identity,
+        };
 
         let run_result = async {
             loop {
@@ -442,12 +515,7 @@ where
                                 stream,
                                 now_ns(started),
                             )? {
-                                session_tasks.spawn(drive_session(
-                                    Arc::clone(&self.manager),
-                                    installed,
-                                    internal_receiver.clone(),
-                                    started,
-                                ));
+                                session_ctx.spawn(&mut session_tasks, installed);
                         }
                     }
                     joined = dial_tasks.join_next(), if !dial_tasks.is_empty() => {
@@ -458,12 +526,7 @@ where
                             dial,
                             now_duration(started),
                         )? {
-                            session_tasks.spawn(drive_session(
-                                Arc::clone(&self.manager),
-                                installed,
-                                internal_receiver.clone(),
-                                started,
-                            ));
+                            session_ctx.spawn(&mut session_tasks, installed);
                         }
                     }
                     joined = session_tasks.join_next(), if !session_tasks.is_empty() => {
@@ -914,6 +977,8 @@ async fn drive_session<I, S, A>(
     installed: InstalledPeerSessionParts<S, A>,
     mut shutdown: tokio::sync::watch::Receiver<bool>,
     started: Instant,
+    publisher: DiagnosticsPublisher,
+    identity: LocalHostIdentity,
 ) -> Result<(), RuntimeTransportError>
 where
     I: OutputInjectionBackend + 'static,
@@ -970,11 +1035,15 @@ where
                     }
                 }
             }
-            _ = telemetry_tick.tick(), if telemetry_enabled => {
-                report_session_telemetry(
-                    observable_stats.telemetry_snapshot(),
-                    &mut telemetry_baseline,
-                );
+            _ = telemetry_tick.tick() => {
+                let telemetry = observable_stats.telemetry_snapshot();
+                // Publish over the separate diagnostics channel on every tick so
+                // the control panel always has fresh data, independent of dev
+                // logging. The dev log line is an additional, opt-in surface.
+                publisher.publish(build_diagnostics_report(identity, Some(telemetry), started));
+                if telemetry_enabled {
+                    report_session_telemetry(telemetry, &mut telemetry_baseline);
+                }
             }
         }
     }
@@ -993,6 +1062,59 @@ where
     let _ = lock_manager(&manager)?.connection_task_lost(peer_id, generation, now_ns(started));
     developer_event("session=runner_stopped");
     Ok(())
+}
+
+/// Binds the separate diagnostics server on the local LAN IP derived from the
+/// KVM listener addresses, and returns the shared publisher the session tasks
+/// update on each telemetry tick.
+///
+/// The seed report carries no network section (no session is active yet at bind
+/// time). The server thread is detached: it dies with the process on shutdown,
+/// which is acceptable because the diagnostics channel is advisory and never
+/// gates input safety.
+fn bind_diagnostics_server(
+    listen_addresses: &[std::net::SocketAddr],
+    identity: LocalHostIdentity,
+    started: Instant,
+) -> DiagnosticsPublisher {
+    let publisher = DiagnosticsPublisher::new(build_diagnostics_report(identity, None, started));
+    let Some(bind_addr) = listen_addresses
+        .first()
+        .map(|addr| std::net::SocketAddr::new(addr.ip(), DEFAULT_DIAGNOSTICS_PORT))
+    else {
+        developer_event("diagnostics=server_skipped detail:no_listen_address");
+        return publisher;
+    };
+    match spawn_diagnostics_server(bind_addr, publisher.clone()) {
+        Ok((bound, _handle)) => {
+            developer_event(&format!("diagnostics=server_ready addr:{bound}"));
+        }
+        Err(error) => developer_event(&format!(
+            "diagnostics=server_bind_failed addr:{bind_addr} detail:{error:?}"
+        )),
+    }
+    publisher
+}
+
+/// Stamps one redacted, versioned diagnostics report for the local host. The
+/// network section is `None` until the first session telemetry tick supplies a
+/// live [`SessionTelemetry`].
+fn build_diagnostics_report(
+    identity: LocalHostIdentity,
+    telemetry: Option<SessionTelemetry>,
+    started: Instant,
+) -> DiagnosticsReport {
+    DiagnosticsReport {
+        schema_version: DIAGNOSTICS_SCHEMA_VERSION,
+        host_id: identity.host_id,
+        peer_id: Some(identity.peer_id),
+        platform: identity.platform,
+        // Host name is layered in once the control-panel profile carries one.
+        host_name: None,
+        captured_at_unix_ms: DiagnosticsReport::now_unix_ms(),
+        uptime_ms: u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+        network: telemetry.map(NetworkDiagnostics::from_telemetry),
+    }
 }
 
 fn report_session_telemetry(current: SessionTelemetry, baseline: &mut (Instant, SessionTelemetry)) {
@@ -1225,6 +1347,11 @@ impl PreparedTwoHostAlpha {
             acceptor: parts.acceptor,
             admission_factory: parts.admission_factory,
             listen_addresses: parts.listen_addresses,
+            host_identity: LocalHostIdentity {
+                host_id: local_host,
+                peer_id: local_peer,
+                platform: LOCAL_PLATFORM,
+            },
         })
     }
 }
