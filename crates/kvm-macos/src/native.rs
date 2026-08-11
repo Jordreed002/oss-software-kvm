@@ -22,9 +22,9 @@ use crate::{
     capture::{
         classify_iohid_observation, classify_quartz_capture, device_accepts_hid_value,
         mach_timestamp_ns, overflow_may_drop, physical_device_evidence, quartz_key_is_down,
-        quartz_modifier_pressed, translate_hid_value, translate_quartz_keyboard,
-        translate_quartz_pointer, translate_quartz_scroll, CG_EVENT_FLAGS_CHANGED,
-        CG_EVENT_KEY_DOWN, CG_EVENT_KEY_UP, CG_EVENT_SCROLL_WHEEL,
+        quartz_modifier_flag, quartz_modifier_pressed, translate_hid_value,
+        translate_quartz_keyboard, translate_quartz_pointer, translate_quartz_scroll,
+        CG_EVENT_FLAGS_CHANGED, CG_EVENT_KEY_DOWN, CG_EVENT_KEY_UP, CG_EVENT_SCROLL_WHEEL,
         CG_EVENT_TAP_DISABLED_BY_TIMEOUT, CG_EVENT_TAP_DISABLED_BY_USER_INPUT,
     },
     derive_device_id,
@@ -239,6 +239,8 @@ extern "C" {
     fn CGEventGetIntegerValueField(event: CGEventRef, field: u32) -> i64;
     fn CGEventGetDoubleValueField(event: CGEventRef, field: u32) -> f64;
     fn CGEventSetIntegerValueField(event: CGEventRef, field: u32, value: i64);
+    fn CGEventSetType(event: CGEventRef, event_type: u32);
+    fn CGEventSetFlags(event: CGEventRef, flags: u64);
     fn CGEventPost(tap: u32, event: CGEventRef);
     fn CGEventTapCreate(
         tap: u32,
@@ -998,6 +1000,12 @@ impl InputCaptureBackend for MacInputBackend {
 pub struct MacOutputBackend {
     pressed_buttons: BTreeSet<PointerButton>,
     windows_modifier_roles: bool,
+    /// Cumulative `CGEventFlags` device mask for currently-held modifiers.
+    /// Updated as modifier key-down/up events are injected so that every
+    /// subsequent modifier event (and, by Quartz's design, the flags word it
+    /// carries) reflects the live modifier set rather than a stale or empty
+    /// state.
+    modifier_flags: u64,
     pointer_target: Option<CGPoint>,
     last_pointer_injection: Option<Instant>,
     last_pointer_resync: Option<Instant>,
@@ -1022,6 +1030,7 @@ impl MacOutputBackend {
         Self {
             pressed_buttons: BTreeSet::new(),
             windows_modifier_roles: false,
+            modifier_flags: 0,
             pointer_target: None,
             last_pointer_injection: None,
             last_pointer_resync: None,
@@ -1037,6 +1046,7 @@ impl MacOutputBackend {
         Self {
             pressed_buttons: BTreeSet::new(),
             windows_modifier_roles: true,
+            modifier_flags: 0,
             pointer_target: None,
             last_pointer_injection: None,
             last_pointer_resync: None,
@@ -1098,6 +1108,25 @@ impl MacOutputBackend {
                 let event = unsafe {
                     CGEventCreateKeyboardEvent(ptr::null(), key, quartz_key_is_down(state))
                 };
+                // Modifier keys (Shift, Control, Option, Command, Fn) must be
+                // delivered as `kCGEventFlagsChanged` (type 12) events whose
+                // `CGEventFlags` word reflects every currently-held modifier.
+                // Sending them as plain keyDown/Up (types 10/11) with no flags
+                // word is what makes WindowServer mis-route a Shift transition
+                // into a spurious Caps Lock toggle. Caps Lock (0x39) returns
+                // `None` here and correctly falls through to the normal path.
+                if let Some(mask) = quartz_modifier_flag(key) {
+                    if quartz_key_is_down(state) {
+                        self.modifier_flags |= mask;
+                    } else {
+                        self.modifier_flags &= !mask;
+                    }
+                    // SAFETY: `event` is a freshly-created, live CGEvent.
+                    unsafe {
+                        CGEventSetType(event, CG_EVENT_FLAGS_CHANGED);
+                        CGEventSetFlags(event, self.modifier_flags);
+                    }
+                }
                 post_owned_event(event, "CGEventCreateKeyboardEvent")
             }
             InputPayload::PointerMove { dx, dy } => {

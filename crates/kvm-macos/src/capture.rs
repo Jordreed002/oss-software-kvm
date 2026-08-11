@@ -46,6 +46,26 @@ pub(crate) const fn quartz_modifier_pressed(virtual_key: u16, flags: u64) -> Opt
     Some(flags & mask != 0)
 }
 
+/// Returns the `CGEventFlags` device mask for a held modifier, or `None` for
+/// non-modifiers and for Caps Lock (0x39). Caps Lock is excluded because Quartz
+/// exposes its toggle state rather than a reliable held-state transition, so it
+/// must stay on the normal key-down/up path. The injection side uses this to
+/// maintain a cumulative flags word and emit `kCGEventFlagsChanged` events.
+pub(crate) const fn quartz_modifier_flag(virtual_key: u16) -> Option<u64> {
+    match virtual_key {
+        0x3b => Some(0x0000_0001), // left Control
+        0x38 => Some(0x0000_0002), // left Shift
+        0x3c => Some(0x0000_0004), // right Shift
+        0x37 => Some(0x0000_0008), // left Command
+        0x36 => Some(0x0000_0010), // right Command
+        0x3a => Some(0x0000_0020), // left Option
+        0x3d => Some(0x0000_0040), // right Option
+        0x3e => Some(0x0000_2000), // right Control
+        0x3f => Some(0x0080_0000), // Fn
+        _ => None,
+    }
+}
+
 pub(crate) const HID_PAGE_GENERIC_DESKTOP: u32 = 0x01;
 pub(crate) const HID_PAGE_KEYBOARD: u32 = 0x07;
 pub(crate) const HID_PAGE_BUTTON: u32 = 0x09;
