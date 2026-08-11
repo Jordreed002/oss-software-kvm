@@ -25,6 +25,29 @@ use crate::supervisor::CurrentAdmittedSession;
 
 const NATIVE_EDGE_TOLERANCE: f64 = 1.0;
 const NATIVE_CURSOR_INSET: f64 = 2.0;
+/// How long the cursor must rest at a transition edge before a pointer
+/// handoff is proposed, in nanoseconds.
+///
+/// Without this dwell, merely *touching* a configured edge fires the handoff
+/// immediately, which collides with OS affordances that also live at the exact
+/// screen edge — most visibly an auto-hidden Windows taskbar (or macOS Dock),
+/// which reveals when the cursor reaches the bottom edge. The dwell lets a
+/// quick flick to the edge reveal the taskbar: the taskbar appears within a
+/// frame or two and the cursor then moves off the edge strip (cancelling the
+/// dwell) before it elapses. A deliberate push-and-hold to switch keeps the
+/// cursor pinned at the edge and clears the dwell. 150 ms is short enough that
+/// a purposeful switch still feels instant (human latency perception thresholds
+/// sit nearer 200 ms) while leaving a wide window to retreat onto the taskbar.
+pub(crate) const NATIVE_EDGE_DWELL_NS: u64 = 150_000_000;
+
+/// In-progress edge dwell: the transition edge the cursor is resting against
+/// and the monotonic timestamp at which it first arrived there. Reset whenever
+/// the cursor leaves the edge zone or the handoff fires.
+#[derive(Clone, Copy)]
+struct EdgeDwell {
+    edge: Edge,
+    started_ns: u64,
+}
 
 /// Coarse workspace-control failure. Pointer protocol failures are session-fatal.
 pub enum WorkspaceControlError {
@@ -126,6 +149,7 @@ pub struct WorkspaceControlPlane {
     device_resync_required: BTreeSet<(kvm_types::HostId, ConnectionGeneration)>,
     pending_local_devices: Option<PendingLocalDeviceInventory>,
     native_portal_armed: bool,
+    edge_dwell: Option<EdgeDwell>,
     shutting_down: bool,
 }
 
@@ -177,6 +201,7 @@ impl fmt::Debug for WorkspaceControlPlane {
                 &self.pending_local_devices.is_some(),
             )
             .field("native_portal_armed", &self.native_portal_armed)
+            .field("edge_dwell", &self.edge_dwell.is_some())
             .field("shutting_down", &self.shutting_down)
             .finish_non_exhaustive()
     }
@@ -223,6 +248,7 @@ impl WorkspaceControlPlane {
             device_resync_required: BTreeSet::new(),
             pending_local_devices: None,
             native_portal_armed: true,
+            edge_dwell: None,
             shutting_down: false,
         })
     }
@@ -265,7 +291,11 @@ impl WorkspaceControlPlane {
     /// Resolves a trusted native cursor position to one configured local
     /// display-edge transition. Ambiguous corners, unlinked edges, remote
     /// authority, and stale/unready workspaces return no proposal.
-    pub(crate) fn native_pointer_boundary(&mut self, position: Point) -> Option<(Edge, f64)> {
+    pub(crate) fn native_pointer_boundary(
+        &mut self,
+        position: Point,
+        now_ns: u64,
+    ) -> Option<(Edge, f64)> {
         if !position.x.is_finite()
             || !position.y.is_finite()
             || !self.selected_inventory_ready
@@ -293,6 +323,7 @@ impl WorkspaceControlPlane {
                     continue;
                 };
                 if candidate.is_some() {
+                    self.edge_dwell = None;
                     return None;
                 }
                 candidate = Some((display.clone(), edge, normalized));
@@ -302,13 +333,34 @@ impl WorkspaceControlPlane {
             // A portal which has just transferred authority remains disarmed
             // until the cursor is observed strictly inside the destination.
             // This prevents its landing coordinate from immediately proposing
-            // the reverse transition on the next native polling tick.
+            // the reverse transition on the next native polling tick. Leaving
+            // the edge zone (no candidate) also cancels any in-progress dwell.
             self.native_portal_armed = true;
+            self.edge_dwell = None;
             return None;
         };
         if !self.native_portal_armed {
             return None;
         }
+        // Edge dwell gate: defer the handoff proposal until the cursor has
+        // rested at this transition edge for NATIVE_EDGE_DWELL_NS. The first
+        // contact (re)starts the dwell; subsequent ticks accumulate until it
+        // elapses. The armed latch is only consumed once the dwell clears and
+        // the proposal actually proceeds, so the dwell itself never disarms
+        // the portal. Moving off the edge resets the dwell via the no-candidate
+        // branch above.
+        if self.edge_dwell.is_none_or(|dwell| dwell.edge != edge) {
+            self.edge_dwell = Some(EdgeDwell {
+                edge,
+                started_ns: now_ns,
+            });
+            return None;
+        }
+        let dwell = self.edge_dwell?;
+        if now_ns.saturating_sub(dwell.started_ns) < NATIVE_EDGE_DWELL_NS {
+            return None;
+        }
+        self.edge_dwell = None;
         self.native_portal_armed = false;
         let logical_position = match edge {
             Edge::Left => Point::new(0.0, normalized * display.logical_size.height),

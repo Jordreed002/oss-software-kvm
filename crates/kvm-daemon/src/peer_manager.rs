@@ -487,7 +487,7 @@ where
         let boundary = self
             .workspace
             .as_mut()
-            .and_then(|workspace| workspace.native_pointer_boundary(position));
+            .and_then(|workspace| workspace.native_pointer_boundary(position, now_ns));
         let Some((edge, normalized_position)) = boundary else {
             return Ok(false);
         };
@@ -3379,8 +3379,15 @@ mod tests {
         activate_selected(&mut manager);
         outbound.clear();
 
-        let outcome =
-            manager.route_selected_capture(captured_pointer_at(1, Point::new(99.0, 25.0)), 10);
+        // First edge contact seeds the dwell (no handoff yet) so a quick flick
+        // to the edge does not immediately yank the pointer to the peer.
+        assert!(!manager
+            .observe_native_pointer(Point::new(99.0, 25.0), 10)
+            .unwrap());
+        let outcome = manager.route_selected_capture(
+            captured_pointer_at(1, Point::new(99.0, 25.0)),
+            10 + crate::workspace_control::NATIVE_EDGE_DWELL_NS,
+        );
 
         assert_eq!(outcome.disposition(), CaptureDisposition::SuppressLocal);
         assert_eq!(outcome.state(), SelectedCaptureState::Inert);
@@ -3402,8 +3409,16 @@ mod tests {
         activate_selected(&mut manager);
         outbound.clear();
 
-        assert!(manager
+        // First edge contact seeds the dwell; the handoff fires only once the
+        // dwell window elapses on a subsequent observation.
+        assert!(!manager
             .observe_native_pointer(Point::new(99.0, 75.0), 10)
+            .unwrap());
+        assert!(manager
+            .observe_native_pointer(
+                Point::new(99.0, 75.0),
+                10 + crate::workspace_control::NATIVE_EDGE_DWELL_NS,
+            )
             .unwrap());
 
         let enter = outbound
@@ -3415,6 +3430,54 @@ mod tests {
             })
             .expect("the polled destination coordinate must enqueue one pointer proposal");
         assert!((enter.normalized_position - 0.75).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn edge_dwell_protects_quick_flick_and_resets_when_leaving() {
+        let outbound = TestOutbound::default();
+        let mut manager = manager_with_outbound(DIAL_PEER, outbound.clone());
+        activate_selected(&mut manager);
+        outbound.clear();
+        let dwell = crate::workspace_control::NATIVE_EDGE_DWELL_NS;
+
+        // A flick: touch the configured edge, then move off it again before the
+        // dwell elapses. This models reaching the screen edge to reveal an
+        // auto-hidden taskbar and then moving onto it — it must NOT switch.
+        assert!(!manager
+            .observe_native_pointer(Point::new(99.0, 50.0), 10)
+            .unwrap());
+        assert!(!manager
+            .observe_native_pointer(Point::new(50.0, 50.0), 10 + dwell / 2)
+            .unwrap());
+        assert!(
+            outbound
+                .messages()
+                .iter()
+                .all(|message| !matches!(message, WireMessage::PointerEnter(_))),
+            "a quick flick past the edge must not propose a handoff"
+        );
+
+        // Leaving the edge resets the dwell: a fresh contact past the original
+        // dwell window still does not fire immediately — it re-seeds.
+        assert!(!manager
+            .observe_native_pointer(Point::new(99.0, 50.0), 10 + dwell + 1)
+            .unwrap());
+        assert!(
+            outbound
+                .messages()
+                .iter()
+                .all(|message| !matches!(message, WireMessage::PointerEnter(_))),
+            "a re-seeded dwell must not fire on first contact"
+        );
+
+        // Only a sustained contact that clears the re-seeded dwell hands off.
+        assert!(manager
+            .observe_native_pointer(Point::new(99.0, 50.0), 10 + 2 * dwell + 2)
+            .unwrap());
+        assert!(outbound
+            .messages()
+            .iter()
+            .any(|message| matches!(message, WireMessage::PointerEnter(_))));
     }
 
     fn snapshot(peer_id: PeerId, addresses: Vec<IpAddr>) -> DiscoverySnapshot {
@@ -4123,8 +4186,16 @@ mod tests {
         let routing = manager.selected_routing_handle().unwrap().load();
         assert!(!routing.handoff_pending);
         assert_eq!(outbound.messages().len(), before_duplicate + 1);
-        assert!(manager
+        // Edge dwell: the first contact seeds the dwell, the second (after the
+        // dwell window) fires the handoff.
+        assert!(!manager
             .observe_native_pointer(Point::new(99.0, 50.0), 13)
+            .unwrap());
+        assert!(manager
+            .observe_native_pointer(
+                Point::new(99.0, 50.0),
+                13 + crate::workspace_control::NATIVE_EDGE_DWELL_NS,
+            )
             .unwrap());
     }
 
