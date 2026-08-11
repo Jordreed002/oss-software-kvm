@@ -31,9 +31,10 @@ pub use connector::{
     SecurePeerStream, TransportPeerIdentity,
 };
 pub use diagnostics::{
-    fetch_report, read_report, spawn_diagnostics_server, write_report, DiagnosticsError,
-    DiagnosticsPublisher, DiagnosticsReport, NetworkDiagnostics, DEFAULT_DIAGNOSTICS_PORT,
-    DIAGNOSTICS_SCHEMA_VERSION, MAX_DIAGNOSTICS_PAYLOAD,
+    empty_capture_cell, fetch_report, read_report, spawn_diagnostics_server, write_report,
+    CaptureDiagnostics, CaptureDiagnosticsCell, DiagnosticsError, DiagnosticsPublisher,
+    DiagnosticsReport, NetworkDiagnostics, DEFAULT_DIAGNOSTICS_PORT, DIAGNOSTICS_SCHEMA_VERSION,
+    MAX_DIAGNOSTICS_PAYLOAD,
 };
 pub use heartbeat::{
     HeartbeatAction, HeartbeatConfig, HeartbeatConfigError, HeartbeatController, HeartbeatError,

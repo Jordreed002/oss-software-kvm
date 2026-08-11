@@ -13,11 +13,12 @@ use kvm_daemon::{
     SupervisorEventOutcome, WorkspaceControlPlane,
 };
 use kvm_network::{
-    spawn_diagnostics_server, AuthenticatedLanConnector, BoundedLanListener,
-    ConnectionGenerationGate, ConnectionRole, DiagnosticsPublisher, DiagnosticsReport,
-    LanListenerConfig, LanListenerEvent, LanListenerReport, LanPeerAddress, NetworkDiagnostics,
-    PersistentPeerConfig, RustlsPeerStream, RustlsTcpConnector, SecurePeerStream, SessionTelemetry,
-    DEFAULT_DIAGNOSTICS_PORT, DIAGNOSTICS_SCHEMA_VERSION,
+    empty_capture_cell, spawn_diagnostics_server, AuthenticatedLanConnector, BoundedLanListener,
+    CaptureDiagnostics, CaptureDiagnosticsCell, ConnectionGenerationGate, ConnectionRole,
+    DiagnosticsPublisher, DiagnosticsReport, LanListenerConfig, LanListenerEvent,
+    LanListenerReport, LanPeerAddress, NetworkDiagnostics, PersistentPeerConfig, RustlsPeerStream,
+    RustlsTcpConnector, SecurePeerStream, SessionTelemetry, DEFAULT_DIAGNOSTICS_PORT,
+    DIAGNOSTICS_SCHEMA_VERSION,
 };
 use kvm_protocol::WirePeerId;
 use kvm_security::PairedPeer;
@@ -252,6 +253,7 @@ where
     started: Instant,
     publisher: DiagnosticsPublisher,
     identity: LocalHostIdentity,
+    capture: CaptureDiagnosticsCell,
 }
 
 impl<I> SessionSpawnCtx<'_, I>
@@ -275,6 +277,7 @@ where
             self.started,
             self.publisher.clone(),
             self.identity,
+            Arc::clone(&self.capture),
         ));
     }
 }
@@ -326,7 +329,7 @@ where
         self,
         shutdown: tokio::sync::watch::Receiver<bool>,
     ) -> Result<(), RuntimeTransportError> {
-        self.run_transport_ready(shutdown, None, Instant::now(), None)
+        self.run_transport_ready(shutdown, None, Instant::now(), None, empty_capture_cell())
             .await
     }
 
@@ -350,6 +353,24 @@ where
         self.run_with_capture_status(backend, shutdown, None).await
     }
 
+    /// Awaits transport readiness, surfacing an early transport-task failure as
+    /// a coarse task/transport error. Extracted from `run_with_capture_status`
+    /// to keep that method within the clippy line budget.
+    async fn await_transport_ready(
+        transport_task: &mut tokio::task::JoinHandle<Result<(), RuntimeTransportError>>,
+        ready_receiver: tokio::sync::oneshot::Receiver<()>,
+    ) -> Result<(), RuntimeServiceError> {
+        let ready_ok = tokio::select! {
+            ready = ready_receiver => ready.is_ok(),
+            result = &mut *transport_task => return coarse_join_outcome(result),
+        };
+        if ready_ok {
+            Ok(())
+        } else {
+            coarse_join_outcome(transport_task.await)
+        }
+    }
+
     pub(crate) async fn run_with_capture_status<B>(
         self,
         backend: B,
@@ -365,34 +386,19 @@ where
         let started = Instant::now();
         let (transport_shutdown, transport_receiver) = tokio::sync::watch::channel(false);
         let (ready_sender, ready_receiver) = tokio::sync::oneshot::channel();
+        let capture_cell = empty_capture_cell();
         let mut transport_task = tokio::spawn(self.run_transport_ready(
             transport_receiver,
             Some(ready_sender),
             started,
             status.clone(),
+            Arc::clone(&capture_cell),
         ));
-        tokio::select! {
-            ready = ready_receiver => {
-                if ready.is_err() {
-                    return transport_task.await
-                        .map_err(|_| RuntimeServiceError::new(RuntimeServiceErrorKind::Task))?
-                        .map_err(|_| RuntimeServiceError::new(RuntimeServiceErrorKind::Transport));
-                }
-            }
-            result = &mut transport_task => {
-                return result
-                    .map_err(|_| RuntimeServiceError::new(RuntimeServiceErrorKind::Task))?
-                    .map_err(|_| RuntimeServiceError::new(RuntimeServiceErrorKind::Transport));
-            }
-        }
-
+        Self::await_transport_ready(&mut transport_task, ready_receiver).await?;
         if *shutdown.borrow() {
             developer_event("service=stopped_before_capture");
             let _ = transport_shutdown.send(true);
-            return transport_task
-                .await
-                .map_err(|_| RuntimeServiceError::new(RuntimeServiceErrorKind::Task))?
-                .map_err(|_| RuntimeServiceError::new(RuntimeServiceErrorKind::Transport));
+            return coarse_join_outcome(transport_task.await);
         }
 
         let mut capture = NativeCaptureSupervisor::new(backend, manager);
@@ -428,8 +434,10 @@ where
                         break Err(RuntimeServiceError::new(RuntimeServiceErrorKind::Capture));
                     }
                     if Instant::now() >= next_capture_report {
+                        let metrics = capture.metrics();
+                        update_capture_cell(&capture_cell, &metrics);
                         report_capture_metrics(
-                            capture.metrics(),
+                            metrics,
                             &mut last_capture_metrics,
                             &mut next_capture_report,
                         );
@@ -466,6 +474,7 @@ where
         ready: Option<tokio::sync::oneshot::Sender<()>>,
         started: Instant,
         status: Option<RuntimeStatusPublisher>,
+        capture_cell: CaptureDiagnosticsCell,
     ) -> Result<(), RuntimeTransportError> {
         // Bind the separate diagnostics channel (spec §31) before the KVM
         // listener consumes `listen_addresses` by move; see `bind_diagnostics_server`.
@@ -492,6 +501,7 @@ where
             started,
             publisher: diagnostics_publisher.clone(),
             identity: self.host_identity,
+            capture: Arc::clone(&capture_cell),
         };
 
         let run_result = async {
@@ -979,6 +989,7 @@ async fn drive_session<I, S, A>(
     started: Instant,
     publisher: DiagnosticsPublisher,
     identity: LocalHostIdentity,
+    capture_cell: CaptureDiagnosticsCell,
 ) -> Result<(), RuntimeTransportError>
 where
     I: OutputInjectionBackend + 'static,
@@ -1040,7 +1051,12 @@ where
                 // Publish over the separate diagnostics channel on every tick so
                 // the control panel always has fresh data, independent of dev
                 // logging. The dev log line is an additional, opt-in surface.
-                publisher.publish(build_diagnostics_report(identity, Some(telemetry), started));
+                publisher.publish(build_diagnostics_report(
+                    identity,
+                    Some(telemetry),
+                    read_capture_cell(&capture_cell),
+                    started,
+                ));
                 if telemetry_enabled {
                     report_session_telemetry(telemetry, &mut telemetry_baseline);
                 }
@@ -1077,7 +1093,8 @@ fn bind_diagnostics_server(
     identity: LocalHostIdentity,
     started: Instant,
 ) -> DiagnosticsPublisher {
-    let publisher = DiagnosticsPublisher::new(build_diagnostics_report(identity, None, started));
+    let publisher =
+        DiagnosticsPublisher::new(build_diagnostics_report(identity, None, None, started));
     let Some(bind_addr) = listen_addresses
         .first()
         .map(|addr| std::net::SocketAddr::new(addr.ip(), DEFAULT_DIAGNOSTICS_PORT))
@@ -1098,10 +1115,12 @@ fn bind_diagnostics_server(
 
 /// Stamps one redacted, versioned diagnostics report for the local host. The
 /// network section is `None` until the first session telemetry tick supplies a
-/// live [`SessionTelemetry`].
+/// live [`SessionTelemetry`]; the capture section is `None` until the capture
+/// supervisor publishes its first counter snapshot.
 fn build_diagnostics_report(
     identity: LocalHostIdentity,
     telemetry: Option<SessionTelemetry>,
+    capture: Option<CaptureDiagnostics>,
     started: Instant,
 ) -> DiagnosticsReport {
     DiagnosticsReport {
@@ -1114,7 +1133,57 @@ fn build_diagnostics_report(
         captured_at_unix_ms: DiagnosticsReport::now_unix_ms(),
         uptime_ms: u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
         network: telemetry.map(NetworkDiagnostics::from_telemetry),
+        capture,
     }
+}
+
+/// Flattens a joined transport-task outcome into the coarse task/transport
+/// error used by the service entrypoints. Extracted so the long service method
+/// stays within the clippy line budget.
+fn coarse_join_outcome(
+    outcome: Result<Result<(), RuntimeTransportError>, tokio::task::JoinError>,
+) -> Result<(), RuntimeServiceError> {
+    let inner = outcome.map_err(|_| RuntimeServiceError::new(RuntimeServiceErrorKind::Task))?;
+    inner.map_err(|_| RuntimeServiceError::new(RuntimeServiceErrorKind::Transport))
+}
+
+/// Copies the native capture supervisor's aggregate counters into the
+/// serializable diagnostics DTO. Every field is an aggregate counter; no input
+/// payload, key value, coordinate, or peer address is carried across.
+fn capture_diagnostics_from(
+    metrics: crate::native_capture::NativeCaptureMetrics,
+) -> CaptureDiagnostics {
+    CaptureDiagnostics {
+        observed: metrics.observed,
+        suppressed: metrics.suppressed,
+        allowed_local: metrics.allowed_local,
+        lock_contention: metrics.lock_contention,
+        callback_panics: metrics.callback_panics,
+        pointer_observations: metrics.pointer_observations,
+        pointer_transitions: metrics.pointer_transitions,
+        pointer_observation_failures: metrics.pointer_observation_failures,
+        cursor_hides: metrics.cursor_hides,
+        cursor_shows: metrics.cursor_shows,
+        cursor_warps: metrics.cursor_warps,
+    }
+}
+
+/// Publishes the latest capture counters into the shared cell so the network
+/// session task can fold them into the next diagnostics report. Best-effort and
+/// non-blocking: a contended write is dropped rather than stalling capture.
+fn update_capture_cell(
+    cell: &CaptureDiagnosticsCell,
+    metrics: &crate::native_capture::NativeCaptureMetrics,
+) {
+    if let Ok(mut guard) = cell.write() {
+        *guard = Some(capture_diagnostics_from(*metrics));
+    }
+}
+
+/// Reads the latest capture snapshot. Returns `None` on a contended lock rather
+/// than blocking the diagnostics publish path.
+fn read_capture_cell(cell: &CaptureDiagnosticsCell) -> Option<CaptureDiagnostics> {
+    cell.read().ok().and_then(|guard| *guard)
 }
 
 fn report_session_telemetry(current: SessionTelemetry, baseline: &mut (Instant, SessionTelemetry)) {

@@ -98,6 +98,56 @@ impl NetworkDiagnostics {
     }
 }
 
+/// Serializable view of the native input-capture supervisor's aggregate
+/// counters (spec §35 surface).
+///
+/// Every field is an aggregate counter — observed events, suppression and
+/// fail-open tallies, pointer/cursor activity — never input payloads, key
+/// values, coordinates, or peer addresses. Like the network DTO, this is safe
+/// to serve over the unauthenticated read-only diagnostics channel: a reader
+/// can observe coarse activity volume but cannot reconstruct any input.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CaptureDiagnostics {
+    /// Total native input events observed by the capture callback.
+    pub observed: u64,
+    /// Events suppressed because routing is remote (input forwarded, not local).
+    pub suppressed: u64,
+    /// Events allowed to pass through to the local OS (fail-open / local owner).
+    pub allowed_local: u64,
+    /// Times the shared metrics/state lock was contended (coarse contention signal).
+    pub lock_contention: u64,
+    /// Capture callback invocations that panicked (recovered; non-fatal).
+    pub callback_panics: u64,
+    /// Pointer observations recorded by the native pipeline.
+    pub pointer_observations: u64,
+    /// Cross-edge pointer handoffs (transitions between local and remote routing).
+    pub pointer_transitions: u64,
+    /// Pointer observations that could not be sampled.
+    pub pointer_observation_failures: u64,
+    /// Times the local cursor was hidden for remote ownership.
+    pub cursor_hides: u64,
+    /// Times the local cursor was restored.
+    pub cursor_shows: u64,
+    /// Programmatic cursor repositions (warp-to-edge on handoff).
+    pub cursor_warps: u64,
+}
+
+/// Cross-task shared holder for the latest capture-metrics snapshot.
+///
+/// The native capture supervisor (which owns the counters) writes; the network
+/// session task that publishes [`DiagnosticsReport`] reads. Both sides use
+/// non-blocking `try_read`/`try_write`-style access so the advisory diagnostics
+/// path can never stall the real-time input or streaming hot paths.
+pub type CaptureDiagnosticsCell = Arc<RwLock<Option<CaptureDiagnostics>>>;
+
+/// Creates an empty capture-metrics cell, seeded to `None` (no capture has
+/// reported yet).
+#[must_use]
+pub fn empty_capture_cell() -> CaptureDiagnosticsCell {
+    Arc::new(RwLock::new(None))
+}
+
 /// One redacted, versioned read of a host's diagnostics state, served over the
 /// separate diagnostics connection.
 ///
@@ -130,6 +180,9 @@ pub struct DiagnosticsReport {
     /// Live authenticated-session network telemetry. `None` when no session is
     /// currently active.
     pub network: Option<NetworkDiagnostics>,
+    /// Aggregate native input-capture counters. `None` until the capture
+    /// supervisor reports its first snapshot (e.g. on a transport-only host).
+    pub capture: Option<CaptureDiagnostics>,
 }
 
 impl DiagnosticsReport {
@@ -362,6 +415,19 @@ mod tests {
                 channel_rejections: DropCounters::default(),
                 coalesced_moves: 42,
             }),
+            capture: Some(CaptureDiagnostics {
+                observed: 1_000,
+                suppressed: 120,
+                allowed_local: 880,
+                lock_contention: 2,
+                callback_panics: 0,
+                pointer_observations: 510,
+                pointer_transitions: 7,
+                pointer_observation_failures: 1,
+                cursor_hides: 7,
+                cursor_shows: 7,
+                cursor_warps: 14,
+            }),
         }
     }
 
@@ -408,6 +474,9 @@ mod tests {
         assert!(json.contains("\"network\""));
         assert!(json.contains("\"lastRttMs\":5"));
         assert!(json.contains("\"coalescedMoves\":42"));
+        assert!(json.contains("\"capture\""));
+        assert!(json.contains("\"allowedLocal\":880"));
+        assert!(json.contains("\"pointerTransitions\":7"));
     }
 
     #[test]

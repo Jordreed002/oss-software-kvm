@@ -134,6 +134,23 @@ export interface NetworkDiagnostics {
   coalescedMoves: number;
 }
 
+/** Aggregate native input-capture counters (spec §35 surface). Every field is
+ *  a coarse counter — never an input payload, key value, coordinate, or peer
+ *  address. Mirrors `kvm_network::CaptureDiagnostics`. */
+export interface CaptureDiagnostics {
+  observed: number;
+  suppressed: number;
+  allowedLocal: number;
+  lockContention: number;
+  callbackPanics: number;
+  pointerObservations: number;
+  pointerTransitions: number;
+  pointerObservationFailures: number;
+  cursorHides: number;
+  cursorShows: number;
+  cursorWarps: number;
+}
+
 /** One redacted, versioned read of a host's diagnostics state. Mirrors
  *  `kvm_network::DiagnosticsReport`, pulled over the separate diagnostics
  *  connection (port 24801), distinct from the active KVM switch (24800). */
@@ -147,4 +164,6 @@ export interface DiagnosticsReport {
   uptimeMs: number;
   /** Live session telemetry, or null when no session is active. */
   network: NetworkDiagnostics | null;
+  /** Aggregate capture counters, or null before the capture supervisor reports. */
+  capture: CaptureDiagnostics | null;
 }

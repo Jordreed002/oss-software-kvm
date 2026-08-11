@@ -180,6 +180,19 @@ const invokeOrPreview = async <T>(command: string, args?: Record<string, unknown
         channelRejections: { input: 0, control: 0, background: 0 },
         coalescedMoves: Math.floor(400 + (Math.cos(t / 4) + 1) * 250),
       },
+      capture: {
+        observed: Math.floor(12_000 + (Math.sin(t / 1.7) + 1) * 3_000),
+        suppressed: Math.floor(8_000 + (Math.cos(t / 1.9) + 1) * 2_500),
+        allowedLocal: Math.floor(4_000 + (Math.sin(t / 2.3) + 1) * 1_200),
+        lockContention: Math.floor((Math.sin(t / 5) + 1) * 2),
+        callbackPanics: 0,
+        pointerObservations: Math.floor(6_200 + (Math.sin(t / 1.4) + 1) * 1_800),
+        pointerTransitions: Math.floor((Math.sin(t / 9) + 1) * 4),
+        pointerObservationFailures: Math.floor((Math.sin(t / 11) + 1) * 1),
+        cursorHides: Math.floor((Math.sin(t / 9) + 1) * 4),
+        cursorShows: Math.floor((Math.sin(t / 9) + 1) * 4),
+        cursorWarps: Math.floor((Math.cos(t / 8) + 1) * 8),
+      },
     } as DiagnosticsReport as T;
   }
   return structuredClone(previewState) as T;

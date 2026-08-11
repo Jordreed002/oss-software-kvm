@@ -2,7 +2,7 @@ import { useEffect, useRef, useState } from "react";
 import { Activity, Laptop, Monitor } from "lucide-react";
 import { api } from "./bridge";
 import { type ChartSeries, TimeSeriesChart, useHistory } from "./DashChart";
-import type { DiagnosticsReport, DropCounters, NetworkDiagnostics, Platform, SetupSnapshot } from "./types";
+import type { CaptureDiagnostics, DiagnosticsReport, DropCounters, NetworkDiagnostics, Platform, SetupSnapshot } from "./types";
 
 const POLL_INTERVAL_MS = 1500;
 const HISTORY_MAX_SAMPLES = 60;
@@ -214,6 +214,8 @@ export function DiagnosticsDashboard({ snapshot }: { snapshot: SetupSnapshot }) 
       <NetworkTable label="Network activity" local={localReport} peer={peerReport} localRate={localRate} peerRate={peerRate} />
 
       <QueueHealthTable label="Queue health · per traffic lane" local={localReport} peer={peerReport} />
+
+      <CaptureTable label="Native input capture · aggregate counters" local={localReport} peer={peerReport} />
 
       <div className="dash-foot">
         <span>
@@ -429,6 +431,80 @@ function QueueHealthTable({
               </tr>
             );
           })}
+        </tbody>
+      </table>
+    </div>
+  );
+}
+
+/** One capture-counter row: its accessor on CaptureDiagnostics, a human label,
+ *  and whether a non-zero value is a *failure* signal (highlighted orange). */
+interface CaptureRow {
+  key: keyof CaptureDiagnostics;
+  label: string;
+  failure: boolean;
+}
+
+const CAPTURE_ROWS: CaptureRow[] = [
+  { key: "observed", label: "Events observed", failure: false },
+  { key: "suppressed", label: "Suppressed (remote routing)", failure: false },
+  { key: "allowedLocal", label: "Allowed locally (fail-open)", failure: false },
+  { key: "pointerObservations", label: "Pointer observations", failure: false },
+  { key: "pointerTransitions", label: "Pointer handoff transitions", failure: false },
+  { key: "cursorHides", label: "Cursor hides", failure: false },
+  { key: "cursorShows", label: "Cursor shows", failure: false },
+  { key: "cursorWarps", label: "Cursor warps", failure: false },
+  { key: "lockContention", label: "Lock contention", failure: true },
+  { key: "callbackPanics", label: "Callback panics", failure: true },
+  { key: "pointerObservationFailures", label: "Pointer observation failures", failure: true },
+];
+
+function CaptureTable({
+  label,
+  local,
+  peer,
+}: {
+  label: string;
+  local: DiagnosticsReport | null;
+  peer: DiagnosticsReport | null;
+}) {
+  const localCap = local?.capture ?? null;
+  const peerCap = peer?.capture ?? null;
+  const seen = localCap ?? peerCap;
+
+  return (
+    <div className="dash-table-wrap">
+      <div className="dash-table-title">
+        <span>{label}</span>
+        <em>AGGREGATE COUNTERS · NO PAYLOADS</em>
+      </div>
+      <table className="dash-table">
+        <thead>
+          <tr>
+            <th scope="col">Counter</th>
+            <th scope="col">This computer</th>
+            <th scope="col">Paired computer</th>
+          </tr>
+        </thead>
+        <tbody>
+          {CAPTURE_ROWS.map((row) => {
+            const lv = localCap ? localCap[row.key] : null;
+            const pv = peerCap ? peerCap[row.key] : null;
+            return (
+              <tr key={row.key}>
+                <td className="label">{row.label}</td>
+                <td className={row.failure && lv && lv > 0 ? "neg" : ""}>{lv != null ? formatNumber(lv) : "—"}</td>
+                <td className={row.failure && pv && pv > 0 ? "neg" : ""}>{pv != null ? formatNumber(pv) : "—"}</td>
+              </tr>
+            );
+          })}
+          {!seen && (
+            <tr>
+              <td className="label">Waiting for capture supervisor…</td>
+              <td>—</td>
+              <td>—</td>
+            </tr>
+          )}
         </tbody>
       </table>
     </div>
