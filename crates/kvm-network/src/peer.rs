@@ -3,6 +3,7 @@ use crate::connection_role::{
     ActiveConnection, ConnectionGeneration, ConnectionGenerationError, ConnectionGenerationGate,
     ConnectionRole, ConnectionRoleError, PendingConnection,
 };
+use crate::pointer_datagram::PointerDatagramPath;
 use crate::{
     AuthenticatedConnector, DevelopmentAddress, FrameReader, FrameWriter, HeartbeatAction,
     HeartbeatConfig, HeartbeatController, NetworkError, ObservableSessionStats, OutboundQueue,
@@ -202,6 +203,10 @@ pub enum PeerEvent {
         peer: AdmittedPeer,
         message: WireMessage,
     },
+    PointerDatagram {
+        peer: AdmittedPeer,
+        input: kvm_protocol::InputEventV1,
+    },
     Disconnected {
         reason: DisconnectReason,
         undelivered: UndeliveredTraffic,
@@ -226,6 +231,9 @@ impl std::fmt::Debug for PeerEvent {
             Self::Message { message, .. } => formatter
                 .debug_struct("Message")
                 .field("message_type", &message.message_type())
+                .finish_non_exhaustive(),
+            Self::PointerDatagram { .. } => formatter
+                .debug_struct("PointerDatagram")
                 .finish_non_exhaustive(),
             Self::Disconnected { reason, .. } => formatter
                 .debug_struct("Disconnected")
@@ -1628,6 +1636,7 @@ async fn run_session_with_stats<S: SecurePeerStream, A: SessionAdmission>(
     shutdown: &mut watch::Receiver<bool>,
     stats: Option<&ObservableSessionStats>,
 ) -> Result<SessionEnd, SessionFailure> {
+    let socket_endpoints = stream.socket_endpoints();
     let admission_result = tokio::time::timeout(
         config.admission_timeout,
         perform_admission(stream, admission, events, shutdown),
@@ -1657,6 +1666,26 @@ async fn run_session_with_stats<S: SecurePeerStream, A: SessionAdmission>(
     // batch reuses them instead of reallocating under sustained throughput.
     let mut recycled = None::<PendingFrame>;
     let selected_protocol_version = admitted.selected_protocol_version();
+    let mut pointer_path =
+        if selected_protocol_version >= kvm_protocol::POINTER_DATAGRAM_PROTOCOL_VERSION {
+            if let Some((local, peer)) = socket_endpoints {
+                PointerDatagramPath::bind(
+                    local,
+                    peer,
+                    admitted.session_id(),
+                    admitted.local_hello().host_id,
+                    admitted.hello().host_id,
+                )
+                .await
+                .ok()
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+    let mut pointer_probe_tick = tokio::time::interval(Duration::from_secs(1));
+    pointer_probe_tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
     let mut read_progress = FrameReadProgress::default();
     // Reused across drains so a multi-frame burst is decoded and dispatched
     // without per-drain or per-frame allocation.
@@ -1667,7 +1696,7 @@ async fn run_session_with_stats<S: SecurePeerStream, A: SessionAdmission>(
     let result: Result<SessionEnd, SessionError> = async {
     loop {
         while let Ok(message) = outbound.try_recv() {
-            enqueue(&mut queue, message)?;
+            route_outbound(&mut queue, &mut pointer_path, message, stats)?;
         }
         if pending.is_none() {
             let reusable = recycled.take().unwrap_or_default();
@@ -1749,9 +1778,38 @@ async fn run_session_with_stats<S: SecurePeerStream, A: SessionAdmission>(
                     stats.publish_rtt(heartbeat.health().last_rtt);
                 }
             }
+            datagram = async {
+                match pointer_path.as_mut() {
+                    Some(path) => path.receive().await,
+                    None => std::future::pending().await,
+                }
+            }, if pointer_path.is_some() => {
+                match datagram {
+                    Ok(Some(input)) => {
+                        if let Some(stats) = stats {
+                            stats.record_pointer_datagram_inbound();
+                        }
+                        send_event(events, PeerEvent::PointerDatagram {
+                            peer: admitted.clone(),
+                            input,
+                        })?;
+                    }
+                    Ok(None) => {
+                        if let (Some(stats), Some(path)) = (stats, pointer_path.as_ref()) {
+                            stats.set_pointer_datagram_active(path.is_ready());
+                        }
+                    }
+                    Err(_) => {
+                        if let Some(stats) = stats {
+                            stats.set_pointer_datagram_active(false);
+                        }
+                        pointer_path = None;
+                    }
+                }
+            }
             message = outbound.recv(), if outbound_open => {
                 if let Some(message) = message {
-                    enqueue(&mut queue, message)?;
+                    route_outbound(&mut queue, &mut pointer_path, message, stats)?;
                 } else {
                     outbound_open = false;
                 }
@@ -1770,6 +1828,16 @@ async fn run_session_with_stats<S: SecurePeerStream, A: SessionAdmission>(
                 reset_backoff |= origin.elapsed() >= config.healthy_reset_after
                     && heartbeat.health().state == crate::PeerState::Healthy
                     && heartbeat.health().last_pong_at.is_some();
+            }
+            _ = pointer_probe_tick.tick(), if pointer_path.is_some() => {
+                if let Some(path) = pointer_path.as_mut() {
+                    if path.send_probe().await.is_err() {
+                        if let Some(stats) = stats {
+                            stats.set_pointer_datagram_active(false);
+                        }
+                        pointer_path = None;
+                    }
+                }
             }
         }
     }}.await;
@@ -2220,6 +2288,33 @@ fn enqueue(queue: &mut OutboundQueue, message: WireMessage) -> Result<(), Sessio
             undelivered: undelivered_metadata(&message, false),
         }
     })
+}
+
+fn route_outbound(
+    queue: &mut OutboundQueue,
+    pointer_path: &mut Option<PointerDatagramPath>,
+    message: WireMessage,
+    stats: Option<&ObservableSessionStats>,
+) -> Result<(), SessionError> {
+    if let Some(path) = pointer_path.as_mut() {
+        match path.try_send_pointer(&message) {
+            Ok(true) => {
+                if let Some(stats) = stats {
+                    stats.record_pointer_datagram_outbound();
+                }
+                return Ok(());
+            }
+            Ok(false) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+            Err(_) => {
+                if let Some(stats) = stats {
+                    stats.set_pointer_datagram_active(false);
+                }
+                *pointer_path = None;
+            }
+        }
+    }
+    enqueue(queue, message)
 }
 
 fn undelivered_metadata(message: &WireMessage, partially_sent: bool) -> UndeliveredMessage {

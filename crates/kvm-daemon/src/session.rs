@@ -14,7 +14,10 @@ use kvm_network::{
     AdmittedPeer, ConnectionGeneration, ConnectionState, OutboundSendError, PeerEvent, PeerSender,
     TransportPeerIdentity,
 };
-use kvm_protocol::{HelloV1, MessageType, ReleaseInputV1, ValidationError, WireMessage};
+use kvm_protocol::{
+    HelloV1, InputEventV1, MessageType, ReleaseInputV1, ValidationError, WireInputPayloadV1,
+    WireMessage,
+};
 use kvm_security::{IdentityFingerprint, PeerIdentity};
 use kvm_types::{DeviceId, HostId, PeerId, WorkspaceState};
 use thiserror::Error;
@@ -998,6 +1001,7 @@ where
         match event {
             rejected @ (PeerEvent::Admitted(_)
             | PeerEvent::Message { .. }
+            | PeerEvent::PointerDatagram { .. }
             | PeerEvent::Disconnected { .. }) => {
                 drop(rejected);
                 Err(self.fail_session(CoordinatorError::NotAdmitted, now_ns))
@@ -1287,6 +1291,32 @@ where
             return Err(self.fail_session(CoordinatorError::IdentityMismatch, now_ns));
         }
         self.handle_authorized_message(message, now_ns)
+    }
+
+    /// Applies an authenticated pointer fast-path event without advancing the
+    /// reliable stream's sequence. The two transports may arrive out of order.
+    pub(crate) fn handle_endpoint_pointer_datagram(
+        &mut self,
+        endpoint: SessionEndpoint,
+        peer: &AdmittedPeer,
+        input: &InputEventV1,
+        now_ns: u64,
+    ) -> Result<PeerEventOutcome, CoordinatorError> {
+        let binding = admitted_binding(peer);
+        if self.authorized.as_ref().is_none_or(|session| {
+            session.endpoint != endpoint || session.binding != binding || !session.accepts_input
+        }) || HostId::from_bytes(input.source_host.0) != self.expected.host_id()
+            || !matches!(input.payload, WireInputPayloadV1::PointerMove { .. })
+        {
+            return Err(self.fail_session(CoordinatorError::IdentityMismatch, now_ns));
+        }
+        WireMessage::Input(input.clone())
+            .validate()
+            .map_err(|error| self.fail_session(CoordinatorError::InvalidMessage(error), now_ns))?;
+        let event = input_from_wire(input)
+            .map_err(|error| self.fail_session(CoordinatorError::Wire(error), now_ns))?;
+        self.inject_received(event, now_ns)?;
+        Ok(PeerEventOutcome::Applied)
     }
 
     fn accept_sequence(&mut self, received: u64, now_ns: u64) -> Result<(), CoordinatorError> {

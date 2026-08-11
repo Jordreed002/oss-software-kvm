@@ -16,8 +16,8 @@ pub use frame::{
     decode_frame, decode_frame_for_version, encode_frame, encode_frame_for_version,
     encode_frame_for_version_into, is_supported_protocol_version, supports_release_proof,
     FrameHeader, CURRENT_PROTOCOL_VERSION, FRAME_HEADER_LEN, FRAME_MAGIC, MAX_FRAME_PAYLOAD,
-    MIN_SUPPORTED_PROTOCOL_VERSION, PROTOCOL_VERSION, PROTOCOL_VERSION_V1, PROTOCOL_VERSION_V2,
-    RELEASE_PROOF_PROTOCOL_VERSION,
+    MIN_SUPPORTED_PROTOCOL_VERSION, POINTER_DATAGRAM_PROTOCOL_VERSION, PROTOCOL_VERSION,
+    PROTOCOL_VERSION_V1, PROTOCOL_VERSION_V2, PROTOCOL_VERSION_V3, RELEASE_PROOF_PROTOCOL_VERSION,
 };
 pub use message::{MessageType, WireMessage};
 pub use wire::*;

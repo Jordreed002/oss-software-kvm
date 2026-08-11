@@ -1213,12 +1213,13 @@ mod tests {
     }
 
     #[test]
-    fn release_proof_capability_is_named_and_exactly_versioned() {
+    fn release_proof_capability_applies_to_v2_and_later() {
         assert_eq!(RELEASE_PROOF_PROTOCOL_VERSION, PROTOCOL_VERSION_V2);
         assert!(!supports_release_proof(0));
         assert!(!supports_release_proof(PROTOCOL_VERSION_V1));
         assert!(supports_release_proof(PROTOCOL_VERSION_V2));
-        assert!(!supports_release_proof(PROTOCOL_VERSION_V2 + 1));
+        assert!(supports_release_proof(PROTOCOL_VERSION_V3));
+        assert!(!supports_release_proof(CURRENT_PROTOCOL_VERSION + 1));
     }
 
     #[test]

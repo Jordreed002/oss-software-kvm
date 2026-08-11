@@ -15,6 +15,7 @@ mod diagnostics;
 mod heartbeat;
 mod listener;
 mod peer;
+mod pointer_datagram;
 mod queue;
 mod reconnect;
 mod rustls_acceptor;

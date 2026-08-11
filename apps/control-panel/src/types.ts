@@ -132,6 +132,9 @@ export interface NetworkDiagnostics {
   dropped: DropCounters;
   channelRejections: DropCounters;
   coalescedMoves: number;
+  pointerDatagramActive: boolean;
+  pointerDatagramsOutbound: number;
+  pointerDatagramsInbound: number;
 }
 
 /** Aggregate native input-capture counters (spec §35 surface). Every field is

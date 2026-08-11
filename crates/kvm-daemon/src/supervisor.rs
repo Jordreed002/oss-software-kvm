@@ -641,6 +641,19 @@ where
                         .map_err(WorkspaceControlError::Coordinator)
                 }
             }
+            PeerEvent::PointerDatagram { peer, input } => {
+                if !current.matches_admitted(generation, &peer)
+                    || self.engine.coordinator.route_policy_update_pending()
+                {
+                    Err(WorkspaceControlError::Unavailable)
+                } else {
+                    workspace.validate_remote_input(current, &input)?;
+                    self.engine
+                        .coordinator
+                        .handle_endpoint_pointer_datagram(current.endpoint(), &peer, &input, now_ns)
+                        .map_err(WorkspaceControlError::Coordinator)
+                }
+            }
             PeerEvent::StateChanged(state) => {
                 if state == kvm_network::ConnectionState::Connected {
                     let outcome = self
@@ -778,6 +791,9 @@ where
             move |coordinator| match event {
                 PeerEvent::Message { peer, message } => {
                     coordinator.handle_endpoint_message(endpoint, &peer, message, now_ns)
+                }
+                PeerEvent::PointerDatagram { peer, input } => {
+                    coordinator.handle_endpoint_pointer_datagram(endpoint, &peer, &input, now_ns)
                 }
                 PeerEvent::StateChanged(state) => {
                     coordinator.handle_endpoint_state(endpoint, state, now_ns)

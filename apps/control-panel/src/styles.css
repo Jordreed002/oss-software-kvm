@@ -296,7 +296,7 @@ footer { height: 44px; border-top: 1px solid var(--line); display: flex; align-i
 .dash-stat strong { font-family: ui-monospace, "SFMono-Regular", Consolas, monospace; font-size: 17px; color: #e6e9e2; font-weight: 500; }
 .dash-stat em { color: #7e8a83; font-size: 9px; font-style: normal; }
 .dash-stat strong.neg { color: #ff9a75; }
-.dash-host-meta { display: grid; grid-template-columns: repeat(3, 1fr); gap: 1px; background: rgba(255,255,255,.05); }
+.dash-host-meta { display: grid; grid-template-columns: repeat(4, 1fr); gap: 1px; background: rgba(255,255,255,.05); }
 .dash-host-meta > span { background: #0b100e; padding: 10px 13px; display: grid; gap: 4px; min-width: 0; }
 .dash-host-meta small { color: #68746d; font-size: 7px; letter-spacing: .13em; text-transform: uppercase; }
 .dash-host-meta code { color: #c2ccc6; font-family: ui-monospace, monospace; font-size: 12px; overflow: hidden; text-overflow: ellipsis; }

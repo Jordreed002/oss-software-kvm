@@ -66,6 +66,12 @@ pub trait SecurePeerStream: sealed::SecureStream + AsyncRead + AsyncWrite + Unpi
     /// in-crate authenticated adapter.
     fn connection_direction(&self) -> ConnectionDirection;
 
+    /// Socket endpoints of the authenticated stream, when backed by TCP.
+    /// Test and alternate transports may omit these, disabling UDP fallback.
+    fn socket_endpoints(&self) -> Option<(SocketAddr, SocketAddr)> {
+        None
+    }
+
     /// Derives 32 bytes bound to this completed authenticated TLS session.
     ///
     /// The sealed transport implementation must fail if its handshake has not

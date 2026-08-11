@@ -418,6 +418,13 @@ function HostCard({
           <small>COALESCED MOVES</small>
           <code>{net ? formatNumber(net.coalescedMoves) : "—"}</code>
         </span>
+        <span>
+          <small>POINTER FAST PATH</small>
+          <code className={net && !net.pointerDatagramActive ? "neg" : ""}>
+            {net ? (net.pointerDatagramActive ? "UDP ACTIVE" : "TCP FALLBACK") : "—"}
+          </code>
+          {net && <small>{formatNumber(net.pointerDatagramsOutbound)} TX · {formatNumber(net.pointerDatagramsInbound)} RX</small>}
+        </span>
       </div>
     </article>
   );

@@ -117,7 +117,9 @@ cargo build --locked --workspace
 To run the Link Console alpha end-to-end (including the `kvm-runtime` sidecar), see the
 [Link Console setup guide](apps/control-panel/README.md). macOS requires Accessibility and Input
 Monitoring permissions for the runtime; Windows requires the C++ build tools and allows the runtime
-on Private networks (TCP port 24800).
+on Private networks (TCP port 24800). Mutually negotiated protocol-v3 sessions
+also use exporter-authenticated UDP port 24802 for replaceable pointer movement;
+all critical input remains on TLS/TCP and UDP failure falls back automatically.
 
 The emergency escape is **Ctrl + Alt + Shift + Backspace**. Routing is fail-open: if a callback,
 session, or native capture path cannot prove that an event was queued safely, that event stays on the

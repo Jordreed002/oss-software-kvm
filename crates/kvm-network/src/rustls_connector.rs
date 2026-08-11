@@ -370,6 +370,11 @@ impl SecurePeerStream for RustlsPeerStream {
         ConnectionDirection::Outbound
     }
 
+    fn socket_endpoints(&self) -> Option<(std::net::SocketAddr, std::net::SocketAddr)> {
+        let tcp = self.inner.get_ref().0;
+        Some((tcp.local_addr().ok()?, tcp.peer_addr().ok()?))
+    }
+
     fn export_keying_material(&self, label: &[u8], context: &[u8]) -> io::Result<[u8; 32]> {
         self.inner
             .get_ref()

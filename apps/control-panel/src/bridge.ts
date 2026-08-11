@@ -179,6 +179,9 @@ const invokeOrPreview = async <T>(command: string, args?: Record<string, unknown
         dropped: { input: Math.floor((Math.sin(t / 7) + 1) * 3), control: 0, background: 0 },
         channelRejections: { input: 0, control: 0, background: 0 },
         coalescedMoves: Math.floor(400 + (Math.cos(t / 4) + 1) * 250),
+        pointerDatagramActive: true,
+        pointerDatagramsOutbound: Math.floor(2_000 + t * 20),
+        pointerDatagramsInbound: Math.floor(1_800 + t * 18),
       },
       capture: {
         observed: Math.floor(12_000 + (Math.sin(t / 1.7) + 1) * 3_000),

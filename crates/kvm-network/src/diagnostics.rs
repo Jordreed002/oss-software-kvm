@@ -73,6 +73,9 @@ pub struct NetworkDiagnostics {
     pub channel_rejections: DropCounters,
     /// Cumulative same-source `PointerMove` frames coalesced on enqueue (spec §23).
     pub coalesced_moves: u64,
+    pub pointer_datagram_active: bool,
+    pub pointer_datagrams_outbound: u64,
+    pub pointer_datagrams_inbound: u64,
 }
 
 impl NetworkDiagnostics {
@@ -94,6 +97,9 @@ impl NetworkDiagnostics {
             dropped: telemetry.queue.dropped,
             channel_rejections: telemetry.channel_rejections,
             coalesced_moves: telemetry.queue.coalesced_moves,
+            pointer_datagram_active: telemetry.pointer_datagram_active,
+            pointer_datagrams_outbound: telemetry.pointer_datagrams_outbound,
+            pointer_datagrams_inbound: telemetry.pointer_datagrams_inbound,
         }
     }
 }
@@ -438,6 +444,9 @@ mod tests {
                 dropped,
                 channel_rejections: DropCounters::default(),
                 coalesced_moves: 42,
+                pointer_datagram_active: true,
+                pointer_datagrams_outbound: 100,
+                pointer_datagrams_inbound: 90,
             }),
             capture: Some(CaptureDiagnostics {
                 observed: 1_000,
@@ -472,6 +481,9 @@ mod tests {
             inbound_frames: 20,
             inbound_bytes: 2_000,
             last_rtt: Some(Duration::from_micros(4_200)),
+            pointer_datagram_active: true,
+            pointer_datagrams_outbound: 100,
+            pointer_datagrams_inbound: 90,
         };
         let dto = NetworkDiagnostics::from_telemetry(telemetry);
         assert_eq!(dto.last_rtt_ms, Some(4));

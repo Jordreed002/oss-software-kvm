@@ -222,6 +222,9 @@ pub struct SessionTelemetry {
     pub inbound_frames: u64,
     pub inbound_bytes: u64,
     pub last_rtt: Option<Duration>,
+    pub pointer_datagram_active: bool,
+    pub pointer_datagrams_outbound: u64,
+    pub pointer_datagrams_inbound: u64,
 }
 
 /// Shared, lock-free observable mirror of a session's cumulative
@@ -249,6 +252,9 @@ pub struct ObservableSessionStats {
     channel_rejected_input: AtomicU64,
     channel_rejected_control: AtomicU64,
     channel_rejected_background: AtomicU64,
+    pointer_datagram_active: std::sync::atomic::AtomicBool,
+    pointer_datagrams_outbound: AtomicU64,
+    pointer_datagrams_inbound: AtomicU64,
 }
 
 impl ObservableSessionStats {
@@ -313,6 +319,21 @@ impl ObservableSessionStats {
         self.last_rtt_ns.store(rtt_ns, Ordering::Relaxed);
     }
 
+    pub fn set_pointer_datagram_active(&self, active: bool) {
+        self.pointer_datagram_active
+            .store(active, Ordering::Relaxed);
+    }
+
+    pub fn record_pointer_datagram_outbound(&self) {
+        self.pointer_datagrams_outbound
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn record_pointer_datagram_inbound(&self) {
+        self.pointer_datagrams_inbound
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
     /// Snapshots queue pressure, traffic volume, and the latest RTT.
     #[must_use]
     pub fn telemetry_snapshot(&self) -> SessionTelemetry {
@@ -329,6 +350,9 @@ impl ObservableSessionStats {
             inbound_frames: self.inbound_frames.load(Ordering::Relaxed),
             inbound_bytes: self.inbound_bytes.load(Ordering::Relaxed),
             last_rtt: (rtt_ns != 0).then(|| Duration::from_nanos(rtt_ns)),
+            pointer_datagram_active: self.pointer_datagram_active.load(Ordering::Relaxed),
+            pointer_datagrams_outbound: self.pointer_datagrams_outbound.load(Ordering::Relaxed),
+            pointer_datagrams_inbound: self.pointer_datagrams_inbound.load(Ordering::Relaxed),
         }
     }
 
@@ -345,6 +369,9 @@ impl ObservableSessionStats {
         self.channel_rejected_input.store(0, Ordering::Relaxed);
         self.channel_rejected_control.store(0, Ordering::Relaxed);
         self.channel_rejected_background.store(0, Ordering::Relaxed);
+        self.pointer_datagram_active.store(false, Ordering::Relaxed);
+        self.pointer_datagrams_outbound.store(0, Ordering::Relaxed);
+        self.pointer_datagrams_inbound.store(0, Ordering::Relaxed);
     }
 }
 

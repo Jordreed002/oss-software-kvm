@@ -3,12 +3,15 @@ use crate::{MessageType, ProtocolError, WireMessage};
 pub const FRAME_MAGIC: [u8; 4] = *b"SKVM";
 pub const PROTOCOL_VERSION_V1: u16 = 1;
 pub const PROTOCOL_VERSION_V2: u16 = 2;
+pub const PROTOCOL_VERSION_V3: u16 = 3;
 pub const MIN_SUPPORTED_PROTOCOL_VERSION: u16 = PROTOCOL_VERSION_V1;
-pub const CURRENT_PROTOCOL_VERSION: u16 = PROTOCOL_VERSION_V2;
+pub const CURRENT_PROTOCOL_VERSION: u16 = PROTOCOL_VERSION_V3;
 /// First protocol version which normatively requires an application-level
 /// applied-release acknowledgement before a held route may move to another
 /// peer.
 pub const RELEASE_PROOF_PROTOCOL_VERSION: u16 = PROTOCOL_VERSION_V2;
+/// First version that can negotiate the exporter-bound UDP pointer fast path.
+pub const POINTER_DATAGRAM_PROTOCOL_VERSION: u16 = PROTOCOL_VERSION_V3;
 /// Compatibility version used by the original framing helpers.
 ///
 /// Initial Hello frames remain v1 so peers can advertise and authenticate a
