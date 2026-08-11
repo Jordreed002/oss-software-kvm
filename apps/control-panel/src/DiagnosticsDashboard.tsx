@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { Activity, Download, Laptop, Monitor, Pause, Play, RefreshCw } from "lucide-react";
 import { api } from "./bridge";
-import { type ChartSeries, TimeSeriesChart, useHistory } from "./DashChart";
+import { type ChartSeries, CompositionBar, type CompositionSegment, TimeSeriesChart, useHistory } from "./DashChart";
 import type { CaptureDiagnostics, DiagnosticsReport, DropCounters, NetworkDiagnostics, Platform, SetupSnapshot } from "./types";
 
 const POLL_INTERVAL_MS = 1500;
@@ -178,6 +178,25 @@ export function DiagnosticsDashboard({ snapshot }: { snapshot: SetupSnapshot }) 
     { id: "in-peer", label: peerName, color: PEER_COLOR, points: history.map((sample) => ({ t: sample.t, y: sample.peer?.inBps ?? null })) },
   ];
 
+  // Point-in-time input-routing split: every observed event is either forwarded
+  // to the peer (suppressed locally) or allowed to reach the local OS. A residual
+  // "other" slice covers any observed events not accounted for by those two. The
+  // ratio — not obvious from the raw capture table — is what this bar shows.
+  const routingSegments = (cap: CaptureDiagnostics | null): CompositionSegment[] => {
+    if (!cap) return [];
+    const other = Math.max(0, cap.observed - cap.suppressed - cap.allowedLocal);
+    const segments: CompositionSegment[] = [
+      { label: "Remote-routed", value: cap.suppressed, color: PEER_COLOR },
+      { label: "Allowed locally", value: cap.allowedLocal, color: LOCAL_COLOR },
+    ];
+    if (other > 0) segments.push({ label: "Other", value: other, color: "#5d6863" });
+    return segments;
+  };
+  const compositionHosts = [
+    ...(localReport?.capture ? [{ name: localName, segments: routingSegments(localReport.capture) }] : []),
+    ...(peerReport?.capture ? [{ name: peerName, segments: routingSegments(peerReport.capture) }] : []),
+  ];
+
   return (
     <section className="dashboard enter" aria-label="Live diagnostics dashboard">
       <header className="dashboard-head">
@@ -265,6 +284,13 @@ export function DiagnosticsDashboard({ snapshot }: { snapshot: SetupSnapshot }) 
           yFormat={(value) => formatBytes(value)}
         />
       </div>
+
+      <CompositionBar
+        title="Input routing split"
+        badge="CAPTURE"
+        hosts={compositionHosts}
+        valueFormat={formatNumber}
+      />
 
       <NetworkTable label="Network activity" local={localReport} peer={peerReport} localRate={localRate} peerRate={peerRate} />
 

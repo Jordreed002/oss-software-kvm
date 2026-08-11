@@ -333,6 +333,17 @@ table.dash-table { width: 100%; border-collapse: collapse; }
 .dash-chart-canvas .dash-svg { display: block; }
 .dash-chart-canvas .dash-axis-text { fill: #6f7b74; font-family: ui-monospace, "SFMono-Regular", Consolas, monospace; font-size: 9px; }
 .dash-chart-empty { min-height: 180px; display: grid; place-items: center; color: #4f5b54; font-size: 10px; letter-spacing: .1em; }
+.dash-comp { padding: 18px 18px 16px; display: grid; gap: 12px; }
+.dash-comp-row { display: grid; grid-template-columns: minmax(90px, 150px) 1fr auto; align-items: center; gap: 14px; }
+.dash-comp-label { color: #9ba69f; font-size: 10px; font-weight: 700; letter-spacing: .04em; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.dash-comp-bar { display: flex; height: 26px; border: 1px solid rgba(235,233,223,.1); background: rgba(255,255,255,.02); overflow: hidden; border-radius: 4px; }
+.dash-comp-seg { display: flex; align-items: center; justify-content: center; min-width: 0; color: #0c1310; font-size: 9px; font-weight: 800; letter-spacing: .03em; overflow: hidden; transition: width .35s ease; }
+.dash-comp-seg span { white-space: nowrap; padding: 0 5px; }
+.dash-comp-empty { width: 100%; display: grid; place-items: center; color: #4f5b54; font-size: 9px; letter-spacing: .08em; }
+.dash-comp-total { color: #c3ccc6; font-family: ui-monospace, "SFMono-Regular", Consolas, monospace; font-size: 11px; min-width: 56px; text-align: right; }
+.dash-comp-legend { display: flex; flex-wrap: wrap; gap: 16px; padding-top: 6px; border-top: 1px solid rgba(235,233,223,.06); margin-top: 2px; }
+.dash-comp-legend span { display: inline-flex; align-items: center; gap: 7px; color: #8b958f; font-size: 9px; letter-spacing: .04em; }
+.dash-comp-legend i { width: 9px; height: 9px; border-radius: 2px; }
 .dash-tooltip { position: absolute; top: 10px; width: 150px; padding: 9px 11px; background: rgba(8,13,11,.96); border: 1px solid rgba(235,233,223,.14); box-shadow: 0 8px 24px rgba(0,0,0,.4); pointer-events: none; display: grid; gap: 6px; z-index: 4; }
 .dash-tooltip strong { color: #cfd6d1; font-size: 8px; font-weight: 800; letter-spacing: .12em; text-transform: uppercase; }
 .dash-tooltip span { display: flex; align-items: center; gap: 7px; color: #aeb6b1; font-size: 9px; min-width: 0; }

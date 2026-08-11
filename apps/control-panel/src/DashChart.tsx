@@ -214,3 +214,82 @@ export function useHistory<T>(max: number): [T[], (sample: T) => void] {
   }, [max]);
   return [history, append];
 }
+
+/** One colored slice of a stacked composition bar. Color is carried per segment
+ *  so the same category renders identically across hosts. */
+export interface CompositionSegment {
+  label: string;
+  value: number;
+  color: string;
+}
+
+interface CompositionBarProps {
+  title: string;
+  badge?: string;
+  /** One stacked bar per host, on a shared scale so magnitudes compare. */
+  hosts: Array<{ name: string; segments: CompositionSegment[] }>;
+  valueFormat: (value: number) => string;
+}
+
+/** A point-in-time stacked-bar comparison — a distinct display type from the
+ *  time-series chart above. Each host is one full-width bar split into colored
+ *  segments; bars share a common scale (the largest host total) so relative
+ *  magnitudes are legible at a glance. Empty totals render a placeholder. */
+export function CompositionBar({ title, badge = "SPLIT", hosts, valueFormat }: CompositionBarProps) {
+  const totals = hosts.map((host) => host.segments.reduce((sum, seg) => sum + Math.max(0, seg.value), 0));
+  const scaleMax = Math.max(1, ...totals);
+  // Legend categories are identical across hosts; derive from the first host.
+  const legend = hosts[0]?.segments ?? [];
+
+  return (
+    <div className="dash-chart-card">
+      <div className="dash-chart-head">
+        <span>{title}</span>
+        <em>{badge}</em>
+      </div>
+      <div className="dash-comp">
+        {hosts.length === 0 && <div className="dash-chart-empty">No capture data yet.</div>}
+        {hosts.map((host, index) => {
+          const total = totals[index];
+          return (
+            <div className="dash-comp-row" key={host.name}>
+              <div className="dash-comp-label" title={host.name}>{host.name}</div>
+              <div className="dash-comp-bar">
+                {total === 0 ? (
+                  <div className="dash-comp-empty">Waiting for capture…</div>
+                ) : (
+                  host.segments.map((seg) => {
+                    const value = Math.max(0, seg.value);
+                    if (value === 0) return null;
+                    const pct = (value / scaleMax) * 100;
+                    return (
+                      <div
+                        key={seg.label}
+                        className="dash-comp-seg"
+                        style={{ width: `${pct}%`, background: seg.color }}
+                        title={`${seg.label}: ${valueFormat(value)}`}
+                      >
+                        {pct > 14 && <span>{valueFormat(value)}</span>}
+                      </div>
+                    );
+                  })
+                )}
+              </div>
+              <div className="dash-comp-total">{valueFormat(total)}</div>
+            </div>
+          );
+        })}
+        {legend.length > 0 && (
+          <div className="dash-comp-legend">
+            {legend.map((seg) => (
+              <span key={seg.label}>
+                <i style={{ background: seg.color }} />
+                {seg.label}
+              </span>
+            ))}
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
