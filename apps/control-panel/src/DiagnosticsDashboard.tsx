@@ -1,5 +1,5 @@
-import { useEffect, useRef, useState } from "react";
-import { Activity, Laptop, Monitor } from "lucide-react";
+import { useCallback, useEffect, useRef, useState } from "react";
+import { Activity, Download, Laptop, Monitor, Pause, Play, RefreshCw } from "lucide-react";
 import { api } from "./bridge";
 import { type ChartSeries, TimeSeriesChart, useHistory } from "./DashChart";
 import type { CaptureDiagnostics, DiagnosticsReport, DropCounters, NetworkDiagnostics, Platform, SetupSnapshot } from "./types";
@@ -93,20 +93,23 @@ export function DiagnosticsDashboard({ snapshot }: { snapshot: SetupSnapshot }) 
   const [localRate, setLocalRate] = useState<NetRate | null>(null);
   const [peerRate, setPeerRate] = useState<NetRate | null>(null);
   const [updatedAt, setUpdatedAt] = useState<number | null>(null);
+  const [paused, setPaused] = useState(false);
   const [history, appendSample] = useHistory<DashSample>(HISTORY_MAX_SAMPLES);
 
   const prevRef = useRef<{ at: number; local: NetworkDiagnostics | null; peer: NetworkDiagnostics | null } | null>(null);
 
-  useEffect(() => {
-    if (!localIp) return;
-    let cancelled = false;
-
-    const poll = async () => {
+  // Extracted so the "Refresh now" control can pull a single snapshot even while
+  // the periodic poll is paused. Wrapped in an in-flight guard so a slow host
+  // cannot stack overlapping polls and race the rate derivation.
+  const inFlightRef = useRef(false);
+  const poll = useCallback(async () => {
+    if (!localIp || inFlightRef.current) return;
+    inFlightRef.current = true;
+    try {
       const [local, peer] = await Promise.all([
         api.fetchDiagnostics(localIp),
         peerIp ? api.fetchDiagnostics(peerIp) : Promise.resolve<DiagnosticsReport | null>(null),
       ]);
-      if (cancelled) return;
 
       const now = Date.now();
       const prev = prevRef.current;
@@ -125,15 +128,38 @@ export function DiagnosticsDashboard({ snapshot }: { snapshot: SetupSnapshot }) 
       setLocalReport(local);
       setPeerReport(peer);
       setUpdatedAt(now);
-    };
-
-    void poll();
-    const timer = window.setInterval(poll, POLL_INTERVAL_MS);
-    return () => {
-      cancelled = true;
-      window.clearInterval(timer);
-    };
+    } finally {
+      inFlightRef.current = false;
+    }
   }, [localIp, peerIp, appendSample]);
+
+  useEffect(() => {
+    if (!localIp || paused) return;
+    void poll();
+    const timer = window.setInterval(() => void poll(), POLL_INTERVAL_MS);
+    return () => window.clearInterval(timer);
+  }, [localIp, paused, poll]);
+
+  // Serializes the current pair of reports to a JSON download. The diagnostics
+  // channel already carries only aggregate counters, so the export holds no
+  // payloads, credentials, or peer addresses.
+  const exportSnapshot = useCallback(() => {
+    const payload = {
+      exportedAtUnixMs: Date.now(),
+      schemaVersion: localReport?.schemaVersion ?? peerReport?.schemaVersion ?? 1,
+      local: localReport,
+      peer: peerReport,
+    };
+    const blob = new Blob([JSON.stringify(payload, null, 2)], { type: "application/json" });
+    const url = URL.createObjectURL(blob);
+    const anchor = document.createElement("a");
+    anchor.href = url;
+    anchor.download = `skvm-diagnostics-${new Date().toISOString().replace(/[:.]/g, "-")}.json`;
+    document.body.appendChild(anchor);
+    anchor.click();
+    anchor.remove();
+    URL.revokeObjectURL(url);
+  }, [localReport, peerReport]);
 
   const localName = snapshot.local?.displayName ?? "This computer";
   const peerName = snapshot.peer?.displayName ?? "Paired computer";
@@ -163,9 +189,38 @@ export function DiagnosticsDashboard({ snapshot }: { snapshot: SetupSnapshot }) 
             active KVM switch on 24800. No input payloads, credentials, or peer addresses leave either host.
           </p>
         </div>
-        <div className="dashboard-pulse" aria-live="polite">
-          <i />
-          {updatedAt ? `Updated ${new Date(updatedAt).toLocaleTimeString()}` : "Connecting…"}
+        <div className="dashboard-controls">
+          <button
+            type="button"
+            className="dash-btn"
+            onClick={() => void poll()}
+            disabled={!localIp}
+            title="Poll both hosts once now"
+          >
+            <RefreshCw size={13} /> Refresh
+          </button>
+          <button
+            type="button"
+            className={`dash-btn${paused ? " active" : ""}`}
+            onClick={() => setPaused((wasPaused) => !wasPaused)}
+            aria-pressed={paused}
+            title={paused ? "Resume periodic polling" : "Pause periodic polling"}
+          >
+            {paused ? (<><Play size={13} /> Resume</>) : (<><Pause size={13} /> Pause</>)}
+          </button>
+          <button
+            type="button"
+            className="dash-btn"
+            onClick={exportSnapshot}
+            disabled={!localReport && !peerReport}
+            title="Download the current diagnostics pair as JSON"
+          >
+            <Download size={13} /> Export
+          </button>
+          <div className={`dashboard-pulse${paused ? " paused" : ""}`} aria-live="polite">
+            <i />
+            {paused ? "Paused" : updatedAt ? `Updated ${new Date(updatedAt).toLocaleTimeString()}` : "Connecting…"}
+          </div>
         </div>
       </header>
 
@@ -219,10 +274,10 @@ export function DiagnosticsDashboard({ snapshot }: { snapshot: SetupSnapshot }) 
 
       <div className="dash-foot">
         <span>
-          <Activity size={12} /> Polling every {(POLL_INTERVAL_MS / 1000).toFixed(1)}s · read-only · schema v
+          <Activity size={12} /> {paused ? "Polling paused" : `Polling every ${(POLL_INTERVAL_MS / 1000).toFixed(1)}s`} · read-only · schema v
           {localReport?.schemaVersion ?? peerReport?.schemaVersion ?? 1}
         </span>
-        <span>Hosts with non-zero drops are highlighted in the queue-health matrix.</span>
+        <span>Pause freezes the live view · Export saves the current pair as JSON · failure counters highlight orange.</span>
       </div>
     </section>
   );
