@@ -135,6 +135,16 @@ export interface NetworkDiagnostics {
   pointerDatagramActive: boolean;
   pointerDatagramsOutbound: number;
   pointerDatagramsInbound: number;
+  pointerDatagramGaps: number;
+  pointerDatagramJitterUs: number;
+  pointerJitterP50Us: number;
+  pointerJitterP95Us: number;
+  pointerJitterP99Us: number;
+  pointerDatagramMaxSilenceMs: number;
+  pointerRecoveryMilliunits: number;
+  reliableDatagramsOutbound: number;
+  reliableDatagramsInbound: number;
+  reliableDatagramRetransmits: number;
 }
 
 /** Aggregate native input-capture counters (spec §35 surface). Every field is

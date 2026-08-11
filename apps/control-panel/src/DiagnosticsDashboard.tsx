@@ -424,6 +424,9 @@ function HostCard({
             {net ? (net.pointerDatagramActive ? "UDP ACTIVE" : "TCP FALLBACK") : "—"}
           </code>
           {net && <small>{formatNumber(net.pointerDatagramsOutbound)} TX · {formatNumber(net.pointerDatagramsInbound)} RX</small>}
+          {net && <small>{formatNumber(net.pointerDatagramGaps)} gaps · {(net.pointerDatagramJitterUs / 1000).toFixed(1)} ms jitter · {formatNumber(net.pointerDatagramMaxSilenceMs)} ms max silence</small>}
+          {net && <small>jitter p50 {(net.pointerJitterP50Us / 1000).toFixed(1)} · p95 {(net.pointerJitterP95Us / 1000).toFixed(1)} · p99 {(net.pointerJitterP99Us / 1000).toFixed(1)} ms</small>}
+          {net && <small>{formatNumber(net.reliableDatagramsOutbound)} / {formatNumber(net.reliableDatagramsInbound)} reliable · {formatNumber(net.reliableDatagramRetransmits)} retries</small>}
         </span>
       </div>
     </article>

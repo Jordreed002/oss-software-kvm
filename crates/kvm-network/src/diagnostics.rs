@@ -24,6 +24,7 @@
 
 use std::io::{Read, Write};
 use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, RwLock};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -46,6 +47,8 @@ pub const DEFAULT_DIAGNOSTICS_PORT: u16 = 24_801;
 /// the KVM frame cap. Defends a hostile or buggy client from triggering an
 /// unbounded allocation in [`read_report`].
 pub const MAX_DIAGNOSTICS_PAYLOAD: usize = 1024 * 1024;
+const MAX_PERSISTENT_DIAGNOSTICS_CLIENTS: usize = 8;
+const REFRESH_REQUEST: u8 = 1;
 
 /// Serializable view of the live authenticated-session [`SessionTelemetry`].
 ///
@@ -76,6 +79,16 @@ pub struct NetworkDiagnostics {
     pub pointer_datagram_active: bool,
     pub pointer_datagrams_outbound: u64,
     pub pointer_datagrams_inbound: u64,
+    pub pointer_datagram_gaps: u64,
+    pub pointer_datagram_jitter_us: u64,
+    pub pointer_jitter_p50_us: u64,
+    pub pointer_jitter_p95_us: u64,
+    pub pointer_jitter_p99_us: u64,
+    pub pointer_datagram_max_silence_ms: u64,
+    pub pointer_recovery_milliunits: u64,
+    pub reliable_datagrams_outbound: u64,
+    pub reliable_datagrams_inbound: u64,
+    pub reliable_datagram_retransmits: u64,
 }
 
 impl NetworkDiagnostics {
@@ -100,6 +113,16 @@ impl NetworkDiagnostics {
             pointer_datagram_active: telemetry.pointer_datagram_active,
             pointer_datagrams_outbound: telemetry.pointer_datagrams_outbound,
             pointer_datagrams_inbound: telemetry.pointer_datagrams_inbound,
+            pointer_datagram_gaps: telemetry.pointer_datagram_gaps,
+            pointer_datagram_jitter_us: telemetry.pointer_datagram_jitter_us,
+            pointer_jitter_p50_us: telemetry.pointer_jitter_p50_us,
+            pointer_jitter_p95_us: telemetry.pointer_jitter_p95_us,
+            pointer_jitter_p99_us: telemetry.pointer_jitter_p99_us,
+            pointer_datagram_max_silence_ms: telemetry.pointer_datagram_max_silence_ms,
+            pointer_recovery_milliunits: telemetry.pointer_recovery_milliunits,
+            reliable_datagrams_outbound: telemetry.reliable_datagrams_outbound,
+            reliable_datagrams_inbound: telemetry.reliable_datagrams_inbound,
+            reliable_datagram_retransmits: telemetry.reliable_datagram_retransmits,
         }
     }
 }
@@ -363,18 +386,45 @@ pub fn spawn_diagnostics_server(
 }
 
 fn serve(listener: &TcpListener, publisher: &DiagnosticsPublisher) {
+    let active = Arc::new(AtomicUsize::new(0));
     for incoming in listener.incoming() {
-        let Ok(mut stream) = incoming else {
+        let Ok(stream) = incoming else {
             continue;
         };
-        let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
-        let _ = stream.set_write_timeout(Some(Duration::from_secs(2)));
-        let report = publisher.snapshot();
-        if let Err(error) = write_report(&mut stream, &report) {
-            eprintln!("[diagnostics] failed to serve report: {error}");
+        if active.fetch_add(1, Ordering::AcqRel) >= MAX_PERSISTENT_DIAGNOSTICS_CLIENTS {
+            active.fetch_sub(1, Ordering::AcqRel);
+            let _ = stream.shutdown(Shutdown::Both);
+            continue;
         }
-        let _ = stream.shutdown(Shutdown::Both);
+        let publisher = publisher.clone();
+        let active_for_client = active.clone();
+        if thread::Builder::new()
+            .name("skvm-diagnostics-client".to_owned())
+            .spawn(move || {
+                serve_client(stream, &publisher);
+                active_for_client.fetch_sub(1, Ordering::AcqRel);
+            })
+            .is_err()
+        {
+            active.fetch_sub(1, Ordering::AcqRel);
+        }
     }
+}
+
+fn serve_client(mut stream: TcpStream, publisher: &DiagnosticsPublisher) {
+    let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
+    let _ = stream.set_write_timeout(Some(Duration::from_secs(2)));
+    loop {
+        if let Err(error) = write_report(&mut stream, &publisher.snapshot()) {
+            eprintln!("[diagnostics] failed to serve report: {error}");
+            break;
+        }
+        let mut request = [0_u8; 1];
+        if stream.read_exact(&mut request).is_err() || request[0] != REFRESH_REQUEST {
+            break;
+        }
+    }
+    let _ = stream.shutdown(Shutdown::Both);
 }
 
 /// Connects to `addr`, reads exactly one length-prefixed JSON report, and returns
@@ -392,6 +442,57 @@ pub fn fetch_report(
     let mut stream = stream;
     let _ = stream.set_read_timeout(Some(timeout));
     read_report(&mut stream)
+}
+
+/// Reuses one low-priority diagnostics connection across dashboard refreshes.
+#[derive(Debug)]
+pub struct PersistentDiagnosticsClient {
+    addr: SocketAddr,
+    timeout: Duration,
+    stream: Option<TcpStream>,
+}
+
+impl PersistentDiagnosticsClient {
+    #[must_use]
+    pub const fn new(addr: SocketAddr, timeout: Duration) -> Self {
+        Self {
+            addr,
+            timeout,
+            stream: None,
+        }
+    }
+
+    /// Requests the next snapshot on the existing connection, reconnecting on
+    /// the following call if this exchange fails.
+    ///
+    /// # Errors
+    ///
+    /// Returns a bounded connection, framing, or JSON diagnostics error.
+    pub fn fetch(&mut self) -> Result<DiagnosticsReport, DiagnosticsError> {
+        if self.stream.is_none() {
+            self.stream = Some(connect_with_timeout(self.addr, self.timeout)?);
+            if let Some(stream) = self.stream.as_mut() {
+                let _ = stream.set_read_timeout(Some(self.timeout));
+                let _ = stream.set_write_timeout(Some(self.timeout));
+                return read_report(stream);
+            }
+        }
+        let result = self.stream.as_mut().map_or_else(
+            || {
+                Err(DiagnosticsError::Io(std::io::Error::other(
+                    "diagnostics disconnected",
+                )))
+            },
+            |stream| {
+                stream.write_all(&[REFRESH_REQUEST])?;
+                read_report(stream)
+            },
+        );
+        if result.is_err() {
+            self.stream = None;
+        }
+        result
+    }
 }
 
 /// Retries a non-blocking connect within `timeout`, matching the deterministic
@@ -447,6 +548,16 @@ mod tests {
                 pointer_datagram_active: true,
                 pointer_datagrams_outbound: 100,
                 pointer_datagrams_inbound: 90,
+                pointer_datagram_gaps: 2,
+                pointer_datagram_jitter_us: 750,
+                pointer_jitter_p50_us: 500,
+                pointer_jitter_p95_us: 2_000,
+                pointer_jitter_p99_us: 5_000,
+                pointer_datagram_max_silence_ms: 12,
+                pointer_recovery_milliunits: 40,
+                reliable_datagrams_outbound: 8,
+                reliable_datagrams_inbound: 7,
+                reliable_datagram_retransmits: 1,
             }),
             capture: Some(CaptureDiagnostics {
                 observed: 1_000,
@@ -484,6 +595,16 @@ mod tests {
             pointer_datagram_active: true,
             pointer_datagrams_outbound: 100,
             pointer_datagrams_inbound: 90,
+            pointer_datagram_gaps: 2,
+            pointer_datagram_jitter_us: 750,
+            pointer_jitter_p50_us: 500,
+            pointer_jitter_p95_us: 2_000,
+            pointer_jitter_p99_us: 5_000,
+            pointer_datagram_max_silence_ms: 12,
+            pointer_recovery_milliunits: 40,
+            reliable_datagrams_outbound: 8,
+            reliable_datagrams_inbound: 7,
+            reliable_datagram_retransmits: 1,
         };
         let dto = NetworkDiagnostics::from_telemetry(telemetry);
         assert_eq!(dto.last_rtt_ms, Some(4));
@@ -573,5 +694,18 @@ mod tests {
         publisher.publish(updated.clone());
         let refetched = fetch_report(bound, Duration::from_secs(2)).expect("refetch");
         assert_eq!(refetched.uptime_ms, 99_999);
+    }
+
+    #[test]
+    fn persistent_client_reuses_connection_and_observes_updates() {
+        let publisher = DiagnosticsPublisher::new(sample_report());
+        let (bound, _server) =
+            spawn_diagnostics_server("127.0.0.1:0".parse().unwrap(), publisher.clone()).unwrap();
+        let mut client = PersistentDiagnosticsClient::new(bound, Duration::from_secs(2));
+        let first = client.fetch().unwrap();
+        let mut updated = first.clone();
+        updated.uptime_ms += 1;
+        publisher.publish(updated.clone());
+        assert_eq!(client.fetch().unwrap(), updated);
     }
 }

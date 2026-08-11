@@ -8,7 +8,7 @@ use std::io::{Read, Seek, SeekFrom, Write};
 use std::net::{IpAddr, SocketAddr, UdpSocket};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex, OnceLock};
 
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
@@ -37,6 +37,9 @@ const KVM_PORT: u16 = 24_800;
 /// the control panel polls telemetry over a different connection than the
 /// active input stream. Mirrors `kvm_network::DEFAULT_DIAGNOSTICS_PORT`.
 const DIAGNOSTICS_PORT: u16 = 24_801;
+static DIAGNOSTICS_CLIENTS: OnceLock<
+    Mutex<HashMap<SocketAddr, Arc<Mutex<kvm_network::PersistentDiagnosticsClient>>>>,
+> = OnceLock::new();
 const PAIRING_VERSION: u16 = 3;
 const CREDENTIAL_VERSION: u16 = 2;
 const STATE_FILE: &str = "setup-state.json";
@@ -1110,7 +1113,20 @@ pub(crate) fn fetch_diagnostics(
     let ip: IpAddr = host.parse().map_err(|_| coarse_error())?;
     let port = port.unwrap_or(DIAGNOSTICS_PORT);
     let addr = SocketAddr::new(ip, port);
-    let report = kvm_network::fetch_report(addr, std::time::Duration::from_secs(1));
+    let clients = DIAGNOSTICS_CLIENTS.get_or_init(|| Mutex::new(HashMap::new()));
+    let client = {
+        let mut clients = clients.lock().map_err(|_| coarse_error())?;
+        clients
+            .entry(addr)
+            .or_insert_with(|| {
+                Arc::new(Mutex::new(kvm_network::PersistentDiagnosticsClient::new(
+                    addr,
+                    std::time::Duration::from_secs(1),
+                )))
+            })
+            .clone()
+    };
+    let report = client.lock().map_err(|_| coarse_error())?.fetch();
     Ok(report.ok())
 }
 

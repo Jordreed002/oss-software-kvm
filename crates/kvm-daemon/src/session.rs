@@ -5,7 +5,7 @@
 //! it events only from `kvm-network`; deterministic tests use recording output
 //! and outbound implementations.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::fmt;
 
 use kvm_config::Config;
@@ -316,6 +316,7 @@ struct AuthorizedSession {
     endpoint: SessionEndpoint,
     binding: AdmittedSessionBinding,
     last_sequence: Option<u64>,
+    recent_inputs: VecDeque<InputEventV1>,
     accepts_input: bool,
 }
 
@@ -1160,6 +1161,7 @@ where
             endpoint,
             binding,
             last_sequence: None,
+            recent_inputs: VecDeque::with_capacity(128),
             accepts_input: true,
         });
         Ok(PeerEventOutcome::Applied)
@@ -1258,7 +1260,16 @@ where
                 if HostId::from_bytes(input.source_host.0) != self.expected.host_id() {
                     return Err(self.fail_session(CoordinatorError::IdentityMismatch, now_ns));
                 }
+                if self.is_recent_duplicate(&input) {
+                    return Ok(PeerEventOutcome::Ignored);
+                }
                 self.accept_sequence(input.sequence, now_ns)?;
+                if let Some(session) = self.authorized.as_mut() {
+                    if session.recent_inputs.len() == 128 {
+                        session.recent_inputs.pop_front();
+                    }
+                    session.recent_inputs.push_back(input.clone());
+                }
                 let event = input_from_wire(&input)
                     .map_err(|error| self.fail_session(CoordinatorError::Wire(error), now_ns))?;
                 self.inject_received(event, now_ns)?;
@@ -1333,6 +1344,12 @@ where
         }
         session.last_sequence = Some(received);
         Ok(())
+    }
+
+    fn is_recent_duplicate(&self, input: &InputEventV1) -> bool {
+        self.authorized
+            .as_ref()
+            .is_some_and(|session| session.recent_inputs.contains(input))
     }
 
     fn inject_received(&mut self, event: InputEvent, now_ns: u64) -> Result<(), CoordinatorError> {
@@ -2549,6 +2566,27 @@ mod tests {
                 code: KeyCode::ControlLeft,
                 state: KeyState::Released
             }
+        ));
+    }
+
+    #[test]
+    fn exact_recent_udp_tls_duplicate_is_ignored_but_unknown_stale_input_fails() {
+        let mut coordinator = coordinator();
+        admit(&mut coordinator);
+        let message = key(5, DEVICE, 0xe0, WireKeyState::Down);
+        assert_eq!(
+            coordinator
+                .handle_authorized_message(message.clone(), 1)
+                .unwrap(),
+            PeerEventOutcome::Applied
+        );
+        assert_eq!(
+            coordinator.handle_authorized_message(message, 2).unwrap(),
+            PeerEventOutcome::Ignored
+        );
+        assert!(matches!(
+            coordinator.handle_authorized_message(key(4, DEVICE, 0x04, WireKeyState::Down), 3),
+            Err(CoordinatorError::StaleSequence { .. })
         ));
     }
 

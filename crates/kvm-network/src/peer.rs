@@ -15,6 +15,7 @@ use kvm_protocol::{
     AuthenticateV1, FrameHeader, HelloV1, MessageType, WireMessage, CURRENT_PROTOCOL_VERSION,
     FRAME_HEADER_LEN, MIN_SUPPORTED_PROTOCOL_VERSION, PROTOCOL_VERSION_V1,
 };
+use std::collections::VecDeque;
 use std::sync::Arc;
 use std::time::Duration;
 use subtle::ConstantTimeEq;
@@ -1627,6 +1628,7 @@ async fn run_session<S: SecurePeerStream, A: SessionAdmission>(
 }
 
 #[allow(clippy::too_many_lines)]
+#[allow(clippy::single_match_else)] // Error branches disable the optional path in-place.
 async fn run_session_with_stats<S: SecurePeerStream, A: SessionAdmission>(
     stream: S,
     admission: &A,
@@ -1686,6 +1688,11 @@ async fn run_session_with_stats<S: SecurePeerStream, A: SessionAdmission>(
         };
     let mut pointer_probe_tick = tokio::time::interval(Duration::from_secs(1));
     pointer_probe_tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    let mut pointer_flush_tick = tokio::time::interval(Duration::from_millis(4));
+    pointer_flush_tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    let mut pointer_recovery_tick = tokio::time::interval(Duration::from_millis(2));
+    pointer_recovery_tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    let mut pointer_recovery = VecDeque::new();
     let mut read_progress = FrameReadProgress::default();
     // Reused across drains so a multi-frame burst is decoded and dispatched
     // without per-drain or per-frame allocation.
@@ -1785,16 +1792,46 @@ async fn run_session_with_stats<S: SecurePeerStream, A: SessionAdmission>(
                 }
             }, if pointer_path.is_some() => {
                 match datagram {
-                    Ok(Some(input)) => {
+                    Ok(observation) => {
                         if let Some(stats) = stats {
-                            stats.record_pointer_datagram_inbound();
+                            stats.record_pointer_datagram_quality(
+                                observation.gaps,
+                                observation.jitter_us,
+                                observation.silence_ms,
+                                observation.recovery_milliunits,
+                            );
                         }
-                        send_event(events, PeerEvent::PointerDatagram {
-                            peer: admitted.clone(),
-                            input,
-                        })?;
-                    }
-                    Ok(None) => {
+                        if let Some(input) = observation.input {
+                            if let Some(stats) = stats {
+                                stats.record_pointer_datagram_inbound();
+                            }
+                            let mut smoothed = smooth_pointer_recovery(
+                                input,
+                                observation.gaps,
+                                observation.recovery_milliunits,
+                                pointer_recovery.len(),
+                            );
+                            if let Some(input) = smoothed.pop_front() {
+                                send_event(events, PeerEvent::PointerDatagram {
+                                    peer: admitted.clone(),
+                                    input,
+                                })?;
+                            }
+                            pointer_recovery.extend(smoothed);
+                        }
+                        for message in observation.reliable_messages {
+                            if let Some(stats) = stats {
+                                stats.record_reliable_datagram_inbound();
+                            }
+                            handle_inbound(
+                                message,
+                                &admitted,
+                                &mut heartbeat,
+                                origin.elapsed(),
+                                &mut queue,
+                                events,
+                            )?;
+                        }
                         if let (Some(stats), Some(path)) = (stats, pointer_path.as_ref()) {
                             stats.set_pointer_datagram_active(path.is_ready());
                         }
@@ -1837,6 +1874,40 @@ async fn run_session_with_stats<S: SecurePeerStream, A: SessionAdmission>(
                         }
                         pointer_path = None;
                     }
+                }
+            }
+            _ = pointer_flush_tick.tick(), if pointer_path.is_some() => {
+                if let Some(path) = pointer_path.as_mut() {
+                    match path.flush_pending() {
+                        Ok(_) => {
+                            let sent = path.take_recently_sent();
+                            if let Some(stats) = stats {
+                                for _ in 0..sent {
+                                    stats.record_pointer_datagram_outbound();
+                                }
+                                match path.maintain_reliable() {
+                                    Ok(count) => stats.record_reliable_datagram_retransmits(count),
+                                    Err(_) => stats.set_pointer_datagram_active(false),
+                                }
+                            } else {
+                                let _ = path.maintain_reliable();
+                            }
+                        }
+                        Err(_) => {
+                            if let Some(stats) = stats {
+                                stats.set_pointer_datagram_active(false);
+                            }
+                            pointer_path = None;
+                        }
+                    }
+                }
+            }
+            _ = pointer_recovery_tick.tick(), if !pointer_recovery.is_empty() => {
+                if let Some(input) = pointer_recovery.pop_front() {
+                    send_event(events, PeerEvent::PointerDatagram {
+                        peer: admitted.clone(),
+                        input,
+                    })?;
                 }
             }
         }
@@ -2297,10 +2368,18 @@ fn route_outbound(
     stats: Option<&ObservableSessionStats>,
 ) -> Result<(), SessionError> {
     if let Some(path) = pointer_path.as_mut() {
+        if path.shadow_reliable(&message).unwrap_or(false) {
+            if let Some(stats) = stats {
+                stats.record_reliable_datagram_outbound();
+            }
+        }
         match path.try_send_pointer(&message) {
             Ok(true) => {
+                let sent = path.take_recently_sent();
                 if let Some(stats) = stats {
-                    stats.record_pointer_datagram_outbound();
+                    for _ in 0..sent {
+                        stats.record_pointer_datagram_outbound();
+                    }
                 }
                 return Ok(());
             }
@@ -2315,6 +2394,45 @@ fn route_outbound(
         }
     }
     enqueue(queue, message)
+}
+
+fn smooth_pointer_recovery(
+    input: kvm_protocol::InputEventV1,
+    gaps: u64,
+    recovery_milliunits: u64,
+    queued: usize,
+) -> VecDeque<kvm_protocol::InputEventV1> {
+    const RECOVERY_SPLIT_THRESHOLD: u64 = 8_000;
+    const RECOVERY_STEPS: usize = 4;
+    const RECOVERY_STEPS_F64: f64 = 4.0;
+    if gaps == 0 || recovery_milliunits < RECOVERY_SPLIT_THRESHOLD || queued > 28 {
+        return VecDeque::from([input]);
+    }
+    let kvm_protocol::WireInputPayloadV1::PointerMove { dx, dy } = input.payload else {
+        return VecDeque::from([input]);
+    };
+    let mut result = VecDeque::with_capacity(RECOVERY_STEPS);
+    let step_dx = dx / RECOVERY_STEPS_F64;
+    let vertical_step = dy / RECOVERY_STEPS_F64;
+    for index in 0..RECOVERY_STEPS {
+        let final_step = index + 1 == RECOVERY_STEPS;
+        result.push_back(kvm_protocol::InputEventV1 {
+            payload: kvm_protocol::WireInputPayloadV1::PointerMove {
+                dx: if final_step {
+                    dx - step_dx * 3.0
+                } else {
+                    step_dx
+                },
+                dy: if final_step {
+                    dy - vertical_step * 3.0
+                } else {
+                    vertical_step
+                },
+            },
+            ..input.clone()
+        });
+    }
+    result
 }
 
 fn undelivered_metadata(message: &WireMessage, partially_sent: bool) -> UndeliveredMessage {

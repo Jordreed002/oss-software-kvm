@@ -225,6 +225,16 @@ pub struct SessionTelemetry {
     pub pointer_datagram_active: bool,
     pub pointer_datagrams_outbound: u64,
     pub pointer_datagrams_inbound: u64,
+    pub pointer_datagram_gaps: u64,
+    pub pointer_datagram_jitter_us: u64,
+    pub pointer_jitter_p50_us: u64,
+    pub pointer_jitter_p95_us: u64,
+    pub pointer_jitter_p99_us: u64,
+    pub pointer_datagram_max_silence_ms: u64,
+    pub pointer_recovery_milliunits: u64,
+    pub reliable_datagrams_outbound: u64,
+    pub reliable_datagrams_inbound: u64,
+    pub reliable_datagram_retransmits: u64,
 }
 
 /// Shared, lock-free observable mirror of a session's cumulative
@@ -255,6 +265,14 @@ pub struct ObservableSessionStats {
     pointer_datagram_active: std::sync::atomic::AtomicBool,
     pointer_datagrams_outbound: AtomicU64,
     pointer_datagrams_inbound: AtomicU64,
+    pointer_datagram_gaps: AtomicU64,
+    pointer_datagram_jitter_us: AtomicU64,
+    pointer_jitter_buckets: [AtomicU64; 8],
+    pointer_datagram_max_silence_ms: AtomicU64,
+    pointer_recovery_milliunits: AtomicU64,
+    reliable_datagrams_outbound: AtomicU64,
+    reliable_datagrams_inbound: AtomicU64,
+    reliable_datagram_retransmits: AtomicU64,
 }
 
 impl ObservableSessionStats {
@@ -334,10 +352,51 @@ impl ObservableSessionStats {
             .fetch_add(1, Ordering::Relaxed);
     }
 
+    pub fn record_pointer_datagram_quality(
+        &self,
+        gaps: u64,
+        jitter_us: u64,
+        silence_ms: u64,
+        recovery_milliunits: u64,
+    ) {
+        self.pointer_datagram_gaps
+            .fetch_add(gaps, Ordering::Relaxed);
+        self.pointer_datagram_jitter_us
+            .store(jitter_us, Ordering::Relaxed);
+        let bucket = [250, 500, 1_000, 2_000, 5_000, 10_000, 25_000]
+            .iter()
+            .position(|limit| jitter_us <= *limit)
+            .unwrap_or(7);
+        self.pointer_jitter_buckets[bucket].fetch_add(1, Ordering::Relaxed);
+        self.pointer_datagram_max_silence_ms
+            .fetch_max(silence_ms, Ordering::Relaxed);
+        self.pointer_recovery_milliunits
+            .fetch_add(recovery_milliunits, Ordering::Relaxed);
+    }
+
+    pub fn record_reliable_datagram_outbound(&self) {
+        self.reliable_datagrams_outbound
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn record_reliable_datagram_inbound(&self) {
+        self.reliable_datagrams_inbound
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn record_reliable_datagram_retransmits(&self, count: usize) {
+        self.reliable_datagram_retransmits
+            .fetch_add(u64::try_from(count).unwrap_or(u64::MAX), Ordering::Relaxed);
+    }
+
     /// Snapshots queue pressure, traffic volume, and the latest RTT.
     #[must_use]
     pub fn telemetry_snapshot(&self) -> SessionTelemetry {
         let rtt_ns = self.last_rtt_ns.load(Ordering::Relaxed);
+        let jitter_buckets = self
+            .pointer_jitter_buckets
+            .each_ref()
+            .map(|bucket| bucket.load(Ordering::Relaxed));
         SessionTelemetry {
             queue: self.snapshot(),
             channel_rejections: DropCounters {
@@ -353,6 +412,20 @@ impl ObservableSessionStats {
             pointer_datagram_active: self.pointer_datagram_active.load(Ordering::Relaxed),
             pointer_datagrams_outbound: self.pointer_datagrams_outbound.load(Ordering::Relaxed),
             pointer_datagrams_inbound: self.pointer_datagrams_inbound.load(Ordering::Relaxed),
+            pointer_datagram_gaps: self.pointer_datagram_gaps.load(Ordering::Relaxed),
+            pointer_datagram_jitter_us: self.pointer_datagram_jitter_us.load(Ordering::Relaxed),
+            pointer_jitter_p50_us: jitter_percentile(&jitter_buckets, 50),
+            pointer_jitter_p95_us: jitter_percentile(&jitter_buckets, 95),
+            pointer_jitter_p99_us: jitter_percentile(&jitter_buckets, 99),
+            pointer_datagram_max_silence_ms: self
+                .pointer_datagram_max_silence_ms
+                .load(Ordering::Relaxed),
+            pointer_recovery_milliunits: self.pointer_recovery_milliunits.load(Ordering::Relaxed),
+            reliable_datagrams_outbound: self.reliable_datagrams_outbound.load(Ordering::Relaxed),
+            reliable_datagrams_inbound: self.reliable_datagrams_inbound.load(Ordering::Relaxed),
+            reliable_datagram_retransmits: self
+                .reliable_datagram_retransmits
+                .load(Ordering::Relaxed),
         }
     }
 
@@ -372,7 +445,36 @@ impl ObservableSessionStats {
         self.pointer_datagram_active.store(false, Ordering::Relaxed);
         self.pointer_datagrams_outbound.store(0, Ordering::Relaxed);
         self.pointer_datagrams_inbound.store(0, Ordering::Relaxed);
+        self.pointer_datagram_gaps.store(0, Ordering::Relaxed);
+        self.pointer_datagram_jitter_us.store(0, Ordering::Relaxed);
+        for bucket in &self.pointer_jitter_buckets {
+            bucket.store(0, Ordering::Relaxed);
+        }
+        self.pointer_datagram_max_silence_ms
+            .store(0, Ordering::Relaxed);
+        self.pointer_recovery_milliunits.store(0, Ordering::Relaxed);
+        self.reliable_datagrams_outbound.store(0, Ordering::Relaxed);
+        self.reliable_datagrams_inbound.store(0, Ordering::Relaxed);
+        self.reliable_datagram_retransmits
+            .store(0, Ordering::Relaxed);
     }
+}
+
+fn jitter_percentile(buckets: &[u64; 8], percentile: u64) -> u64 {
+    const UPPER_BOUNDS_US: [u64; 8] = [250, 500, 1_000, 2_000, 5_000, 10_000, 25_000, 50_000];
+    let total = buckets.iter().sum::<u64>();
+    if total == 0 {
+        return 0;
+    }
+    let target = total.saturating_mul(percentile).div_ceil(100);
+    let mut cumulative = 0_u64;
+    for (index, count) in buckets.iter().enumerate() {
+        cumulative = cumulative.saturating_add(*count);
+        if cumulative >= target {
+            return UPPER_BOUNDS_US[index];
+        }
+    }
+    UPPER_BOUNDS_US[7]
 }
 
 /// Bounded, priority-aware outbound queue.

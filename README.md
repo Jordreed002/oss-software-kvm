@@ -119,7 +119,9 @@ To run the Link Console alpha end-to-end (including the `kvm-runtime` sidecar), 
 Monitoring permissions for the runtime; Windows requires the C++ build tools and allows the runtime
 on Private networks (TCP port 24800). Mutually negotiated protocol-v3 sessions
 also use exporter-authenticated UDP port 24802 for replaceable pointer movement;
-all critical input remains on TLS/TCP and UDP failure falls back automatically.
+stateful input also takes an ordered, acknowledged UDP shadow while TLS remains
+the safety fallback. The paced, QoS-marked path and gap/jitter telemetry are
+documented in [transport latency hardening](docs/transport-v4-latency-hardening.md).
 
 The emergency escape is **Ctrl + Alt + Shift + Backspace**. Routing is fail-open: if a callback,
 session, or native capture path cannot prove that an event was queued safely, that event stays on the
