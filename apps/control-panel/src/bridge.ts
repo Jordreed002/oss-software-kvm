@@ -153,8 +153,12 @@ const invokeOrPreview = async <T>(command: string, args?: Record<string, unknown
     // in the web preview without a real runtime. Returns null when the runtime
     // is not running, matching the Tauri command's unreachable -> null contract.
     if (previewState.runtime !== "running") return null as T;
+    // The dashboard addresses each host by its real LAN IP (derived from the
+    // identity address), which is what the Tauri backend expects too. Treat the
+    // "local" sentinel and the local machine's own address as this computer.
     const host = String(args?.host ?? "local");
-    const isLocal = host === "local";
+    const localHost = previewState.local?.address?.slice(0, previewState.local.address.lastIndexOf(":")) ?? "";
+    const isLocal = host === "local" || (localHost.length > 0 && host === localHost);
     const peerPlatform = previewState.platform === "macos" ? "windows" : "macos";
     const seed = isLocal ? 1 : 2;
     const t = Date.now() / 1000;

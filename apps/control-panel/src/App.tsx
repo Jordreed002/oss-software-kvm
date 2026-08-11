@@ -1,9 +1,10 @@
 import { useEffect, useMemo, useState } from "react";
 import {
-    ArrowLeftRight, Check, ChevronRight, CircleAlert, Copy, KeyRound,
+    Activity, ArrowLeftRight, Check, ChevronRight, CircleAlert, Copy, KeyRound,
   Handshake, Laptop, Link2, LoaderCircle, Monitor, MousePointer2, Move, Play, Radio, RotateCcw, ShieldCheck, Square, Unplug, X,
 } from "lucide-react";
 import { api } from "./bridge";
+import { DiagnosticsDashboard } from "./DiagnosticsDashboard";
 import type { DisplayInfo, DisplayPlacement, Placement, SetupSnapshot } from "./types";
 
 const steps = ["This computer", "Pair", "Arrange", "Ready"] as const;
@@ -23,6 +24,7 @@ function App() {
   const [busy, setBusy] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [copied, setCopied] = useState(false);
+  const [monitoring, setMonitoring] = useState(false);
 
   useEffect(() => {
     api.status().then((state) => {
@@ -46,6 +48,10 @@ function App() {
   useEffect(() => {
     if (step === 1 && snapshot?.peer) setStep(2);
   }, [snapshot?.peer, step]);
+
+  useEffect(() => {
+    if (snapshot?.runtime !== "running") setMonitoring(false);
+  }, [snapshot?.runtime]);
 
   useEffect(() => {
     if (step === 2 && snapshot?.configured && snapshot.workspaceRole === "follower") setStep(3);
@@ -87,9 +93,19 @@ function App() {
       <div className="ambient ambient-one" /><div className="ambient ambient-two" />
       <header className="topbar">
         <div className="brand"><span className="brand-mark"><ArrowLeftRight size={18} /></span><span>Software KVM</span><small>Link Console</small></div>
-        <div className={`runtime-pill ${snapshot.runtime}`}><i />{readiness}</div>
+        <div className="topbar-actions">
+          <div className={`runtime-pill ${snapshot.runtime}`}><i />{readiness}</div>
+          {snapshot.runtime === "running" && (
+            <button className={`topbar-monitor ${monitoring ? "active" : ""}`} onClick={() => setMonitoring((value) => !value)} aria-pressed={monitoring}>
+              <Activity size={14} />{monitoring ? "Back to console" : "Monitor"}
+            </button>
+          )}
+        </div>
       </header>
 
+      {monitoring && snapshot.runtime === "running" ? (
+        <DiagnosticsDashboard snapshot={snapshot} />
+      ) : (
       <section className="workspace">
         <aside className="rail">
           <div className="eyebrow">SETUP / 01</div>
@@ -123,6 +139,7 @@ function App() {
           {step === 3 && <ReadyStep snapshot={snapshot} busy={busy} onValidate={() => perform("validate", api.validate)} onStart={() => perform("start", api.start)} onStop={() => perform("stop", api.stop)} onReplace={() => perform("forget-pair", async () => { if (snapshot.runtime === "running") await api.stop(); return api.forgetPairedComputer(); }, 1)} onRepair={() => perform("repair-lan", async () => { const restart = snapshot.runtime === "running"; if (restart) await api.stop(); const repaired = await api.repairLanBinding(); return restart ? api.start() : repaired; })} />}
         </section>
       </section>
+      )}
       <footer><span>ALPHA · TWO HOSTS · LOCAL NETWORK ONLY</span><span className="escape"><KeyRound size={13} /> Emergency: Ctrl + Alt + Shift + Backspace</span></footer>
     </main>
   );
