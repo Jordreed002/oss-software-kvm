@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { Activity, Download, Laptop, Monitor, Pause, Play, RefreshCw } from "lucide-react";
 import { api } from "./bridge";
-import { type ChartSeries, CompositionBar, type CompositionSegment, HealthMeter, TimeSeriesChart, useHistory } from "./DashChart";
+import { type ChartSeries, CompositionBar, type CompositionSegment, HealthMeter, Sparkline, TimeSeriesChart, useHistory } from "./DashChart";
 import type { CaptureDiagnostics, DiagnosticsReport, DropCounters, NetworkDiagnostics, Platform, SetupSnapshot } from "./types";
 
 const POLL_INTERVAL_MS = 1500;
@@ -26,6 +26,8 @@ interface SampleHost {
   rttMs: number | null;
   outBps: number | null;
   inBps: number | null;
+  /** Cumulative total drops at sample time — differenced into a rate trend. */
+  drops: number | null;
 }
 
 interface DashSample {
@@ -121,8 +123,8 @@ export function DiagnosticsDashboard({ snapshot }: { snapshot: SetupSnapshot }) 
 
       appendSample({
         t: now,
-        local: local ? { rttMs: local.network?.lastRttMs ?? null, outBps: localDerived?.outBps ?? null, inBps: localDerived?.inBps ?? null } : null,
-        peer: peer ? { rttMs: peer.network?.lastRttMs ?? null, outBps: peerDerived?.outBps ?? null, inBps: peerDerived?.inBps ?? null } : null,
+        local: local ? { rttMs: local.network?.lastRttMs ?? null, outBps: localDerived?.outBps ?? null, inBps: localDerived?.inBps ?? null, drops: local.network ? totalDrops(local.network.dropped) : null } : null,
+        peer: peer ? { rttMs: peer.network?.lastRttMs ?? null, outBps: peerDerived?.outBps ?? null, inBps: peerDerived?.inBps ?? null, drops: peer.network ? totalDrops(peer.network.dropped) : null } : null,
       });
 
       setLocalReport(local);
@@ -211,6 +213,24 @@ export function DiagnosticsDashboard({ snapshot }: { snapshot: SetupSnapshot }) 
     ...(peerReport?.network ? [{ name: peerName, fraction: dropFraction(peerReport.network), detail: `${formatNumber(totalDrops(peerReport.network.dropped))} drops · ${formatNumber(peerReport.network.outboundFrames)} frames` }] : []),
   ];
 
+  // Difference the cumulative drop counter into per-sample deltas so the
+  // sparkline shows the drop *rate* trend (new drops per poll), not a monotonic
+  // rise. A flat baseline means no new drops; any peak is an active loss burst.
+  const dropRateSeries = (host: "local" | "peer"): number[] => {
+    const out: number[] = [];
+    let prev: number | null = null;
+    for (const sample of history) {
+      const cumulative = (host === "local" ? sample.local?.drops : sample.peer?.drops) ?? null;
+      if (cumulative != null) {
+        out.push(prev != null ? Math.max(0, cumulative - prev) : 0);
+        prev = cumulative;
+      }
+    }
+    return out;
+  };
+  const localDropSeries = dropRateSeries("local");
+  const peerDropSeries = dropRateSeries("peer");
+
   return (
     <section className="dashboard enter" aria-label="Live diagnostics dashboard">
       <header className="dashboard-head">
@@ -265,6 +285,7 @@ export function DiagnosticsDashboard({ snapshot }: { snapshot: SetupSnapshot }) 
           report={localReport}
           rate={localRate}
           hasPeer={!!snapshot.peer}
+          dropSeries={localDropSeries}
         />
         <HostCard
           kind="peer"
@@ -273,6 +294,7 @@ export function DiagnosticsDashboard({ snapshot }: { snapshot: SetupSnapshot }) 
           report={peerReport}
           rate={peerRate}
           hasPeer={!!snapshot.peer}
+          dropSeries={peerDropSeries}
         />
       </div>
 
@@ -332,6 +354,7 @@ function HostCard({
   report,
   rate,
   hasPeer,
+  dropSeries,
 }: {
   kind: "local" | "peer";
   name: string;
@@ -339,6 +362,7 @@ function HostCard({
   report: DiagnosticsReport | null;
   rate: NetRate | null;
   hasPeer: boolean;
+  dropSeries: number[];
 }) {
   const online = !!report;
   const net = report?.network ?? null;
@@ -386,6 +410,9 @@ function HostCard({
           <code className={net && totalDrops(net.dropped) > 0 ? "neg" : ""}>
             {net ? formatNumber(totalDrops(net.dropped)) : "—"}
           </code>
+          {dropSeries.length > 0 && (
+            <Sparkline values={dropSeries} color={kind === "local" ? LOCAL_COLOR : PEER_COLOR} />
+          )}
         </span>
         <span>
           <small>COALESCED MOVES</small>

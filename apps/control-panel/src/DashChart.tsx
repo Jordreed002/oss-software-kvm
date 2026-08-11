@@ -366,3 +366,28 @@ export function HealthMeter({ title, badge = "HEALTH", hosts }: HealthMeterProps
     </div>
   );
 }
+
+interface SparklineProps {
+  values: number[];
+  color: string;
+  width?: number;
+  height?: number;
+}
+
+/** A tiny axis-less SVG line for in-cell trend display — a fifth, compact
+ *  visualization type. Empty/all-zero series render nothing so a healthy host
+ *  stays clean. Scales to its own max so the shape (not the magnitude) reads. */
+export function Sparkline({ values, color, width = 56, height = 16 }: SparklineProps) {
+  const nonzero = values.some((v) => v > 0);
+  if (values.length < 2 || !nonzero) return null;
+  const max = Math.max(1, ...values);
+  const step = width / (values.length - 1);
+  const points = values
+    .map((v, i) => `${(i * step).toFixed(2)},${(height - (v / max) * (height - 2) - 1).toFixed(2)}`)
+    .join(" ");
+  return (
+    <svg width={width} height={height} className="dash-spark" aria-hidden="true">
+      <polyline points={points} fill="none" stroke={color} strokeWidth={1.4} strokeLinejoin="round" strokeLinecap="round" />
+    </svg>
+  );
+}
