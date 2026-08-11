@@ -794,6 +794,34 @@ mod tests {
     }
 
     #[test]
+    fn quartz_modifier_flag_returns_device_masks_and_excludes_caps_lock() {
+        // The injector combines these masks into a cumulative CGEventFlags word;
+        // each must be a distinct bit so held modifiers never clobber each other.
+        let masks = [
+            quartz_modifier_flag(0x3b), // left Control
+            quartz_modifier_flag(0x38), // left Shift
+            quartz_modifier_flag(0x3c), // right Shift
+            quartz_modifier_flag(0x37), // left Command
+            quartz_modifier_flag(0x36), // right Command
+            quartz_modifier_flag(0x3a), // left Option
+            quartz_modifier_flag(0x3d), // right Option
+            quartz_modifier_flag(0x3e), // right Control
+            quartz_modifier_flag(0x3f), // Fn
+        ];
+        let resolved: u64 = masks.iter().filter_map(|mask| *mask).fold(0, |acc, m| acc | m);
+        for mask in masks {
+            let Some(mask) = mask else { panic!("every held modifier must resolve") };
+            // Each mask is a single bit, disjoint from the cumulative OR.
+            assert_eq!(mask & (resolved ^ mask), 0, "modifier mask {mask:#x} overlaps another");
+        }
+        // Caps Lock (0x39) and non-modifiers return None so they stay on the
+        // normal key-down/up path instead of being treated as held modifiers.
+        assert_eq!(quartz_modifier_flag(0x39), None);
+        assert_eq!(quartz_modifier_flag(0x00), None);
+        assert_eq!(quartz_modifier_flag(0x04), None);
+    }
+
+    #[test]
     fn quartz_pointer_and_scroll_translation_is_finite_and_role_correct() {
         assert_eq!(
             translate_quartz_pointer(CG_EVENT_LEFT_MOUSE_DRAGGED, 0, 4.0, -3.0),
