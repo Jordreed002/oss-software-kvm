@@ -319,7 +319,7 @@ export function DiagnosticsDashboard({ snapshot }: { snapshot: SetupSnapshot }) 
           <Activity size={12} /> {paused ? "Polling paused" : `Polling every ${(POLL_INTERVAL_MS / 1000).toFixed(1)}s`} · read-only · schema v
           {localReport?.schemaVersion ?? peerReport?.schemaVersion ?? 1}
         </span>
-        <span>Pause freezes the live view · Export saves the current pair as JSON · click capture columns to sort.</span>
+        <span>Pause freezes the live view · Export saves the current pair as JSON · click table columns to sort.</span>
       </div>
     </section>
   );
@@ -421,13 +421,20 @@ function NetworkTable({
 }) {
   const localNet = local?.network ?? null;
   const peerNet = peer?.network ?? null;
-  const rows: Array<{ metric: string; local: string; localSub?: string; peer: string; peerSub?: string }> = [
+  // Each row carries its raw numeric value alongside the formatted display
+  // string so the column headers can sort by magnitude. Units differ across
+  // rows (B/s, ms, count), so a magnitude sort ranks within whatever column is
+  // active — the units stay visible in the cells.
+  type NetSortKey = "metric" | "local" | "peer";
+  const rows: Array<{ metric: string; local: string; localSub?: string; peer: string; peerSub?: string; localValue: number | null; peerValue: number | null }> = [
     {
       metric: "Outbound throughput",
-      local: localRate ? formatRate(localRate.outBps) : localNet ? "—" : "—",
+      local: localRate ? formatRate(localRate.outBps) : "—",
       localSub: localNet ? `${formatNumber(localNet.outboundFrames)} frames` : undefined,
       peer: peerRate ? formatRate(peerRate.outBps) : "—",
       peerSub: peerNet ? `${formatNumber(peerNet.outboundFrames)} frames` : undefined,
+      localValue: localRate?.outBps ?? null,
+      peerValue: peerRate?.outBps ?? null,
     },
     {
       metric: "Inbound throughput",
@@ -435,35 +442,53 @@ function NetworkTable({
       localSub: localNet ? `${formatNumber(localNet.inboundFrames)} frames` : undefined,
       peer: peerRate ? formatRate(peerRate.inBps) : "—",
       peerSub: peerNet ? `${formatNumber(peerNet.inboundFrames)} frames` : undefined,
+      localValue: localRate?.inBps ?? null,
+      peerValue: peerRate?.inBps ?? null,
     },
     {
       metric: "Last RTT",
       local: localNet?.lastRttMs != null ? `${localNet.lastRttMs} ms` : "—",
       peer: peerNet?.lastRttMs != null ? `${peerNet.lastRttMs} ms` : "—",
+      localValue: localNet?.lastRttMs ?? null,
+      peerValue: peerNet?.lastRttMs ?? null,
     },
     {
       metric: "Coalesced pointer moves",
       local: localNet ? formatNumber(localNet.coalescedMoves) : "—",
       peer: peerNet ? formatNumber(peerNet.coalescedMoves) : "—",
+      localValue: localNet?.coalescedMoves ?? null,
+      peerValue: peerNet?.coalescedMoves ?? null,
     },
   ];
+  const { key: sortKey, dir, toggle } = useSort<NetSortKey>("metric", "asc");
+  const sortedRows = [...rows].sort((a, b) => {
+    let cmp: number;
+    if (sortKey === "metric") {
+      cmp = a.metric.localeCompare(b.metric);
+    } else {
+      const av = (sortKey === "local" ? a.localValue : a.peerValue) ?? -1;
+      const bv = (sortKey === "local" ? b.localValue : b.peerValue) ?? -1;
+      cmp = av - bv;
+    }
+    return dir === "asc" ? cmp : -cmp;
+  });
 
   return (
     <div className="dash-table-wrap">
       <div className="dash-table-title">
         <span>{label}</span>
-        <em>CUMULATIVE · LIVE</em>
+        <em>SORTABLE · CUMULATIVE</em>
       </div>
       <table className="dash-table">
         <thead>
           <tr>
-            <th scope="col">Metric</th>
-            <th scope="col">This computer</th>
-            <th scope="col">Paired computer</th>
+            <SortTh text="Metric" active={sortKey === "metric"} dir={dir} onClick={() => toggle("metric")} />
+            <SortTh text="This computer" active={sortKey === "local"} dir={dir} onClick={() => toggle("local")} />
+            <SortTh text="Paired computer" active={sortKey === "peer"} dir={dir} onClick={() => toggle("peer")} />
           </tr>
         </thead>
         <tbody>
-          {rows.map((row) => (
+          {sortedRows.map((row) => (
             <tr key={row.metric}>
               <td className="label">{row.metric}</td>
               <td>
