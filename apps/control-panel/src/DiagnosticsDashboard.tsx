@@ -277,7 +277,7 @@ export function DiagnosticsDashboard({ snapshot }: { snapshot: SetupSnapshot }) 
           <Activity size={12} /> {paused ? "Polling paused" : `Polling every ${(POLL_INTERVAL_MS / 1000).toFixed(1)}s`} · read-only · schema v
           {localReport?.schemaVersion ?? peerReport?.schemaVersion ?? 1}
         </span>
-        <span>Pause freezes the live view · Export saves the current pair as JSON · failure counters highlight orange.</span>
+        <span>Pause freezes the live view · Export saves the current pair as JSON · click capture columns to sort.</span>
       </div>
     </section>
   );
@@ -514,6 +514,51 @@ const CAPTURE_ROWS: CaptureRow[] = [
   { key: "pointerObservationFailures", label: "Pointer observation failures", failure: true },
 ];
 
+type CaptureSortKey = "counter" | "local" | "peer";
+type SortDir = "asc" | "desc";
+
+/** Click-to-sort state for a table column set. Clicking the active column
+ *  flips the direction; clicking another column switches to it, descending. */
+function useSort<K extends string>(initialKey: K, initialDir: SortDir) {
+  const [key, setKey] = useState<K>(initialKey);
+  const [dir, setDir] = useState<SortDir>(initialDir);
+  const toggle = useCallback(
+    (clicked: K) => {
+      if (clicked === key) {
+        setDir((d) => (d === "asc" ? "desc" : "asc"));
+      } else {
+        setKey(clicked);
+        setDir("desc");
+      }
+    },
+    [key],
+  );
+  return { key, dir, toggle };
+}
+
+/** A `<th>` whose label is a sort button. Shows ▲/▼ on the active column and a
+ *  faint ↕ hint on the others so the whole header row reads as interactive. */
+function SortTh({
+  text,
+  active,
+  dir,
+  onClick,
+}: {
+  text: string;
+  active: boolean;
+  dir: SortDir;
+  onClick: () => void;
+}) {
+  return (
+    <th scope="col">
+      <button type="button" className={`dash-sort${active ? " active" : ""}`} onClick={onClick}>
+        {text}
+        <span className="dash-sort-arrow" aria-hidden="true">{active ? (dir === "asc" ? "▲" : "▼") : "↕"}</span>
+      </button>
+    </th>
+  );
+}
+
 function CaptureTable({
   label,
   local,
@@ -526,23 +571,42 @@ function CaptureTable({
   const localCap = local?.capture ?? null;
   const peerCap = peer?.capture ?? null;
   const seen = localCap ?? peerCap;
+  const { key: sortKey, dir, toggle } = useSort<CaptureSortKey>("counter", "asc");
+
+  const valueFor = (row: CaptureRow, host: "local" | "peer"): number => {
+    const cap = host === "local" ? localCap : peerCap;
+    return cap ? cap[row.key] : -1;
+  };
+
+  // Stable sort: a copy of CAPTURE_ROWS ordered by the active column. Numeric
+  // columns compare the raw counter (missing -> -1 so absent values sink in
+  // descending order); the Counter column is alphabetical by label.
+  const sortedRows = [...CAPTURE_ROWS].sort((a, b) => {
+    let cmp: number;
+    if (sortKey === "counter") {
+      cmp = a.label.localeCompare(b.label);
+    } else {
+      cmp = valueFor(a, sortKey) - valueFor(b, sortKey);
+    }
+    return dir === "asc" ? cmp : -cmp;
+  });
 
   return (
     <div className="dash-table-wrap">
       <div className="dash-table-title">
         <span>{label}</span>
-        <em>AGGREGATE COUNTERS · NO PAYLOADS</em>
+        <em>SORTABLE · AGGREGATE COUNTERS</em>
       </div>
       <table className="dash-table">
         <thead>
           <tr>
-            <th scope="col">Counter</th>
-            <th scope="col">This computer</th>
-            <th scope="col">Paired computer</th>
+            <SortTh text="Counter" active={sortKey === "counter"} dir={dir} onClick={() => toggle("counter")} />
+            <SortTh text="This computer" active={sortKey === "local"} dir={dir} onClick={() => toggle("local")} />
+            <SortTh text="Paired computer" active={sortKey === "peer"} dir={dir} onClick={() => toggle("peer")} />
           </tr>
         </thead>
         <tbody>
-          {CAPTURE_ROWS.map((row) => {
+          {sortedRows.map((row) => {
             const lv = localCap ? localCap[row.key] : null;
             const pv = peerCap ? peerCap[row.key] : null;
             return (

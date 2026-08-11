@@ -314,6 +314,11 @@ table.dash-table { width: 100%; border-collapse: collapse; }
 .dash-table td.label { color: #9ba69f; font-family: "Manrope Variable", sans-serif; font-size: 11px; }
 .dash-table td.neg, .dash-table td .neg { color: #ff9a75; }
 .dash-lane-badge { display: inline-block; font-size: 7px; font-weight: 800; letter-spacing: .12em; padding: 3px 7px; border: 1px solid rgba(255,255,255,.1); color: #8a958f; text-transform: uppercase; }
+.dash-sort { appearance: none; background: none; border: 0; padding: 0; color: inherit; font: inherit; text-transform: inherit; letter-spacing: inherit; cursor: pointer; display: inline-flex; align-items: center; gap: 6px; transition: color .2s; }
+.dash-sort:hover { color: var(--mint); }
+.dash-sort.active { color: var(--mint); }
+.dash-sort-arrow { font-size: 8px; opacity: .9; }
+.dash-sort:not(.active) .dash-sort-arrow { opacity: .25; }
 
 .dash-foot { display: flex; align-items: center; justify-content: space-between; gap: 16px; flex-wrap: wrap; color: #5d6863; font-size: 9px; letter-spacing: .04em; }
 .dash-foot span { display: inline-flex; align-items: center; gap: 7px; }
