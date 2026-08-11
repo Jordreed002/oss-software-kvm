@@ -213,17 +213,17 @@ export function DiagnosticsDashboard({ snapshot }: { snapshot: SetupSnapshot }) 
     ...(peerReport?.network ? [{ name: peerName, fraction: dropFraction(peerReport.network), detail: `${formatNumber(totalDrops(peerReport.network.dropped))} drops · ${formatNumber(peerReport.network.outboundFrames)} frames` }] : []),
   ];
 
-  // Difference the cumulative drop counter into per-sample deltas so the
-  // sparkline shows the drop *rate* trend (new drops per poll), not a monotonic
-  // rise. A flat baseline means no new drops; any peak is an active loss burst.
+  // Difference the cumulative counter and normalize by elapsed wall time so
+  // delayed or manual polls do not distort the per-second drop-rate trend.
   const dropRateSeries = (host: "local" | "peer"): number[] => {
     const out: number[] = [];
-    let prev: number | null = null;
+    let prev: { at: number; drops: number } | null = null;
     for (const sample of history) {
       const cumulative = (host === "local" ? sample.local?.drops : sample.peer?.drops) ?? null;
       if (cumulative != null) {
-        out.push(prev != null ? Math.max(0, cumulative - prev) : 0);
-        prev = cumulative;
+        const elapsedSeconds = prev ? (sample.t - prev.at) / 1000 : 0;
+        out.push(prev && elapsedSeconds > 0 ? Math.max(0, cumulative - prev.drops) / elapsedSeconds : 0);
+        prev = { at: sample.t, drops: cumulative };
       }
     }
     return out;

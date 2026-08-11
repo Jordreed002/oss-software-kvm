@@ -257,6 +257,14 @@ impl DiagnosticsPublisher {
         }
     }
 
+    /// Marks session telemetry unavailable without disturbing independently
+    /// published capture counters.
+    pub fn clear_network(&self) {
+        if let Ok(mut guard) = self.inner.write() {
+            guard.network = None;
+        }
+    }
+
     /// Returns a clone of the current published snapshot.
     ///
     /// Returns the seed report if a writer is contended, rather than blocking
@@ -521,6 +529,19 @@ mod tests {
         assert_eq!(refreshed.capture, Some(capture));
         assert_eq!(refreshed.captured_at_unix_ms, Some(123));
         assert_eq!(refreshed.uptime_ms, 456);
+    }
+
+    #[test]
+    fn clearing_network_preserves_capture_telemetry() {
+        let initial = sample_report();
+        let expected_capture = initial.capture;
+        let publisher = DiagnosticsPublisher::new(initial);
+
+        publisher.clear_network();
+
+        let refreshed = publisher.snapshot();
+        assert_eq!(refreshed.network, None);
+        assert_eq!(refreshed.capture, expected_capture);
     }
 
     #[test]

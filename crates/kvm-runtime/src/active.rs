@@ -470,7 +470,7 @@ where
 
     #[allow(
         clippy::too_many_lines,
-        reason = "transport select loop is clearest inline"
+        reason = "transport select branches are clearer when kept together"
     )]
     async fn run_transport_ready(
         self,
@@ -497,6 +497,8 @@ where
         let mut dial_tasks = tokio::task::JoinSet::new();
         let mut session_tasks = tokio::task::JoinSet::new();
         let mut tick = tokio::time::interval(TRANSPORT_SERVICE_TICK);
+        let mut diagnostics_tick = tokio::time::interval(Duration::from_secs(1));
+        diagnostics_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let mut last_manager_snapshot = None;
         let session_ctx = SessionSpawnCtx {
             manager: &self.manager,
@@ -545,14 +547,12 @@ where
                     joined = session_tasks.join_next(), if !session_tasks.is_empty() => {
                         settle_session_task(joined)?;
                         developer_event("session=task_finished");
+                        if session_tasks.is_empty() {
+                            diagnostics_publisher.clear_network();
+                        }
                     }
                     _ = tick.tick() => {
-                        service_manager_and_publish(
-                            &self.manager,
-                            started,
-                            &diagnostics_publisher,
-                            &capture_cell,
-                        )?;
+                        service_manager(&self.manager, started)?;
                         let previous = &mut last_manager_snapshot;
                         report_manager_snapshot(&self.manager, previous, status.as_ref());
                         if dial_tasks.is_empty() {
@@ -566,6 +566,9 @@ where
                                 });
                             }
                         }
+                    }
+                    _ = diagnostics_tick.tick() => {
+                        publish_capture_snapshot(&diagnostics_publisher, &capture_cell, started);
                     }
                 }
             }
@@ -1280,20 +1283,6 @@ where
             developer_event(&format!("manager=lifecycle_rejected detail:{error:?}"));
             RuntimeTransportError::new(RuntimeTransportErrorKind::Authority)
         })
-}
-
-fn service_manager_and_publish<I>(
-    manager: &Arc<Mutex<PeerManager<I, ManagedSessionOutbound>>>,
-    started: Instant,
-    diagnostics_publisher: &DiagnosticsPublisher,
-    capture_cell: &CaptureDiagnosticsCell,
-) -> Result<(), RuntimeTransportError>
-where
-    I: OutputInjectionBackend,
-{
-    service_manager(manager, started)?;
-    publish_capture_snapshot(diagnostics_publisher, capture_cell, started);
-    Ok(())
 }
 
 async fn settle_shutdown<I>(

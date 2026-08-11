@@ -316,6 +316,7 @@ table.dash-table { width: 100%; border-collapse: collapse; }
 .dash-lane-badge { display: inline-block; font-size: 7px; font-weight: 800; letter-spacing: .12em; padding: 3px 7px; border: 1px solid rgba(255,255,255,.1); color: #8a958f; text-transform: uppercase; }
 .dash-sort { appearance: none; background: none; border: 0; padding: 0; color: inherit; font: inherit; text-transform: inherit; letter-spacing: inherit; cursor: pointer; display: inline-flex; align-items: center; gap: 6px; transition: color .2s; }
 .dash-sort:hover { color: var(--mint); }
+.dash-sort:focus-visible { color: var(--mint); outline: 2px solid var(--mint); outline-offset: 4px; }
 .dash-sort.active { color: var(--mint); }
 .dash-sort-arrow { font-size: 8px; opacity: .9; }
 .dash-sort:not(.active) .dash-sort-arrow { opacity: .25; }
@@ -356,6 +357,9 @@ table.dash-table { width: 100%; border-collapse: collapse; }
 .dash-health-readout span { font-size: 8px; font-weight: 800; letter-spacing: .12em; text-transform: uppercase; opacity: .9; }
 .dash-health-detail { color: #6f7b74; font-size: 9px; font-family: ui-monospace, "SFMono-Regular", Consolas, monospace; white-space: nowrap; }
 .dash-spark { display: block; margin-top: 3px; }
+@media (prefers-reduced-motion: reduce) {
+  .dash-comp-seg, .dash-health-fill { transition: none; }
+}
 .dash-tooltip { position: absolute; top: 10px; width: 150px; padding: 9px 11px; background: rgba(8,13,11,.96); border: 1px solid rgba(235,233,223,.14); box-shadow: 0 8px 24px rgba(0,0,0,.4); pointer-events: none; display: grid; gap: 6px; z-index: 4; }
 .dash-tooltip strong { color: #cfd6d1; font-size: 8px; font-weight: 800; letter-spacing: .12em; text-transform: uppercase; }
 .dash-tooltip span { display: flex; align-items: center; gap: 7px; color: #aeb6b1; font-size: 9px; min-width: 0; }
