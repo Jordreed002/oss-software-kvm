@@ -241,6 +241,22 @@ impl DiagnosticsPublisher {
         }
     }
 
+    /// Refreshes only the capture portion of the current report. Updating the
+    /// existing value under one lock prevents an idle-transport refresh from
+    /// overwriting network telemetry published concurrently by a session.
+    pub fn publish_capture(
+        &self,
+        capture: Option<CaptureDiagnostics>,
+        captured_at_unix_ms: Option<u64>,
+        uptime_ms: u64,
+    ) {
+        if let Ok(mut guard) = self.inner.write() {
+            guard.captured_at_unix_ms = captured_at_unix_ms;
+            guard.uptime_ms = uptime_ms;
+            guard.capture = capture;
+        }
+    }
+
     /// Returns a clone of the current published snapshot.
     ///
     /// Returns the seed report if a writer is contended, rather than blocking
@@ -486,6 +502,25 @@ mod tests {
         bomb.extend_from_slice(&(2 * 1024 * 1024u32).to_be_bytes());
         let error = read_report(&mut bomb.as_slice()).expect_err("must reject");
         assert!(matches!(error, DiagnosticsError::Oversized(_)));
+    }
+
+    #[test]
+    fn capture_refresh_preserves_session_network_telemetry() {
+        let initial = sample_report();
+        let expected_network = initial.network;
+        let publisher = DiagnosticsPublisher::new(initial);
+        let capture = CaptureDiagnostics {
+            observed: 7,
+            ..CaptureDiagnostics::default()
+        };
+
+        publisher.publish_capture(Some(capture), Some(123), 456);
+
+        let refreshed = publisher.snapshot();
+        assert_eq!(refreshed.network, expected_network);
+        assert_eq!(refreshed.capture, Some(capture));
+        assert_eq!(refreshed.captured_at_unix_ms, Some(123));
+        assert_eq!(refreshed.uptime_ms, 456);
     }
 
     #[test]

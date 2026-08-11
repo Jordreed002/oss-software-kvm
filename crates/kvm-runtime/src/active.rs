@@ -468,6 +468,10 @@ where
         result
     }
 
+    #[allow(
+        clippy::too_many_lines,
+        reason = "transport select loop is clearest inline"
+    )]
     async fn run_transport_ready(
         self,
         mut shutdown: tokio::sync::watch::Receiver<bool>,
@@ -476,8 +480,7 @@ where
         status: Option<RuntimeStatusPublisher>,
         capture_cell: CaptureDiagnosticsCell,
     ) -> Result<(), RuntimeTransportError> {
-        // Bind the separate diagnostics channel (spec §31) before the KVM
-        // listener consumes `listen_addresses` by move; see `bind_diagnostics_server`.
+        // Bind diagnostics before the KVM listener consumes `listen_addresses`.
         let diagnostics_publisher =
             bind_diagnostics_server(&self.listen_addresses, self.host_identity, started);
         let (listener, mut accepted) = BoundedLanListener::bind(
@@ -544,10 +547,12 @@ where
                         developer_event("session=task_finished");
                     }
                     _ = tick.tick() => {
-                        if let Err(error) = service_manager(&self.manager, started) {
-                            developer_event(&format!("transport=manager_tick_failed detail:{error:?}"));
-                            return Err(error);
-                        }
+                        service_manager_and_publish(
+                            &self.manager,
+                            started,
+                            &diagnostics_publisher,
+                            &capture_cell,
+                        )?;
                         let previous = &mut last_manager_snapshot;
                         report_manager_snapshot(&self.manager, previous, status.as_ref());
                         if dial_tasks.is_empty() {
@@ -1186,6 +1191,21 @@ fn read_capture_cell(cell: &CaptureDiagnosticsCell) -> Option<CaptureDiagnostics
     cell.read().ok().and_then(|guard| *guard)
 }
 
+/// Refreshes capture diagnostics independently of session telemetry. This keeps
+/// capture counters visible while the transport is idle, while preserving the
+/// most recent network section when a session is active.
+fn publish_capture_snapshot(
+    publisher: &DiagnosticsPublisher,
+    capture_cell: &CaptureDiagnosticsCell,
+    started: Instant,
+) {
+    publisher.publish_capture(
+        read_capture_cell(capture_cell),
+        DiagnosticsReport::now_unix_ms(),
+        u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+    );
+}
+
 fn report_session_telemetry(current: SessionTelemetry, baseline: &mut (Instant, SessionTelemetry)) {
     let now = Instant::now();
     let elapsed = now.saturating_duration_since(baseline.0);
@@ -1260,6 +1280,20 @@ where
             developer_event(&format!("manager=lifecycle_rejected detail:{error:?}"));
             RuntimeTransportError::new(RuntimeTransportErrorKind::Authority)
         })
+}
+
+fn service_manager_and_publish<I>(
+    manager: &Arc<Mutex<PeerManager<I, ManagedSessionOutbound>>>,
+    started: Instant,
+    diagnostics_publisher: &DiagnosticsPublisher,
+    capture_cell: &CaptureDiagnosticsCell,
+) -> Result<(), RuntimeTransportError>
+where
+    I: OutputInjectionBackend,
+{
+    service_manager(manager, started)?;
+    publish_capture_snapshot(diagnostics_publisher, capture_cell, started);
+    Ok(())
 }
 
 async fn settle_shutdown<I>(
