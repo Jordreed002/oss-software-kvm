@@ -23,8 +23,13 @@ use crate::pointer_handoff::{
 use crate::session::{CoordinatorError, OutboundPeer, PeerEventOutcome, SessionRoutingContext};
 use crate::supervisor::CurrentAdmittedSession;
 
-const NATIVE_EDGE_TOLERANCE: f64 = 1.0;
-const NATIVE_CURSOR_INSET: f64 = 2.0;
+// Quartz may report a cursor physically pinned to a display edge as much as
+// ~1.5 logical points inside it. Keep the portal strip wide enough to include
+// that quantization instead of requiring intermittent exact-edge samples.
+const NATIVE_EDGE_TOLERANCE: f64 = 2.0;
+// A handoff landing must remain strictly outside the portal strip so the first
+// native poll on the destination can re-arm the reverse transition.
+const NATIVE_CURSOR_INSET: f64 = 4.0;
 /// How long the cursor must rest at a transition edge before a pointer
 /// handoff is proposed, in nanoseconds.
 ///
@@ -43,8 +48,8 @@ pub(crate) const NATIVE_EDGE_DWELL_NS: u64 = 150_000_000;
 /// this does NOT reset an in-progress dwell, only pauses it. Pointer hardware
 /// does not hold the cursor perfectly still against a screen edge — on macOS
 /// the reported coordinate is in points and a trackpad held at the top edge
-/// drifts between ~0 and ~1.5 pt, flickering in and out of the
-/// `NATIVE_EDGE_TOLERANCE` band on alternating 4 ms polls. Without hysteresis
+/// can briefly flicker in and out of the `NATIVE_EDGE_TOLERANCE` band on
+/// alternating 4 ms polls. Without hysteresis
 /// that flicker restarts the dwell on every other tick so it never elapses,
 /// making the return handoff impossible even when the user holds the edge for
 /// seconds. 80 ms is well below the dwell (so a genuine push-and-hold still
@@ -1442,4 +1447,46 @@ fn validate_topology_config(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod native_pointer_tests {
+    use super::{map_logical_pointer_to_native, native_edge_position, NATIVE_EDGE_TOLERANCE};
+    use kvm_types::{Display, DisplayId, Edge, HostId, Point, Rect, Size};
+
+    #[test]
+    fn top_edge_accepts_quartz_point_quantization() {
+        let bounds = Rect::new(100.0, 50.0, 1_512.0, 982.0);
+
+        assert_eq!(
+            native_edge_position(bounds, Edge::Top, Point::new(856.0, 51.5)),
+            Some(0.5)
+        );
+        assert_eq!(
+            native_edge_position(
+                bounds,
+                Edge::Top,
+                Point::new(856.0, 50.0 + NATIVE_EDGE_TOLERANCE + 0.01),
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn handoff_landing_is_outside_reverse_portal_strip() {
+        let display = Display {
+            id: DisplayId::from_bytes([1; 16]),
+            host_id: HostId::from_bytes([2; 16]),
+            name: "test".to_owned(),
+            logical_size: Size::new(1_512.0, 982.0),
+            physical_size: None,
+            scale_factor: 2.0,
+            refresh_rate: Some(60.0),
+            native_bounds: Rect::new(100.0, 50.0, 1_512.0, 982.0),
+            primary: true,
+        };
+
+        let landing = map_logical_pointer_to_native(&display, Point::new(756.0, 0.0)).unwrap();
+        assert!(native_edge_position(display.native_bounds, Edge::Top, landing).is_none());
+    }
 }
