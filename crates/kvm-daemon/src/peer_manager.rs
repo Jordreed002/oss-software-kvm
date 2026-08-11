@@ -3311,6 +3311,27 @@ mod tests {
             .unwrap();
     }
 
+    /// Drives the edge dwell the way the native-capture poll loop does: one
+    /// `observe_native_pointer` call per ~4 ms tick, starting at `start_ns`,
+    /// until just past the dwell window. Returns `true` if a handoff fired.
+    /// Models the real cursor being held steadily at the transition edge.
+    fn dwell_fires_at_edge(
+        manager: &mut PeerManager<TestInjection, TestOutbound>,
+        position: Point,
+        start_ns: u64,
+    ) -> bool {
+        let step = 4_000_000u64; // 4 ms poll tick (250 Hz)
+        let dwell = crate::workspace_control::NATIVE_EDGE_DWELL_NS;
+        let mut now = start_ns;
+        while now < start_ns.saturating_add(dwell).saturating_add(step) {
+            if manager.observe_native_pointer(position, now).unwrap() {
+                return true;
+            }
+            now = now.saturating_add(step);
+        }
+        false
+    }
+
     fn captured_key(sequence: u64, code: KeyCode, state: KeyState) -> CapturedInput {
         CapturedInput::new(
             InputEvent::new(
@@ -3379,14 +3400,18 @@ mod tests {
         activate_selected(&mut manager);
         outbound.clear();
 
-        // First edge contact seeds the dwell (no handoff yet) so a quick flick
-        // to the edge does not immediately yank the pointer to the peer.
-        assert!(!manager
-            .observe_native_pointer(Point::new(99.0, 25.0), 10)
-            .unwrap());
+        // Holding the cursor at the edge accumulates the dwell across polls;
+        // only once it elapses does the handoff fire (and suppress local input).
+        assert!(dwell_fires_at_edge(
+            &mut manager,
+            Point::new(99.0, 25.0),
+            10
+        ));
+        // The dwell fires on an observe_native_pointer poll; re-route one final
+        // captured move at the same edge to confirm suppression is in effect.
         let outcome = manager.route_selected_capture(
             captured_pointer_at(1, Point::new(99.0, 25.0)),
-            10 + crate::workspace_control::NATIVE_EDGE_DWELL_NS,
+            10 + crate::workspace_control::NATIVE_EDGE_DWELL_NS + 8_000_000,
         );
 
         assert_eq!(outcome.disposition(), CaptureDisposition::SuppressLocal);
@@ -3409,17 +3434,16 @@ mod tests {
         activate_selected(&mut manager);
         outbound.clear();
 
-        // First edge contact seeds the dwell; the handoff fires only once the
-        // dwell window elapses on a subsequent observation.
+        // A single contact seeds the dwell; the handoff fires only after the
+        // dwell elapses across successive 4 ms observations at the edge.
         assert!(!manager
             .observe_native_pointer(Point::new(99.0, 75.0), 10)
             .unwrap());
-        assert!(manager
-            .observe_native_pointer(
-                Point::new(99.0, 75.0),
-                10 + crate::workspace_control::NATIVE_EDGE_DWELL_NS,
-            )
-            .unwrap());
+        assert!(dwell_fires_at_edge(
+            &mut manager,
+            Point::new(99.0, 75.0),
+            14
+        ));
 
         let enter = outbound
             .messages()
@@ -3433,51 +3457,67 @@ mod tests {
     }
 
     #[test]
-    fn edge_dwell_protects_quick_flick_and_resets_when_leaving() {
+    fn edge_dwell_tolerates_jitter_but_resets_on_sustained_departure() {
+        let step = 4_000_000u64; // 4 ms poll tick
+        let dwell = crate::workspace_control::NATIVE_EDGE_DWELL_NS;
+        let grace = crate::workspace_control::NATIVE_EDGE_DWELL_GRACE_NS;
+        let edge = Point::new(99.0, 50.0);
+        let interior = Point::new(50.0, 50.0);
+
+        // (a) Trackpad drift at the screen edge flickers the reported coordinate
+        // in and out of the edge band on alternating polls. The grace window
+        // must keep the dwell alive across these brief excursions so a genuine
+        // push-and-hold still switches.
         let outbound = TestOutbound::default();
         let mut manager = manager_with_outbound(DIAL_PEER, outbound.clone());
         activate_selected(&mut manager);
         outbound.clear();
-        let dwell = crate::workspace_control::NATIVE_EDGE_DWELL_NS;
-
-        // A flick: touch the configured edge, then move off it again before the
-        // dwell elapses. This models reaching the screen edge to reveal an
-        // auto-hidden taskbar and then moving onto it — it must NOT switch.
-        assert!(!manager
-            .observe_native_pointer(Point::new(99.0, 50.0), 10)
-            .unwrap());
-        assert!(!manager
-            .observe_native_pointer(Point::new(50.0, 50.0), 10 + dwell / 2)
-            .unwrap());
+        let mut now = 10u64;
+        let mut fired = false;
+        while now < 10 + dwell + step {
+            let position = if (now / step).is_multiple_of(2) {
+                edge
+            } else {
+                interior
+            };
+            if manager.observe_native_pointer(position, now).unwrap() {
+                fired = true;
+                break;
+            }
+            now += step;
+        }
         assert!(
-            outbound
-                .messages()
-                .iter()
-                .all(|message| !matches!(message, WireMessage::PointerEnter(_))),
-            "a quick flick past the edge must not propose a handoff"
+            fired,
+            "edge jitter within the grace window must not block the handoff"
         );
-
-        // Leaving the edge resets the dwell: a fresh contact past the original
-        // dwell window still does not fire immediately — it re-seeds.
-        assert!(!manager
-            .observe_native_pointer(Point::new(99.0, 50.0), 10 + dwell + 1)
-            .unwrap());
-        assert!(
-            outbound
-                .messages()
-                .iter()
-                .all(|message| !matches!(message, WireMessage::PointerEnter(_))),
-            "a re-seeded dwell must not fire on first contact"
-        );
-
-        // Only a sustained contact that clears the re-seeded dwell hands off.
-        assert!(manager
-            .observe_native_pointer(Point::new(99.0, 50.0), 10 + 2 * dwell + 2)
-            .unwrap());
         assert!(outbound
             .messages()
             .iter()
             .any(|message| matches!(message, WireMessage::PointerEnter(_))));
+
+        // (b) A sustained departure — moving onto a revealed taskbar and staying
+        // there — exceeds the grace window and resets the dwell, so returning to
+        // the edge does not fire on first contact.
+        let mut manager = manager_with_outbound(DIAL_PEER, outbound.clone());
+        activate_selected(&mut manager);
+        outbound.clear();
+        assert!(!manager.observe_native_pointer(edge, 100).unwrap());
+        assert!(!manager.observe_native_pointer(edge, 100 + step).unwrap());
+        let departed = 100 + step + grace + step;
+        assert!(!manager.observe_native_pointer(interior, departed).unwrap());
+        assert!(
+            !manager
+                .observe_native_pointer(edge, departed + step)
+                .unwrap(),
+            "a sustained departure must reset the dwell"
+        );
+        assert!(
+            outbound
+                .messages()
+                .iter()
+                .all(|message| !matches!(message, WireMessage::PointerEnter(_))),
+            "no handoff may fire after a reset"
+        );
     }
 
     fn snapshot(peer_id: PeerId, addresses: Vec<IpAddr>) -> DiscoverySnapshot {
@@ -4186,17 +4226,13 @@ mod tests {
         let routing = manager.selected_routing_handle().unwrap().load();
         assert!(!routing.handoff_pending);
         assert_eq!(outbound.messages().len(), before_duplicate + 1);
-        // Edge dwell: the first contact seeds the dwell, the second (after the
-        // dwell window) fires the handoff.
-        assert!(!manager
-            .observe_native_pointer(Point::new(99.0, 50.0), 13)
-            .unwrap());
-        assert!(manager
-            .observe_native_pointer(
-                Point::new(99.0, 50.0),
-                13 + crate::workspace_control::NATIVE_EDGE_DWELL_NS,
-            )
-            .unwrap());
+        // Edge dwell: holding the cursor at the edge across successive polls
+        // accumulates the dwell and eventually fires the handoff.
+        assert!(dwell_fires_at_edge(
+            &mut manager,
+            Point::new(99.0, 50.0),
+            13
+        ));
     }
 
     #[test]

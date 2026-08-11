@@ -39,14 +39,30 @@ const NATIVE_CURSOR_INSET: f64 = 2.0;
 /// a purposeful switch still feels instant (human latency perception thresholds
 /// sit nearer 200 ms) while leaving a wide window to retreat onto the taskbar.
 pub(crate) const NATIVE_EDGE_DWELL_NS: u64 = 150_000_000;
+/// Hysteresis window for the edge dwell: an off-edge excursion shorter than
+/// this does NOT reset an in-progress dwell, only pauses it. Pointer hardware
+/// does not hold the cursor perfectly still against a screen edge — on macOS
+/// the reported coordinate is in points and a trackpad held at the top edge
+/// drifts between ~0 and ~1.5 pt, flickering in and out of the
+/// `NATIVE_EDGE_TOLERANCE` band on alternating 4 ms polls. Without hysteresis
+/// that flicker restarts the dwell on every other tick so it never elapses,
+/// making the return handoff impossible even when the user holds the edge for
+/// seconds. 80 ms is well below the dwell (so a genuine push-and-hold still
+/// accumulates to a switch) but well above a poll's worth of jitter, and a real
+/// departure (moving onto a revealed taskbar) lasts far longer and still resets.
+pub(crate) const NATIVE_EDGE_DWELL_GRACE_NS: u64 = 80_000_000;
 
-/// In-progress edge dwell: the transition edge the cursor is resting against
-/// and the monotonic timestamp at which it first arrived there. Reset whenever
-/// the cursor leaves the edge zone or the handoff fires.
+/// In-progress edge dwell: the transition edge the cursor is resting against,
+/// the monotonic timestamp at which the current dwell attempt began, and the
+/// last tick at which the cursor was confirmed on that edge. Brief off-edge
+/// excursions (within `NATIVE_EDGE_DWELL_GRACE_NS`) preserve `started_ns`;
+/// only a sustained departure or a change of edge restarts it. Cleared when
+/// the handoff fires.
 #[derive(Clone, Copy)]
 struct EdgeDwell {
     edge: Edge,
     started_ns: u64,
+    last_on_edge_ns: u64,
 }
 
 /// Coarse workspace-control failure. Pointer protocol failures are session-fatal.
@@ -323,7 +339,6 @@ impl WorkspaceControlPlane {
                     continue;
                 };
                 if candidate.is_some() {
-                    self.edge_dwell = None;
                     return None;
                 }
                 candidate = Some((display.clone(), edge, normalized));
@@ -333,31 +348,45 @@ impl WorkspaceControlPlane {
             // A portal which has just transferred authority remains disarmed
             // until the cursor is observed strictly inside the destination.
             // This prevents its landing coordinate from immediately proposing
-            // the reverse transition on the next native polling tick. Leaving
-            // the edge zone (no candidate) also cancels any in-progress dwell.
+            // the reverse transition on the next native polling tick. The
+            // in-progress dwell is left untouched here; the hysteresis window
+            // in the dwell gate decides whether a departure was a real reset.
             self.native_portal_armed = true;
-            self.edge_dwell = None;
             return None;
         };
         if !self.native_portal_armed {
             return None;
         }
-        // Edge dwell gate: defer the handoff proposal until the cursor has
-        // rested at this transition edge for NATIVE_EDGE_DWELL_NS. The first
-        // contact (re)starts the dwell; subsequent ticks accumulate until it
-        // elapses. The armed latch is only consumed once the dwell clears and
-        // the proposal actually proceeds, so the dwell itself never disarms
-        // the portal. Moving off the edge resets the dwell via the no-candidate
-        // branch above.
-        if self.edge_dwell.is_none_or(|dwell| dwell.edge != edge) {
-            self.edge_dwell = Some(EdgeDwell {
+        // Edge dwell with hysteresis: the cursor must rest at this transition
+        // edge for NATIVE_EDGE_DWELL_NS before a handoff is proposed. A brief
+        // off-edge excursion (sub-pixel jitter at the screen edge, a single
+        // stale cursor read) within NATIVE_EDGE_DWELL_GRACE_NS does not restart
+        // the timer — it just refreshes `last_on_edge_ns`. Only a sustained
+        // departure (longer than the grace window) or a change of edge restarts
+        // `started_ns`. The armed latch is consumed only when the dwell clears
+        // and the proposal proceeds, so dwelling never disarms the portal.
+        let continuing = self.edge_dwell.is_some_and(|dwell| {
+            dwell.edge == edge
+                && now_ns.saturating_sub(dwell.last_on_edge_ns) <= NATIVE_EDGE_DWELL_GRACE_NS
+        });
+        let dwell = if continuing {
+            let dwell = self.edge_dwell.expect("is_some_and checked Some");
+            EdgeDwell {
+                edge,
+                started_ns: dwell.started_ns,
+                last_on_edge_ns: now_ns,
+            }
+        } else {
+            // Fresh start: first contact, a different edge, or the cursor was
+            // away from the edge longer than the grace window.
+            EdgeDwell {
                 edge,
                 started_ns: now_ns,
-            });
-            return None;
-        }
-        let dwell = self.edge_dwell?;
+                last_on_edge_ns: now_ns,
+            }
+        };
         if now_ns.saturating_sub(dwell.started_ns) < NATIVE_EDGE_DWELL_NS {
+            self.edge_dwell = Some(dwell);
             return None;
         }
         self.edge_dwell = None;
