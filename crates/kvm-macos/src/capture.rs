@@ -808,11 +808,20 @@ mod tests {
             quartz_modifier_flag(0x3e), // right Control
             quartz_modifier_flag(0x3f), // Fn
         ];
-        let resolved: u64 = masks.iter().filter_map(|mask| *mask).fold(0, |acc, m| acc | m);
+        let resolved: u64 = masks
+            .iter()
+            .filter_map(|mask| *mask)
+            .fold(0, |acc, m| acc | m);
         for mask in masks {
-            let Some(mask) = mask else { panic!("every held modifier must resolve") };
+            let Some(mask) = mask else {
+                panic!("every held modifier must resolve")
+            };
             // Each mask is a single bit, disjoint from the cumulative OR.
-            assert_eq!(mask & (resolved ^ mask), 0, "modifier mask {mask:#x} overlaps another");
+            assert_eq!(
+                mask & (resolved ^ mask),
+                0,
+                "modifier mask {mask:#x} overlaps another"
+            );
         }
         // Caps Lock (0x39) and non-modifiers return None so they stay on the
         // normal key-down/up path instead of being treated as held modifiers.

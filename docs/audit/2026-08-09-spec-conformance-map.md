@@ -31,7 +31,7 @@ priority by design.
 | Failsafe + stuck-key recovery (§24/§25) | ✅ Done + tested | `PressedState` consumed on disconnect/route-change/failsafe/shutdown; emergency shortcut |
 | Discovery trust-gating (§20) | ✅ Done + tested | `PairedPeerAllowlist` fail-closed; `discovery_or_unknown_identity_never_implies_trust` test |
 | Semantic translation (§17/§26) | ⚠️ Partial | resolver/translator exist (`kvm-input::semantic`, cycle 2) but **not wired** into daemon injection; `KeyboardMode::Semantic` still a no-op on the input path |
-| Daemon↔panel IPC (§31/§32) | ❌ Transport missing | protocol contract added (cycle 4: `kvm-protocol::control`) but **no named-pipe/Unix-socket transport** and no daemon/panel wiring |
+| Daemon↔panel IPC (§31/§32) | ⚠️ Handler done, transport missing | protocol contract (cycle 4) + **daemon-side `ControlHandler`** (§31 command→response mapping, validation, serve loop over `LocalControlTransport`, injectable read/effect seams, 14 loopback tests) now exist; **no named-pipe/Unix-socket transport** and no production backend/main-loop wiring yet |
 | Control panel (§32–§34) | ⚠️ Partial | setup/pairing wizard + Tauri commands exist; runtime status/control blocked on the IPC gap; full UI page set (Workspace/Devices/Connections/Audio/Settings/Diagnostics) not verified |
 | macOS selective suppression (§15) | ⚠️ Known limitation | `kvm-macos` docs: selective suppression unavailable pending IOHID↔CGEvent correlation (whole-host suppression available) |
 | Audio (§28–§30) | ❌ Absent | no `kvm-audio` crate; consistent with industry v1 scope and spec non-goals — lowest priority |

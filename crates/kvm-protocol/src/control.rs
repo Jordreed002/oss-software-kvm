@@ -365,10 +365,15 @@ impl LoopbackControlTransport {
 impl LocalControlTransport for LoopbackControlTransport {
     fn send(&mut self, frame: ControlFrame) -> Result<(), ControlCodecError> {
         let bytes = encode_control(&frame)?;
-        // A send error means the peer dropped its receiver: surface as closed.
-        self.tx
-            .send(bytes)
-            .map_err(|_| ControlCodecError::Malformed)
+        // A send error means the peer dropped its receiver: mark this end
+        // closed and surface the error. Callers (notably `ControlHandler::serve`)
+        // then observe `is_closed()` and map the disconnect to a clean closure
+        // rather than a fatal codec error.
+        if self.tx.send(bytes).is_err() {
+            self.peer_closed.store(true, Ordering::Release);
+            return Err(ControlCodecError::Malformed);
+        }
+        Ok(())
     }
 
     fn try_recv(&mut self) -> Result<Option<ControlFrame>, ControlCodecError> {

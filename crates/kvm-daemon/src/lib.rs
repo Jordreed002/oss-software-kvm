@@ -4,6 +4,7 @@
 //! daemon core is deterministic and synchronous so a platform callback can
 //! decide whether to suppress an event without waiting for UI or disk I/O.
 
+mod control_handler;
 mod core;
 mod device_inventory;
 #[cfg(feature = "diagnostics")]
@@ -18,6 +19,13 @@ mod supervisor;
 mod wire;
 mod workspace_control;
 
+pub use control_handler::{
+    ControlAudioRoute, ControlDeviceEntry, ControlDeviceKind, ControlDeviceRoute,
+    ControlDeviceSummary, ControlDisplayEntry, ControlDisplaySummary, ControlEdgeSide,
+    ControlEffects, ControlError, ControlHandler, ControlPeerEntry, ControlPeerState,
+    ControlPeerStatus, ControlState, ControlStatus, ControlStatusOutput, ControlTopologyEdge,
+    ServeOutcome,
+};
 pub use core::{
     CaptureOutcome, CaptureRouteState, CoreAction, CoreCaptureError, DaemonCore, DaemonError,
     PeerState, ProcessResult, RemoteRelease, RoutingSnapshot, RoutingSnapshotHandle,

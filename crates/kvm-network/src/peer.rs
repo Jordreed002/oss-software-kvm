@@ -533,6 +533,76 @@ impl ReconnectJitter for NoReconnectJitter {
     }
 }
 
+/// Production reconnect jitter using an equal-jitter strategy backed by a
+/// deterministic, dependency-free splitmix64 PRNG.
+///
+/// Equal jitter keeps at least half of the computed backoff and randomises the
+/// remainder: `delay = base/2 + uniform(0, base/2)`, so the result always lies in
+/// `[base/2, base]`. This preserves the exponential-growth shape (a persistently
+/// failing peer still backs off toward `maximum_delay`) while spreading
+/// near-simultaneous failures across a window — the standard remedy for a
+/// reconnect thundering-herd when several paired peers fail at once.
+///
+/// The PRNG is seeded per peer so peers sharing one daemon do not retry in
+/// lockstep, and the sequence is deterministic for a given seed so tests are
+/// reproducible. `splitmix64` is a public-domain algorithm; it advances its
+/// 64-bit state by a fixed increment on each draw and cannot start from zero
+/// (zero is remapped to the `SplitMix64` golden-ratio constant in [`Self::new`]).
+#[derive(Clone, Copy, Debug)]
+pub struct SeededReconnectJitter {
+    state: u64,
+}
+
+/// `SplitMix64` mixing constant, also used to seed from a zero state.
+const SPLITMIX64_INCREMENT: u64 = 0x9E37_79B9_7F4A_7C15;
+
+impl SeededReconnectJitter {
+    /// Creates a jitter source from a nonzero seed.
+    ///
+    /// A zero seed is remapped to [`SPLITMIX64_INCREMENT`] because splitmix64 is
+    /// stuck at zero otherwise. Two sources built from distinct seeds draw from
+    /// uncorrelated sequences.
+    #[must_use]
+    pub const fn new(seed: u64) -> Self {
+        Self {
+            state: if seed == 0 {
+                SPLITMIX64_INCREMENT
+            } else {
+                seed
+            },
+        }
+    }
+
+    /// Draws the next pseudo-random `u64`, advancing the internal state.
+    fn next_u64(&mut self) -> u64 {
+        self.state = self.state.wrapping_add(SPLITMIX64_INCREMENT);
+        let mut z = self.state;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^ (z >> 31)
+    }
+
+    /// Returns a pseudo-random duration in `[Duration::ZERO, bound]`.
+    fn uniform_below(&mut self, bound: Duration) -> Duration {
+        let bound_ns = bound.as_nanos();
+        if bound_ns == 0 {
+            return Duration::ZERO;
+        }
+        let bound_ns = u64::try_from(bound_ns).unwrap_or(u64::MAX);
+        // `% (bound_ns + 1)` maps the draw onto `[0, bound_ns]` inclusive.
+        Duration::from_nanos(self.next_u64() % bound_ns.saturating_add(1))
+    }
+}
+
+impl ReconnectJitter for SeededReconnectJitter {
+    fn apply(&mut self, base: Duration, _attempt: u32) -> Duration {
+        // Equal jitter: base/2 + uniform(0, base/2). Integer division of a
+        // nanosecond Duration floors the half, so the result stays <= base.
+        let half = base / 2;
+        half + self.uniform_below(half)
+    }
+}
+
 impl PersistentPeerConfig {
     /// Validates all bounded resources and timing relationships.
     ///
@@ -2587,6 +2657,70 @@ mod tests {
     use std::sync::Arc;
     use std::task::{Context, Poll};
     use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, DuplexStream, ReadBuf};
+
+    #[test]
+    fn seeded_jitter_stays_in_equal_jitter_band() {
+        // equal-jitter: delay ∈ [base/2, base] for every base.
+        let mut jitter = SeededReconnectJitter::new(0xA1B2_C3D4);
+        for base_ns in [250_000_000u64, 500_000_000, 1_000_000_000, 5_000_000_000] {
+            let base = Duration::from_nanos(base_ns);
+            for _ in 0..64 {
+                let delay = jitter.apply(base, 0);
+                let half = base / 2;
+                assert!(
+                    delay >= half && delay <= base,
+                    "delay {delay:?} outside equal-jitter band [{half:?}, {base:?}]"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn seeded_jitter_zero_base_is_zero() {
+        // A zero backoff must not underflow into a huge duration.
+        let mut jitter = SeededReconnectJitter::new(7);
+        assert_eq!(jitter.apply(Duration::ZERO, 0), Duration::ZERO);
+    }
+
+    #[test]
+    fn seeded_jitter_distinct_seeds_uncorrelate() {
+        // Two peers with distinct seeds must not retry in lockstep: across many
+        // draws their delay sequences differ. This is the thundering-herd remedy.
+        let mut a = SeededReconnectJitter::new(1);
+        let mut b = SeededReconnectJitter::new(2);
+        let base = Duration::from_secs(1);
+        let seq_a: Vec<Duration> = (0..32).map(|_| a.apply(base, 0)).collect();
+        let seq_b: Vec<Duration> = (0..32).map(|_| b.apply(base, 0)).collect();
+        assert_ne!(seq_a, seq_b, "distinct seeds produced identical sequences");
+    }
+
+    #[test]
+    fn seeded_jitter_is_deterministic_for_a_seed() {
+        // Same seed → same advancing sequence: tests are reproducible.
+        let base = Duration::from_millis(800);
+        let mut a = SeededReconnectJitter::new(42);
+        let mut b = SeededReconnectJitter::new(42);
+        let first: Vec<Duration> = (0..16).map(|_| a.apply(base, 0)).collect();
+        let second: Vec<Duration> = (0..16).map(|_| b.apply(base, 0)).collect();
+        assert_eq!(first, second);
+        // The PRNG actually varies output across the run (not a fixed point).
+        assert!(first.iter().any(|d| *d > base / 2));
+    }
+
+    #[test]
+    fn seeded_jitter_zero_seed_remaps_and_advances() {
+        // A zero seed cannot leave splitmix64 stuck at zero.
+        let mut jitter = SeededReconnectJitter::new(0);
+        let base = Duration::from_millis(100);
+        let first = jitter.apply(base, 0);
+        let second = jitter.apply(base, 0);
+        let half = base / 2;
+        assert!(first >= half && first <= base);
+        // State advances, so two draws from a remapped-zero seed differ somewhere
+        // in a run (otherwise it would be a fixed point).
+        let run: Vec<_> = (0..16).map(|_| jitter.apply(base, 0)).collect();
+        assert!(run.iter().any(|d| *d != first || *d != second));
+    }
 
     #[derive(Debug)]
     struct TestSecureStream {

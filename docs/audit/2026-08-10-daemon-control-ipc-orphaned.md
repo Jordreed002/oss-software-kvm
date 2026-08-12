@@ -1,5 +1,15 @@
 # Audit: §31 daemon↔panel IPC — protocol exists but is orphaned; no OS transport
 
+> **Update (2026-08-12):** the daemon-side **handler logic** has landed —
+> `crates/kvm-daemon/src/control_handler.rs` maps every §31 `ControlRequest` →
+> `ControlResponse`, validates inputs (unknown device/display, malformed
+> topology), and drives the exchange over the existing `LocalControlTransport`
+> trait via a `serve` loop, with injectable `ControlState` (reads) /
+> `ControlEffects` (writes) seams (14 loopback round-trip tests). The open items
+> below remain: the OS-backed transport (named pipe / Unix socket), the
+> production backend wiring (`PeerManager` + `DaemonCore` behind the seams), and
+> main-loop integration in `main.rs`.
+
 **Date:** 2026-08-10
 **Cycle:** /loop audit cycle 19 (updates cycle-3 finding with post-cycle-4/6 reality)
 **Spec refs:** `.spec/implementation.md` §31 (Daemon IPC), §32-34 (Control Panel), §35 (Diagnostics)

@@ -18,8 +18,8 @@ use kvm_network::{
     ConnectionDirection, ConnectionGeneration, ConnectionRole, GenerationBoundEventClassification,
     GenerationBoundPeerEvent, GenerationBoundPeerSession, GenerationBoundSessionBuildError,
     GenerationBoundSessionError, LanPeerAddress, PeerSender, PersistentPeerConfig,
-    ReconnectBackoff, ReconnectPolicy, SecurePeerStream, SessionAdmission, SessionEnd,
-    SessionError, TransportPeerIdentity,
+    ReconnectBackoff, ReconnectJitter, ReconnectPolicy, SecurePeerStream, SeededReconnectJitter,
+    SessionAdmission, SessionEnd, SessionError, TransportPeerIdentity,
 };
 use kvm_protocol::{WireHostId, WirePeerId};
 use kvm_security::{PairedPeer, PeerIdentity};
@@ -58,6 +58,12 @@ pub struct PeerManagerConfig {
     /// Operator-provided candidates ([`PeerManager::replace_selected_outbound_candidate`])
     /// bypass this pin — an explicit operator address is trusted verbatim.
     pub expected_service_port: Option<u16>,
+    /// Whether reconnect backoff is spread with per-peer equal-jitter
+    /// (`SeededReconnectJitter`). Production defaults to `true` so paired
+    /// peers that fail near-simultaneously do not retry in lockstep
+    /// (reconnect thundering-herd). Tests that assert exact backoff timing
+    /// set this to `false` to recover deterministic delays.
+    pub apply_reconnect_jitter: bool,
 }
 
 impl Default for PeerManagerConfig {
@@ -67,6 +73,7 @@ impl Default for PeerManagerConfig {
             maximum_candidates_per_peer: MAX_CANDIDATES_PER_PEER,
             reconnect: ReconnectPolicy::default(),
             expected_service_port: None,
+            apply_reconnect_jitter: true,
         }
     }
 }
@@ -119,12 +126,39 @@ enum PeerTaskSlot {
     Session { generation: ConnectionGeneration },
 }
 
+/// Per-peer reconnect-jitter strategy selected by [`PeerManagerConfig`].
+///
+/// Wraps the network-layer jitter sources so the manager can disable jitter for
+/// deterministic backoff tests while production peers use seeded equal-jitter.
+/// Implementing [`ReconnectJitter`] keeps the scheduler call sites unchanged:
+/// they just call `peer.jitter.apply(base, attempts)` regardless of strategy.
+#[derive(Clone, Copy, Debug)]
+enum ManagedJitter {
+    /// Equal-jitter backed by a per-peer seeded splitmix64 PRNG (production).
+    Seeded(SeededReconnectJitter),
+    /// Leave the backoff delay unchanged (deterministic tests).
+    Disabled,
+}
+
+impl ReconnectJitter for ManagedJitter {
+    fn apply(&mut self, base: Duration, attempt: u32) -> Duration {
+        match self {
+            Self::Seeded(jitter) => jitter.apply(base, attempt),
+            Self::Disabled => base,
+        }
+    }
+}
+
 struct ManagedPeerState<I, O> {
     identity: PeerIdentity,
     supervisor: PeerSessionSupervisor<I, O>,
     candidates: BTreeSet<LanPeerAddress>,
     candidate_cursor: usize,
     backoff: ReconnectBackoff,
+    /// Per-peer jitter source. Seeded equal-jitter in production so peers that
+    /// fail near-simultaneously do not retry in lockstep (reconnect
+    /// thundering-herd); disabled only when a test needs exact backoff timing.
+    jitter: ManagedJitter,
     retry_not_before: Duration,
     task: PeerTaskSlot,
     revoked: bool,
@@ -350,6 +384,15 @@ where
             {
                 return Err(PeerManagerError::InvalidIdentity);
             }
+            // Distinct per peer (peer_id) and per daemon instance (manager_id)
+            // so simultaneous failures spread rather than retry in lockstep.
+            // Computed before `identity` moves into the struct literal below.
+            let jitter = if config.apply_reconnect_jitter {
+                let jitter_seed = peer_jitter_seed(manager_id, identity.peer_id());
+                ManagedJitter::Seeded(SeededReconnectJitter::new(jitter_seed))
+            } else {
+                ManagedJitter::Disabled
+            };
             states.insert(
                 identity.peer_id(),
                 ManagedPeerState {
@@ -358,6 +401,7 @@ where
                     candidates: BTreeSet::new(),
                     candidate_cursor: 0,
                     backoff: ReconnectBackoff::new(config.reconnect),
+                    jitter,
                     retry_not_before: Duration::ZERO,
                     task: PeerTaskSlot::Idle,
                     revoked: false,
@@ -2686,7 +2730,8 @@ fn schedule_connect_failure<I, O>(peer: &mut ManagedPeerState<I, O>, now: Durati
     if !peer.candidates.is_empty() {
         peer.candidate_cursor = (peer.candidate_cursor + 1) % peer.candidates.len();
     }
-    let delay = peer.backoff.next_delay();
+    let base = peer.backoff.next_delay();
+    let delay = peer.jitter.apply(base, peer.backoff.attempts());
     peer.retry_not_before = now.checked_add(delay).unwrap_or(Duration::MAX);
 }
 
@@ -2789,9 +2834,25 @@ where
 
 fn schedule_retry<I, O>(peer: &mut ManagedPeerState<I, O>, now: Duration) {
     if !peer.revoked {
-        let delay = peer.backoff.next_delay();
+        let base = peer.backoff.next_delay();
+        let delay = peer.jitter.apply(base, peer.backoff.attempts());
         peer.retry_not_before = now.checked_add(delay).unwrap_or(Duration::MAX);
     }
+}
+
+/// Derives a deterministic, peer-distinct reconnect-jitter seed.
+///
+/// Combines the per-daemon `manager_id` with the peer's stable id so peers in one
+/// daemon draw uncorrelated jitter sequences (de-herding near-simultaneous
+/// reconnects) while remaining reproducible for a given daemon instance.
+fn peer_jitter_seed(manager_id: u64, peer_id: PeerId) -> u64 {
+    let bytes = peer_id.into_bytes();
+    let mut seed = manager_id;
+    for chunk in bytes.chunks_exact(8) {
+        let part = u64::from_le_bytes(chunk.try_into().expect("8-byte chunk"));
+        seed = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15).wrapping_add(part);
+    }
+    seed
 }
 
 struct CoarseSessionError<'a>(&'a SessionError);
@@ -3084,6 +3145,17 @@ mod tests {
         remote_peer_id: PeerId,
         outbound: TestOutbound,
     ) -> PeerManager<TestInjection, TestOutbound> {
+        manager_with_outbound_and_jitter(remote_peer_id, outbound, false)
+    }
+
+    /// Builder behind [`manager_with_outbound`] that also exposes the
+    /// reconnect-jitter flag, so a test can opt into the production seeded
+    /// equal-jitter path without redoing the workspace/capture wiring.
+    fn manager_with_outbound_and_jitter(
+        remote_peer_id: PeerId,
+        outbound: TestOutbound,
+        apply_reconnect_jitter: bool,
+    ) -> PeerManager<TestInjection, TestOutbound> {
         let mut manager = PeerManager::new(
             LOCAL_PEER,
             [managed_peer_with_outbound(
@@ -3098,6 +3170,10 @@ mod tests {
                     maximum_delay: Duration::from_secs(8),
                     multiplier: 2,
                 },
+                // Backoff-mechanics tests assert exact delays; jitter would
+                // spread them across [base/2, base] and break the timing
+                // assertions. Jitter behaviour is covered separately.
+                apply_reconnect_jitter,
                 ..PeerManagerConfig::default()
             },
         )
@@ -5557,6 +5633,68 @@ mod tests {
     #[test]
     fn successful_reconciliation_retry_schedules_reconnect_backoff() {
         assert_reconciliation_retirement_schedules_backoff(4_000_000_000, true);
+    }
+
+    #[test]
+    fn reconnect_backoff_is_jittered_when_enabled() {
+        // Mirrors assert_reconciliation_retirement_schedules_backoff but with
+        // the production seeded equal-jitter path switched on. The first
+        // failure's base delay is 1s; equal-jitter spreads the scheduled
+        // deadline across [now + base/2, now + base] — the inclusive contract
+        // band (at least half the backoff preserved, at most the full base).
+        // The seed for this peer is deterministic, so the exact deadline is a
+        // fixed constant within that band; asserting `delay != base` proves the
+        // manager wired the per-peer jitter source into the scheduler (the
+        // reconnect thundering-herd remedy) rather than passing the raw base
+        // through unchanged.
+        let now_ns: u64 = 2_000_000_000;
+        let base = Duration::from_secs(1);
+        let mut manager =
+            manager_with_outbound_and_jitter(DIAL_PEER, TestOutbound::default(), true);
+        manager
+            .replace_candidates([(DIAL_PEER, "10.0.0.2:24800".parse().unwrap())])
+            .unwrap();
+        let peer = manager.peers.get_mut(&DIAL_PEER).unwrap();
+        let pending = peer
+            .supervisor
+            .begin_pending(ConnectionDirection::Outbound)
+            .unwrap();
+        let generation = pending.generation();
+        peer.task = PeerTaskSlot::Session { generation };
+        assert_eq!(
+            peer.supervisor
+                .connection_task_lost(generation, now_ns)
+                .unwrap(),
+            SupervisorEventOutcome::PendingCancelled
+        );
+
+        let result = Ok(SupervisorEventOutcome::Retired(
+            crate::PeerEventOutcome::Applied,
+        ));
+        assert!(settle_connection_lost_result(peer, result, now_ns).is_ok());
+
+        assert_eq!(peer.task, PeerTaskSlot::Idle);
+        assert_eq!(peer.backoff.attempts(), 1);
+        let now = Duration::from_nanos(now_ns);
+        let delay = peer
+            .retry_not_before
+            .checked_sub(now)
+            .expect("retry_not_before is after now");
+        assert!(
+            delay >= base / 2,
+            "jitter must preserve at least half the backoff: got {delay:?} < {:?}",
+            base / 2
+        );
+        assert!(
+            delay <= base,
+            "jitter must not exceed the full backoff: got {delay:?} > {base:?}"
+        );
+        // Wiring proof: the equal-jitter path was actually engaged for this
+        // seed, so the deadline is strictly inside the band, not the raw base.
+        assert_ne!(
+            delay, base,
+            "delay equals the unjittered base — jitter was not applied for this seed"
+        );
     }
 
     #[test]
