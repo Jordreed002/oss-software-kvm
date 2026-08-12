@@ -52,7 +52,8 @@ pub use peer::{
     GenerationBoundEventClassification, GenerationBoundPeerEvent, GenerationBoundPeerSession,
     GenerationBoundSessionBuildError, GenerationBoundSessionError, HandshakeTranscript,
     NoReconnectJitter, OutboundSendError, PeerConfigError, PeerEvent, PeerSender, PersistentExit,
-    PersistentPeer, PersistentPeerConfig, ReconnectJitter, SecurePeerSession, SessionAdmission,
+    PersistentPeer, PersistentPeerConfig, ReconnectJitter, SeededReconnectJitter,
+    SecurePeerSession, SessionAdmission,
     SessionEnd, SessionError, UndeliveredMessage, UndeliveredTraffic,
 };
 pub use queue::{
