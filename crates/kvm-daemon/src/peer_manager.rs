@@ -18,7 +18,7 @@ use kvm_network::{
     ConnectionDirection, ConnectionGeneration, ConnectionRole, GenerationBoundEventClassification,
     GenerationBoundPeerEvent, GenerationBoundPeerSession, GenerationBoundSessionBuildError,
     GenerationBoundSessionError, LanPeerAddress, PeerSender, PersistentPeerConfig,
-    ReconnectBackoff, ReconnectJitter, ReconnectPolicy, SeededReconnectJitter, SecurePeerStream,
+    ReconnectBackoff, ReconnectJitter, ReconnectPolicy, SecurePeerStream, SeededReconnectJitter,
     SessionAdmission, SessionEnd, SessionError, TransportPeerIdentity,
 };
 use kvm_protocol::{WireHostId, WirePeerId};

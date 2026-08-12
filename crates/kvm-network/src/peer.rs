@@ -547,13 +547,13 @@ impl ReconnectJitter for NoReconnectJitter {
 /// lockstep, and the sequence is deterministic for a given seed so tests are
 /// reproducible. `splitmix64` is a public-domain algorithm; it advances its
 /// 64-bit state by a fixed increment on each draw and cannot start from zero
-/// (zero is remapped to the SplitMix64 golden-ratio constant in [`Self::new`]).
+/// (zero is remapped to the `SplitMix64` golden-ratio constant in [`Self::new`]).
 #[derive(Clone, Copy, Debug)]
 pub struct SeededReconnectJitter {
     state: u64,
 }
 
-/// SplitMix64 mixing constant, also used to seed from a zero state.
+/// `SplitMix64` mixing constant, also used to seed from a zero state.
 const SPLITMIX64_INCREMENT: u64 = 0x9E37_79B9_7F4A_7C15;
 
 impl SeededReconnectJitter {
@@ -2688,7 +2688,7 @@ mod tests {
         // draws their delay sequences differ. This is the thundering-herd remedy.
         let mut a = SeededReconnectJitter::new(1);
         let mut b = SeededReconnectJitter::new(2);
-        let base = Duration::from_millis(1000);
+        let base = Duration::from_secs(1);
         let seq_a: Vec<Duration> = (0..32).map(|_| a.apply(base, 0)).collect();
         let seq_b: Vec<Duration> = (0..32).map(|_| b.apply(base, 0)).collect();
         assert_ne!(seq_a, seq_b, "distinct seeds produced identical sequences");

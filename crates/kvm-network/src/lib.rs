@@ -35,8 +35,7 @@ pub use diagnostics::{
     empty_capture_cell, fetch_report, read_report, spawn_diagnostics_server, write_report,
     CaptureDiagnostics, CaptureDiagnosticsCell, DiagnosticsError, DiagnosticsPublisher,
     DiagnosticsReport, NetworkDiagnostics, PersistentDiagnosticsClient, DEFAULT_DIAGNOSTICS_PORT,
-    DIAGNOSTICS_SCHEMA_VERSION,
-    MAX_DIAGNOSTICS_PAYLOAD,
+    DIAGNOSTICS_SCHEMA_VERSION, MAX_DIAGNOSTICS_PAYLOAD,
 };
 pub use heartbeat::{
     HeartbeatAction, HeartbeatConfig, HeartbeatConfigError, HeartbeatController, HeartbeatError,
@@ -52,9 +51,9 @@ pub use peer::{
     GenerationBoundEventClassification, GenerationBoundPeerEvent, GenerationBoundPeerSession,
     GenerationBoundSessionBuildError, GenerationBoundSessionError, HandshakeTranscript,
     NoReconnectJitter, OutboundSendError, PeerConfigError, PeerEvent, PeerSender, PersistentExit,
-    PersistentPeer, PersistentPeerConfig, ReconnectJitter, SeededReconnectJitter,
-    SecurePeerSession, SessionAdmission,
-    SessionEnd, SessionError, UndeliveredMessage, UndeliveredTraffic,
+    PersistentPeer, PersistentPeerConfig, ReconnectJitter, SecurePeerSession,
+    SeededReconnectJitter, SessionAdmission, SessionEnd, SessionError, UndeliveredMessage,
+    UndeliveredTraffic,
 };
 pub use queue::{
     DropCounters, EnqueueError, ObservableSessionStats, OutboundQueue, QueueConfig,
