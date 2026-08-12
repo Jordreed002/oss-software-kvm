@@ -228,7 +228,16 @@ impl<'a, B: ControlState + ControlEffects + ?Sized> ControlHandler<'a, B> {
                 Ok(None) => return Ok(ServeOutcome::Idle),
                 Ok(Some(ControlFrame::Request(request))) => {
                     let response = self.handle(request);
-                    transport.send(ControlFrame::Response(response))?;
+                    // A send failure may be a peer disconnect (the panel dropped
+                    // its receiver between our recv and this reply). Mirroring
+                    // the recv-error branch, treat that as a clean closure; only
+                    // surface a genuine codec error when the peer is still there.
+                    if let Err(error) = transport.send(ControlFrame::Response(response)) {
+                        if transport.is_closed() {
+                            return Ok(ServeOutcome::Closed);
+                        }
+                        return Err(error);
+                    }
                 }
                 // The daemon is the responder; a Response/Event arriving here is
                 // panel-side protocol misuse. Drop it and keep draining rather
@@ -840,6 +849,31 @@ mod tests {
             .serve(&mut daemon)
             .expect("disconnect is not an error");
         assert_eq!(outcome, ServeOutcome::Closed);
+    }
+
+    #[test]
+    fn serve_returns_closed_when_the_panel_drops_between_recv_and_send() {
+        // The panel queues a request, then drops its end. The daemon receives
+        // the request fine, but its reply send fails because the panel is gone.
+        // The documented contract maps this disconnect to `Closed`, not a fatal
+        // codec error (the send-path analogue of the recv-disconnect test above).
+        let mut backend = sample_backend();
+        let (mut panel, mut daemon) = LoopbackControlTransport::pair();
+        panel
+            .send(ControlFrame::Request(ControlRequest::EnableKvm))
+            .expect("request is queued before the panel drops");
+        drop(panel);
+        let mut handler = ControlHandler::new(&mut backend);
+        let outcome = handler
+            .serve(&mut daemon)
+            .expect("a send-path disconnect is Closed, not an error");
+        assert_eq!(outcome, ServeOutcome::Closed);
+        // The request was still handled (the effect routed) even though the
+        // reply could not be delivered.
+        assert_eq!(
+            backend.writes.borrow().as_slice(),
+            &[RecordedWrite::SetKvmEnabled { enabled: true }]
+        );
     }
 
     #[test]

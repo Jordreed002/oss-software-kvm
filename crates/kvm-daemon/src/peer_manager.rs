@@ -5639,11 +5639,14 @@ mod tests {
     fn reconnect_backoff_is_jittered_when_enabled() {
         // Mirrors assert_reconciliation_retirement_schedules_backoff but with
         // the production seeded equal-jitter path switched on. The first
-        // failure's base delay is 1s; equal-jitter must spread the scheduled
-        // deadline into [now + base/2, now + base) — at least half the backoff
-        // is preserved, and the deadline is strictly before the unjittered
-        // base, proving the manager wired the per-peer jitter source into the
-        // scheduler (the reconnect thundering-herd remedy).
+        // failure's base delay is 1s; equal-jitter spreads the scheduled
+        // deadline across [now + base/2, now + base] — the inclusive contract
+        // band (at least half the backoff preserved, at most the full base).
+        // The seed for this peer is deterministic, so the exact deadline is a
+        // fixed constant within that band; asserting `delay != base` proves the
+        // manager wired the per-peer jitter source into the scheduler (the
+        // reconnect thundering-herd remedy) rather than passing the raw base
+        // through unchanged.
         let now_ns: u64 = 2_000_000_000;
         let base = Duration::from_secs(1);
         let mut manager =
@@ -5683,8 +5686,14 @@ mod tests {
             base / 2
         );
         assert!(
-            delay < base,
-            "jitter must bring the deadline strictly under the base: got {delay:?} >= {base:?}"
+            delay <= base,
+            "jitter must not exceed the full backoff: got {delay:?} > {base:?}"
+        );
+        // Wiring proof: the equal-jitter path was actually engaged for this
+        // seed, so the deadline is strictly inside the band, not the raw base.
+        assert_ne!(
+            delay, base,
+            "delay equals the unjittered base — jitter was not applied for this seed"
         );
     }
 
