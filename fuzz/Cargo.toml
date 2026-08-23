@@ -1,0 +1,32 @@
+[package]
+name = "kvm-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+kvm-protocol = { path = "../crates/kvm-protocol" }
+kvm-network = { path = "../crates/kvm-network" }
+
+# cargo-fuzz targets build with sanitizer flags the workspace does not carry,
+# so this crate deliberately stands up its own (empty) workspace instead of
+# joining the root one.
+[workspace]
+
+[[bin]]
+name = "fuzz_frame_decode"
+path = "fuzz_targets/fuzz_frame_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_datagram_plaintext"
+path = "fuzz_targets/fuzz_datagram_plaintext.rs"
+test = false
+doc = false
+bench = false

@@ -3,7 +3,7 @@ use crate::connection_role::{
     ActiveConnection, ConnectionGeneration, ConnectionGenerationError, ConnectionGenerationGate,
     ConnectionRole, ConnectionRoleError, PendingConnection,
 };
-use crate::pointer_datagram::PointerDatagramPath;
+use crate::pointer_datagram::{PointerDatagramConfig, PointerDatagramPath};
 use crate::{
     AuthenticatedConnector, DevelopmentAddress, FrameReader, FrameWriter, HeartbeatAction,
     HeartbeatConfig, HeartbeatController, NetworkError, ObservableSessionStats, OutboundQueue,
@@ -487,6 +487,10 @@ pub struct PersistentPeerConfig {
     pub queue: QueueConfig,
     pub heartbeat: HeartbeatConfig,
     pub reconnect: ReconnectPolicy,
+    /// UDP port for the pointer-datagram fast path. Both peers of a session
+    /// must agree on it out of band; the default is the wire-negotiated
+    /// port, and multi-session hosts override it per session.
+    pub pointer_datagram: PointerDatagramConfig,
     pub outbound_channel_capacity: usize,
     pub event_channel_capacity: usize,
     pub admission_timeout: Duration,
@@ -502,6 +506,7 @@ impl Default for PersistentPeerConfig {
             queue: QueueConfig::default(),
             heartbeat: HeartbeatConfig::default(),
             reconnect: ReconnectPolicy::default(),
+            pointer_datagram: PointerDatagramConfig::default(),
             outbound_channel_capacity: 1_024,
             event_channel_capacity: 256,
             admission_timeout: Duration::from_secs(5),
@@ -553,6 +558,11 @@ impl PersistentPeerConfig {
         }
         if self.reconnect.validate().is_err() {
             return Err(PeerConfigError::Invalid("invalid reconnect policy"));
+        }
+        if self.pointer_datagram.validate().is_err() {
+            return Err(PeerConfigError::Invalid(
+                "pointer-datagram port must be nonzero",
+            ));
         }
         if self.outbound_channel_capacity == 0 || self.event_channel_capacity == 0 {
             return Err(PeerConfigError::Invalid(
@@ -1677,6 +1687,7 @@ async fn run_session_with_stats<S: SecurePeerStream, A: SessionAdmission>(
                     admitted.session_id(),
                     admitted.local_hello().host_id,
                     admitted.hello().host_id,
+                    config.pointer_datagram,
                 )
                 .await
                 .ok()

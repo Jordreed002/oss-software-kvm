@@ -300,3 +300,36 @@ fn require_message_version(message_type: MessageType, version: u16) -> Result<()
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Deterministic stand-in for the `fuzz_frame_decode` cargo-fuzz target:
+    /// arbitrary bytes plus an arbitrary requested version must never panic,
+    /// only return `Err` (or decode cleanly) for every u16 version.
+    #[test]
+    fn decode_frame_for_version_never_panics_on_arbitrary_input() {
+        let mut state = 0x0DDB_1A5E_5BAD_5EED_u64;
+        let mut next = move || {
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            state
+        };
+        let mut bytes = [0_u8; 256];
+        for _ in 0..100_000 {
+            for byte in &mut bytes {
+                *byte = u8::try_from(next() % 256).unwrap();
+            }
+            let length = usize::try_from(next() % 200).unwrap();
+            let body = &bytes[..length];
+            let derived_version = u16::try_from(next() % 65_536).unwrap();
+            let _ = decode_frame_for_version(body, derived_version);
+            for version in MIN_SUPPORTED_PROTOCOL_VERSION..=CURRENT_PROTOCOL_VERSION {
+                let _ = decode_frame_for_version(body, version);
+                let _ = FrameHeader::decode_for_version(body, version);
+            }
+        }
+    }
+}

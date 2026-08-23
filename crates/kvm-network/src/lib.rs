@@ -59,6 +59,15 @@ pub use peer::{
     PersistentPeer, PersistentPeerConfig, ReconnectJitter, SecurePeerSession, SessionAdmission,
     SessionEnd, SessionError, UndeliveredMessage, UndeliveredTraffic,
 };
+/// Pointer-datagram fast-path plaintext codec and reorder buffer. The session
+/// treats these as internal details; they are public so cargo-fuzz targets
+/// and criterion benches can exercise the datagram parse/encode/reassembly
+/// paths without a socket or session keys.
+pub use pointer_datagram::{
+    encode_pointer_plaintext, parse_pointer_datagram_plaintext, PointerDatagramConfig,
+    PointerDatagramConfigError, PointerDatagramPlaintext, ReliableReorderBuffer,
+    POINTER_DATAGRAM_PORT,
+};
 pub use queue::{
     DropCounters, EnqueueError, ObservableSessionStats, OutboundQueue, QueueConfig,
     QueueConfigError, SessionStats, SessionTelemetry, TrafficClass,

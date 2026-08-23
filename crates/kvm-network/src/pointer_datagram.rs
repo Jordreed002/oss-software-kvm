@@ -11,10 +11,12 @@ use std::io;
 use std::net::SocketAddr;
 use std::time::Duration;
 use std::time::Instant;
+use thiserror::Error;
 use tokio::net::UdpSocket;
 use zeroize::Zeroizing;
 
-pub(crate) const POINTER_DATAGRAM_PORT: u16 = 24_802;
+/// UDP port both session peers bind for the pointer-datagram fast path.
+pub const POINTER_DATAGRAM_PORT: u16 = 24_802;
 const MAGIC: [u8; 4] = *b"SKVU";
 const VERSION: u8 = 1;
 const HEADER_LEN: usize = 13;
@@ -47,10 +49,76 @@ const POINTER_FLAG_REBASE: u8 = 0x01;
 // a pixel-scale addend is at risk of rounding away, so senders rebase.
 const POINTER_TOTALS_REBASE_THRESHOLD: f64 = 1_099_511_627_776.0;
 const MAX_TRACKED_DEVICES: usize = 64;
+/// Baseline pacing interval before any feedback has been observed. Once the
+/// adaptive controller engages, the interval moves within
+/// [`PACING_INTERVAL_MIN`]..=[`PACING_INTERVAL_MAX`].
 const POINTER_PACING_INTERVAL: Duration = Duration::from_millis(4);
+/// Fastest pacing the adaptive controller may select. Only reachable after a
+/// sustained feedback-free window, so a healthy link runs faster than the
+/// 4 ms baseline.
+const PACING_INTERVAL_MIN: Duration = Duration::from_millis(2);
+/// Slowest pacing the adaptive controller may select under worst-case loss.
+const PACING_INTERVAL_MAX: Duration = Duration::from_millis(16);
+/// Redundant copies granted by the lowest adaptation level once the
+/// controller engages. Before any feedback arrives the grant stays at zero:
+/// a loss-free link sends no redundant datagrams at all.
+const REDUNDANCY_BUDGET_MIN: usize = 2;
+/// Redundant copies granted by the highest adaptation level.
+const REDUNDANCY_BUDGET_MAX: usize = 16;
+/// Gap feedback arriving at least this close to its predecessor extends the
+/// storm streak that drives escalation.
+const FEEDBACK_STORM_WINDOW: Duration = Duration::from_millis(48);
+/// Consecutive stormy feedbacks required before parameters escalate. One
+/// stray report changes nothing (hysteresis on the escalation side).
+const FEEDBACK_STORM_THRESHOLD: u32 = 2;
+/// Feedback silence required before parameters relax (hysteresis on the
+/// relaxation side: escalation consumes events, relaxation consumes their
+/// absence, so the two can never alternate off one observation).
+const FEEDBACK_QUIET_WINDOW: Duration = Duration::from_millis(200);
+/// Minimum spacing between any two parameter adjustments, either direction.
+const ADAPTATION_COOLDOWN: Duration = Duration::from_millis(100);
 const RELIABLE_RETRY_INTERVAL: Duration = Duration::from_millis(8);
 const MAX_RELIABLE_PENDING: usize = 128;
 const MAX_RELIABLE_ATTEMPTS: u8 = 4;
+
+/// Configuration for the UDP pointer-datagram fast path.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PointerDatagramConfig {
+    /// UDP port both session peers bind for the fast path. The default is the
+    /// wire-negotiated [`POINTER_DATAGRAM_PORT`]; tests and multi-session
+    /// hosts (where the default port is already occupied) override it with a
+    /// port both peers of that session agree on out of band.
+    pub port: u16,
+}
+
+impl Default for PointerDatagramConfig {
+    fn default() -> Self {
+        Self {
+            port: POINTER_DATAGRAM_PORT,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Error, Eq, PartialEq)]
+pub enum PointerDatagramConfigError {
+    #[error("pointer-datagram port must be nonzero")]
+    ZeroPort,
+}
+
+impl PointerDatagramConfig {
+    /// Validates the configurable fast-path parameters.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PointerDatagramConfigError::ZeroPort`] when the port is the
+    /// wildcard value, which no remote peer could ever target.
+    pub fn validate(self) -> Result<(), PointerDatagramConfigError> {
+        if self.port == 0 {
+            return Err(PointerDatagramConfigError::ZeroPort);
+        }
+        Ok(())
+    }
+}
 
 struct PendingPointer {
     timestamp_ns: u64,
@@ -62,6 +130,139 @@ struct PendingReliable {
     payload: Vec<u8>,
     last_sent: Instant,
     attempts: u8,
+}
+
+/// Bounded adaptive controller for the fast path's pacing interval and
+/// redundancy budget.
+///
+/// Escalation (more redundant copies, longer pacing interval) reacts to
+/// feedback storms: the receiver's gap reports arriving close together.
+/// Relaxation (fewer copies, shorter interval) requires a sustained feedback
+/// silence, and only engages once at least one gap report has been observed —
+/// before that the path keeps the fixed no-evidence baseline (4 ms pacing,
+/// no redundancy), exactly matching the pre-adaptive behavior on a loss-free
+/// link. Oscillation is prevented by construction:
+///
+/// - escalation consumes at least [`FEEDBACK_STORM_THRESHOLD`] feedbacks
+///   inside [`FEEDBACK_STORM_WINDOW`] of each other;
+/// - relaxation requires [`FEEDBACK_QUIET_WINDOW`] with *no* feedback;
+/// - consecutive adjustments in the same direction are spaced by
+///   [`ADAPTATION_COOLDOWN`], while the two directions respond to mutually
+///   exclusive evidence (feedback present vs absent), so they can never
+///   alternate off one observation.
+///
+/// An up→down→up cycle therefore always spans at least one full quiet window
+/// plus a fresh storm — sustained loss, not controller churn. All values are
+/// clamped to `REDUNDANCY_BUDGET_MIN..=REDUNDANCY_BUDGET_MAX` copies (zero
+/// only before the first engagement) and `PACING_INTERVAL_MIN..=
+/// PACING_INTERVAL_MAX` milliseconds.
+///
+/// Every entry point takes the elapsed time since path creation instead of
+/// reading a clock, which keeps the whole controller deterministic and
+/// unit-testable without sockets or sleeps.
+#[derive(Clone, Copy, Debug)]
+struct AdaptivePacing {
+    /// Remaining redundant datagram copies granted by the current level.
+    redundancy_budget: usize,
+    pacing_interval: Duration,
+    /// Feedbacks currently inside the storm window; reset when escalation
+    /// consumes the signal or a slow feedback breaks the streak.
+    storm_streak: u32,
+    last_feedback: Option<Duration>,
+    last_escalation: Option<Duration>,
+    last_relaxation: Option<Duration>,
+}
+
+impl AdaptivePacing {
+    fn new() -> Self {
+        Self {
+            redundancy_budget: 0,
+            pacing_interval: POINTER_PACING_INTERVAL,
+            storm_streak: 0,
+            last_feedback: None,
+            last_escalation: None,
+            last_relaxation: None,
+        }
+    }
+
+    fn pacing_interval(&self) -> Duration {
+        self.pacing_interval
+    }
+
+    /// Records one received gap report at `elapsed` since path creation.
+    fn note_feedback(&mut self, elapsed: Duration) {
+        let stormy = self
+            .last_feedback
+            .is_some_and(|last| elapsed.saturating_sub(last) <= FEEDBACK_STORM_WINDOW);
+        self.storm_streak = if stormy {
+            self.storm_streak.saturating_add(1)
+        } else {
+            1
+        };
+        self.last_feedback = Some(elapsed);
+        let cooled = self
+            .last_escalation
+            .is_none_or(|last| elapsed.saturating_sub(last) >= ADAPTATION_COOLDOWN);
+        if self.storm_streak >= FEEDBACK_STORM_THRESHOLD && cooled {
+            self.escalate(elapsed);
+        }
+    }
+
+    /// Re-examines feedback cadence on the flush tick; relaxing requires the
+    /// full quiet window and only runs once feedback has been observed at
+    /// least once (no evidence yet means the baseline, not the floor).
+    fn refresh(&mut self, elapsed: Duration) {
+        let quiet = self
+            .last_feedback
+            .is_some_and(|last| elapsed.saturating_sub(last) >= FEEDBACK_QUIET_WINDOW);
+        let cooled = self
+            .last_relaxation
+            .is_none_or(|last| elapsed.saturating_sub(last) >= ADAPTATION_COOLDOWN);
+        if quiet && cooled {
+            self.relax(elapsed);
+        }
+    }
+
+    /// Doubles both parameters within their bounds and consumes the storm.
+    fn escalate(&mut self, elapsed: Duration) {
+        self.redundancy_budget = if self.redundancy_budget < REDUNDANCY_BUDGET_MIN {
+            REDUNDANCY_BUDGET_MIN
+        } else {
+            (self.redundancy_budget * 2).min(REDUNDANCY_BUDGET_MAX)
+        };
+        self.pacing_interval = (self.pacing_interval * 2).min(PACING_INTERVAL_MAX);
+        self.storm_streak = 0;
+        self.last_escalation = Some(elapsed);
+    }
+
+    /// Halves both parameters within their bounds. A never-engaged budget
+    /// stays at zero: relaxation never grants redundancy, only escalation
+    /// does.
+    fn relax(&mut self, elapsed: Duration) {
+        let target_budget = if self.redundancy_budget == 0 {
+            0
+        } else {
+            (self.redundancy_budget / 2).max(REDUNDANCY_BUDGET_MIN)
+        };
+        let target_pacing = (self.pacing_interval / 2).max(PACING_INTERVAL_MIN);
+        if target_budget == self.redundancy_budget && target_pacing == self.pacing_interval {
+            // Already relaxed; leave the adjustment clock untouched so a
+            // later relaxation step is not delayed by a no-op.
+            return;
+        }
+        self.redundancy_budget = target_budget;
+        self.pacing_interval = target_pacing;
+        self.last_relaxation = Some(elapsed);
+    }
+
+    /// Consumes one redundant-copy allowance for a just-sent datagram.
+    fn spend_redundancy(&mut self) -> bool {
+        if self.redundancy_budget == 0 {
+            return false;
+        }
+        self.redundancy_budget -= 1;
+        true
+    }
 }
 
 pub(crate) struct PointerDatagramPath {
@@ -81,12 +282,14 @@ pub(crate) struct PointerDatagramPath {
     pending: HashMap<WireDeviceId, PendingPointer>,
     last_pointer_send: Option<Instant>,
     recently_sent: usize,
-    redundancy_budget: usize,
-    pacing_interval: Duration,
+    // Adaptive pacing/redundancy state; driven by elapsed time from
+    // `started_at` so the controller itself stays deterministic.
+    pacing: AdaptivePacing,
+    started_at: Instant,
     reliable_send_sequence: u64,
-    reliable_receive_sequence: u64,
+    // Receive-side reorder buffer for the reliable shadow path.
+    reliable_reorder: ReliableReorderBuffer,
     reliable_pending: BTreeMap<u64, PendingReliable>,
-    reliable_received: BTreeMap<u64, WireMessage>,
     received_totals: HashMap<WireDeviceId, (f64, f64)>,
     last_arrival: Option<Instant>,
     last_interval_us: Option<u64>,
@@ -115,9 +318,10 @@ impl PointerDatagramPath {
         session_id: [u8; 32],
         local_host: WireHostId,
         remote_host: WireHostId,
+        config: PointerDatagramConfig,
     ) -> io::Result<Self> {
-        let local = SocketAddr::new(local.ip(), POINTER_DATAGRAM_PORT);
-        let peer = SocketAddr::new(peer.ip(), POINTER_DATAGRAM_PORT);
+        let local = SocketAddr::new(local.ip(), config.port);
+        let peer = SocketAddr::new(peer.ip(), config.port);
         Self::open(local, peer, session_id, local_host, remote_host)
     }
 
@@ -166,12 +370,11 @@ impl PointerDatagramPath {
             pending: HashMap::new(),
             last_pointer_send: None,
             recently_sent: 0,
-            redundancy_budget: 0,
-            pacing_interval: POINTER_PACING_INTERVAL,
+            pacing: AdaptivePacing::new(),
+            started_at: Instant::now(),
             reliable_send_sequence: 0,
-            reliable_receive_sequence: 0,
+            reliable_reorder: ReliableReorderBuffer::new(),
             reliable_pending: BTreeMap::new(),
-            reliable_received: BTreeMap::new(),
             received_totals: HashMap::new(),
             last_arrival: None,
             last_interval_us: None,
@@ -253,7 +456,7 @@ impl PointerDatagramPath {
         );
         if self
             .last_pointer_send
-            .is_some_and(|last| last.elapsed() < self.pacing_interval)
+            .is_some_and(|last| last.elapsed() < self.pacing.pacing_interval())
         {
             return Ok(true);
         }
@@ -261,6 +464,10 @@ impl PointerDatagramPath {
     }
 
     pub(crate) fn flush_pending(&mut self) -> io::Result<usize> {
+        // The flush tick is the controller's relaxation heartbeat: it fires
+        // on the session's 4 ms cadence whether or not anything is pending,
+        // so a feedback-free window relaxes pacing even on an idle path.
+        self.pacing.refresh(self.started_at.elapsed());
         if !self.ready || self.pending.is_empty() {
             return Ok(0);
         }
@@ -269,25 +476,14 @@ impl PointerDatagramPath {
         for (device, pointer) in pending {
             // Fixed-size pointer payload assembled on the stack; encryption
             // reuses the struct-owned scratch buffer.
-            let mut payload = [0_u8; POINTER_PAYLOAD_LEN];
-            payload[0] = KIND_POINTER;
-            payload[POINTER_FLAGS_OFFSET] = u8::from(pointer.rebase) * POINTER_FLAG_REBASE;
-            payload[POINTER_DEVICE_OFFSET..POINTER_TIMESTAMP_OFFSET].copy_from_slice(&device.0);
-            payload[POINTER_TIMESTAMP_OFFSET..POINTER_TOTAL_X_OFFSET]
-                .copy_from_slice(&pointer.timestamp_ns.to_be_bytes());
-            payload[POINTER_TOTAL_X_OFFSET..POINTER_TOTAL_Y_OFFSET]
-                .copy_from_slice(&pointer.totals.0.to_bits().to_be_bytes());
-            payload[POINTER_TOTAL_Y_OFFSET..POINTER_PAYLOAD_LEN]
-                .copy_from_slice(&pointer.totals.1.to_bits().to_be_bytes());
+            let flags = u8::from(pointer.rebase) * POINTER_FLAG_REBASE;
+            let payload =
+                encode_pointer_plaintext(flags, device, pointer.timestamp_ns, pointer.totals);
             let length = self.encode_payload(&payload)?;
             match self.socket.try_send(&self.encode_scratch[..length]) {
                 Ok(written) if written == length => {
-                    if self.redundancy_budget > 0 {
+                    if self.pacing.spend_redundancy() {
                         let _ = self.socket.try_send(&self.encode_scratch[..length]);
-                        self.redundancy_budget -= 1;
-                        if self.redundancy_budget == 0 {
-                            self.pacing_interval = POINTER_PACING_INTERVAL;
-                        }
                     }
                     sent += 1;
                 }
@@ -415,7 +611,7 @@ impl PointerDatagramPath {
         }
         // Parse into owned values so no borrow of the receive buffer outlives
         // the bookkeeping and control sends below.
-        let received = parse_plaintext(&self.buffer[HEADER_LEN..body_end]);
+        let received = parse_pointer_datagram_plaintext(&self.buffer[HEADER_LEN..body_end]);
         let gaps = self
             .receive_sequence
             .map_or(0, |last| sequence.saturating_sub(last).saturating_sub(1));
@@ -437,7 +633,7 @@ impl PointerDatagramPath {
             let _ = self.socket.try_send(&self.encode_scratch[..length]);
         }
         match received {
-            ReceivedDatagram::Probe => {
+            PointerDatagramPlaintext::Probe => {
                 self.ready = true;
                 Ok(DatagramReceive {
                     gaps,
@@ -448,7 +644,7 @@ impl PointerDatagramPath {
                     reliable_messages: Vec::new(),
                 })
             }
-            ReceivedDatagram::Pointer {
+            PointerDatagramPlaintext::Pointer {
                 flags,
                 device,
                 timestamp_ns,
@@ -495,9 +691,11 @@ impl PointerDatagramPath {
                     reliable_messages: Vec::new(),
                 })
             }
-            ReceivedDatagram::Feedback => {
-                self.redundancy_budget = 8;
-                self.pacing_interval = Duration::from_millis(8);
+            PointerDatagramPlaintext::Feedback => {
+                // The receiver saw receive-window gaps; feed the observed
+                // cadence to the adaptive controller (parameters only, the
+                // wire format is untouched).
+                self.pacing.note_feedback(self.started_at.elapsed());
                 Ok(DatagramReceive {
                     gaps,
                     jitter_us,
@@ -507,32 +705,19 @@ impl PointerDatagramPath {
                     reliable_messages: Vec::new(),
                 })
             }
-            ReceivedDatagram::Reliable {
+            PointerDatagramPlaintext::Reliable {
                 reliable_sequence,
                 message,
             } => {
-                let ahead = reliable_sequence.saturating_sub(self.reliable_receive_sequence);
-                if ahead >= MAX_RELIABLE_PENDING as u64 {
+                let Some((reliable_messages, acknowledged)) =
+                    self.reliable_reorder.insert(reliable_sequence, message)
+                else {
                     // A sequence parked far in the future could never drain
                     // (nothing before it would arrive to advance the window)
                     // and would pin the reorder buffer at capacity.
                     return Ok(DatagramReceive::default());
-                }
-                if self.reliable_received.len() < MAX_RELIABLE_PENDING {
-                    self.reliable_received
-                        .entry(reliable_sequence)
-                        .or_insert(message);
-                }
-                let mut reliable_messages = Vec::new();
-                while let Some(message) = self
-                    .reliable_received
-                    .remove(&self.reliable_receive_sequence)
-                {
-                    reliable_messages.push(message);
-                    self.reliable_receive_sequence += 1;
-                }
-                if self.reliable_receive_sequence > 0 {
-                    let acknowledged = self.reliable_receive_sequence - 1;
+                };
+                if let Some(acknowledged) = acknowledged {
                     let mut ack = [0_u8; 9];
                     ack[0] = KIND_RELIABLE_ACK;
                     ack[1..].copy_from_slice(&acknowledged.to_be_bytes());
@@ -548,7 +733,7 @@ impl PointerDatagramPath {
                     reliable_messages,
                 })
             }
-            ReceivedDatagram::ReliableAck { acknowledged } => {
+            PointerDatagramPlaintext::ReliableAck { acknowledged } => {
                 self.reliable_pending
                     .retain(|sequence, _| *sequence > acknowledged);
                 Ok(DatagramReceive {
@@ -562,7 +747,7 @@ impl PointerDatagramPath {
             }
             // Authenticated garbage or an unknown kind; TLS still carries the
             // peer's authoritative copy of any real message.
-            ReceivedDatagram::Invalid => Ok(DatagramReceive::default()),
+            PointerDatagramPlaintext::Invalid => Ok(DatagramReceive::default()),
         }
     }
 
@@ -624,10 +809,14 @@ pub(crate) struct DatagramReceive {
     pub(crate) reliable_messages: Vec<WireMessage>,
 }
 
-/// One decrypted datagram's kind and fully validated fields. `Invalid` covers
-/// any authenticated payload that fails structural or semantic validation;
-/// callers drop those rather than tearing down the path.
-enum ReceivedDatagram {
+/// One decrypted datagram's kind and fully validated fields.
+///
+/// `Invalid` covers any authenticated payload that fails structural or
+/// semantic validation; the session path drops those rather than tearing
+/// down the fast path. Public so cargo-fuzz targets and criterion benches
+/// can exercise the parser without a socket, session keys, or a peer.
+#[derive(Clone, Debug, PartialEq)]
+pub enum PointerDatagramPlaintext {
     Probe,
     Pointer {
         flags: u8,
@@ -647,12 +836,89 @@ enum ReceivedDatagram {
     Invalid,
 }
 
+/// Receive-side reorder buffer for the reliable datagram shadow path.
+///
+/// Holds sequenced messages that arrived ahead of the next expected
+/// sequence and drains them in order once the gap fills. Public for the
+/// same tooling reason as [`PointerDatagramPlaintext`]; the session treats
+/// it as an internal detail.
+#[derive(Debug, Default)]
+pub struct ReliableReorderBuffer {
+    next_sequence: u64,
+    buffered: BTreeMap<u64, WireMessage>,
+}
+
+impl ReliableReorderBuffer {
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            next_sequence: 0,
+            buffered: BTreeMap::new(),
+        }
+    }
+
+    /// Inserts one authenticated sequenced message and drains every message
+    /// that is now deliverable in order.
+    ///
+    /// Sequences parked so far ahead that the buffer could never drain past
+    /// them are ignored (`None`): nothing before them would arrive to
+    /// advance the window and the buffer would pin at capacity.
+    ///
+    /// Returns the drained messages plus the highest contiguous sequence
+    /// received so far (the cumulative acknowledgement value), or `None`
+    /// when the sequence was rejected as unreachably far in the future.
+    pub fn insert(
+        &mut self,
+        sequence: u64,
+        message: WireMessage,
+    ) -> Option<(Vec<WireMessage>, Option<u64>)> {
+        if sequence.saturating_sub(self.next_sequence) >= MAX_RELIABLE_PENDING as u64 {
+            return None;
+        }
+        if self.buffered.len() < MAX_RELIABLE_PENDING {
+            self.buffered.entry(sequence).or_insert(message);
+        }
+        let mut drained = Vec::new();
+        while let Some(message) = self.buffered.remove(&self.next_sequence) {
+            drained.push(message);
+            self.next_sequence += 1;
+        }
+        Some((drained, self.next_sequence.checked_sub(1)))
+    }
+}
+
+/// Assembles one `KIND_POINTER` plaintext payload from its fields.
+///
+/// This is the single encode-side source of truth for the pointer layout;
+/// the session flush path and external tooling (fuzz round-trips, benches)
+/// share it so the two sides cannot drift.
+#[must_use]
+pub fn encode_pointer_plaintext(
+    flags: u8,
+    device: WireDeviceId,
+    timestamp_ns: u64,
+    totals: (f64, f64),
+) -> [u8; POINTER_PAYLOAD_LEN] {
+    let mut payload = [0_u8; POINTER_PAYLOAD_LEN];
+    payload[0] = KIND_POINTER;
+    payload[POINTER_FLAGS_OFFSET] = flags;
+    payload[POINTER_DEVICE_OFFSET..POINTER_TIMESTAMP_OFFSET].copy_from_slice(&device.0);
+    payload[POINTER_TIMESTAMP_OFFSET..POINTER_TOTAL_X_OFFSET]
+        .copy_from_slice(&timestamp_ns.to_be_bytes());
+    payload[POINTER_TOTAL_X_OFFSET..POINTER_TOTAL_Y_OFFSET]
+        .copy_from_slice(&totals.0.to_bits().to_be_bytes());
+    payload[POINTER_TOTAL_Y_OFFSET..POINTER_PAYLOAD_LEN]
+        .copy_from_slice(&totals.1.to_bits().to_be_bytes());
+    payload
+}
+
 /// Parses and validates one decrypted payload. Field offsets are relative to
 /// the full payload (kind byte included), matching the encode side in
-/// `flush_pending`.
-fn parse_plaintext(plaintext: &[u8]) -> ReceivedDatagram {
+/// [`encode_pointer_plaintext`].
+#[must_use]
+pub fn parse_pointer_datagram_plaintext(plaintext: &[u8]) -> PointerDatagramPlaintext {
     match plaintext.split_first() {
-        Some((&KIND_PROBE, _)) => ReceivedDatagram::Probe,
+        Some((&KIND_PROBE, _)) => PointerDatagramPlaintext::Probe,
         Some((&KIND_POINTER, _)) if plaintext.len() == POINTER_PAYLOAD_LEN => {
             let device = WireDeviceId(
                 plaintext[POINTER_DEVICE_OFFSET..POINTER_TIMESTAMP_OFFSET]
@@ -676,9 +942,9 @@ fn parse_plaintext(plaintext: &[u8]) -> ReceivedDatagram {
             ));
             if !total_x.is_finite() || !total_y.is_finite() {
                 // Nonsensical totals must never enter the delta math.
-                return ReceivedDatagram::Invalid;
+                return PointerDatagramPlaintext::Invalid;
             }
-            ReceivedDatagram::Pointer {
+            PointerDatagramPlaintext::Pointer {
                 flags: plaintext[POINTER_FLAGS_OFFSET],
                 device,
                 timestamp_ns,
@@ -686,21 +952,23 @@ fn parse_plaintext(plaintext: &[u8]) -> ReceivedDatagram {
                 total_y,
             }
         }
-        Some((&KIND_FEEDBACK, _)) => ReceivedDatagram::Feedback,
+        Some((&KIND_FEEDBACK, _)) => PointerDatagramPlaintext::Feedback,
         Some((&KIND_RELIABLE, body)) if body.len() > 8 => {
             let reliable_sequence = u64::from_be_bytes(body[..8].try_into().unwrap_or_default());
             match decode_frame_for_version(&body[8..], POINTER_DATAGRAM_PROTOCOL_VERSION) {
-                Ok(message) if is_stateful_input(&message) => ReceivedDatagram::Reliable {
+                Ok(message) if is_stateful_input(&message) => PointerDatagramPlaintext::Reliable {
                     reliable_sequence,
                     message,
                 },
-                _ => ReceivedDatagram::Invalid,
+                _ => PointerDatagramPlaintext::Invalid,
             }
         }
-        Some((&KIND_RELIABLE_ACK, body)) if body.len() == 8 => ReceivedDatagram::ReliableAck {
-            acknowledged: u64::from_be_bytes(body.try_into().unwrap_or_default()),
-        },
-        _ => ReceivedDatagram::Invalid,
+        Some((&KIND_RELIABLE_ACK, body)) if body.len() == 8 => {
+            PointerDatagramPlaintext::ReliableAck {
+                acknowledged: u64::from_be_bytes(body.try_into().unwrap_or_default()),
+            }
+        }
+        _ => PointerDatagramPlaintext::Invalid,
     }
 }
 
@@ -822,6 +1090,25 @@ mod tests {
         (a, b)
     }
 
+    /// Timeout-wraps every datagram receive: a bare `.await` against a lossy
+    /// or wedged UDP peer hangs the suite outright (past incident in this
+    /// repo), while the wrapper turns it into a test failure.
+    async fn recv(path: &mut PointerDatagramPath) -> DatagramReceive {
+        tokio::time::timeout(Duration::from_secs(2), path.receive())
+            .await
+            .expect("datagram receive timed out")
+            .expect("datagram receive failed")
+    }
+
+    /// Timeout-wrapped raw receive used to model in-network loss by pulling a
+    /// datagram off the socket and discarding it.
+    async fn recv_raw(path: &mut PointerDatagramPath, buffer: &mut [u8]) -> usize {
+        tokio::time::timeout(Duration::from_secs(2), path.socket.recv(buffer))
+            .await
+            .expect("raw datagram receive timed out")
+            .expect("raw datagram receive failed")
+    }
+
     #[tokio::test]
     async fn exporter_bound_paths_exchange_pointer_after_probe() {
         let host_a = WireHostId([1; 16]);
@@ -837,27 +1124,13 @@ mod tests {
 
         a.send_probe().await.unwrap();
         b.send_probe().await.unwrap();
-        assert!(tokio::time::timeout(Duration::from_secs(1), a.receive())
-            .await
-            .unwrap()
-            .unwrap()
-            .input
-            .is_none());
-        assert!(tokio::time::timeout(Duration::from_secs(1), b.receive())
-            .await
-            .unwrap()
-            .unwrap()
-            .input
-            .is_none());
+        assert!(recv(&mut a).await.input.is_none());
+        assert!(recv(&mut b).await.input.is_none());
         assert!(a.is_ready() && b.is_ready());
 
         let sent = pointer(host_a);
         assert!(a.try_send_pointer(&sent).unwrap());
-        let received = tokio::time::timeout(Duration::from_secs(1), b.receive())
-            .await
-            .unwrap()
-            .unwrap();
-        let received = received.input.unwrap();
+        let received = recv(&mut b).await.input.unwrap();
         let WireMessage::Input(sent) = sent else {
             unreachable!()
         };
@@ -903,19 +1176,19 @@ mod tests {
         .await;
         a.send_probe().await.unwrap();
         b.send_probe().await.unwrap();
-        a.receive().await.unwrap();
-        b.receive().await.unwrap();
+        recv(&mut a).await;
+        recv(&mut b).await;
 
         let movement = pointer(host_a);
         assert!(a.try_send_pointer(&movement).unwrap());
         // Model network loss by removing the first encrypted packet before the
         // path can decode it and update its receive baseline.
         let mut discarded = [0_u8; MAX_DATAGRAM];
-        b.socket.recv(&mut discarded).await.unwrap();
+        recv_raw(&mut b, &mut discarded).await;
         assert!(a.try_send_pointer(&movement).unwrap());
         a.flush_pending().unwrap();
 
-        let recovered = b.receive().await.unwrap().input.unwrap();
+        let recovered = recv(&mut b).await.input.unwrap();
         assert!(matches!(
             recovered.payload,
             WireInputPayloadV1::PointerMove { dx, dy }
@@ -937,20 +1210,20 @@ mod tests {
         .await;
         a.send_probe().await.unwrap();
         b.send_probe().await.unwrap();
-        a.receive().await.unwrap();
-        b.receive().await.unwrap();
+        recv(&mut a).await;
+        recv(&mut b).await;
 
         let first = scroll(host_a, 20);
         let second = scroll(host_a, 21);
         assert!(a.shadow_reliable(&first).unwrap());
         assert!(a.shadow_reliable(&second).unwrap());
-        let received_first = b.receive().await.unwrap();
-        let received_second = b.receive().await.unwrap();
+        let received_first = recv(&mut b).await;
+        let received_second = recv(&mut b).await;
         let mut received = received_first.reliable_messages;
         received.extend(received_second.reliable_messages);
         assert_eq!(received, vec![first, second]);
-        a.receive().await.unwrap();
-        a.receive().await.unwrap();
+        recv(&mut a).await;
+        recv(&mut a).await;
         assert!(a.reliable_pending.is_empty());
     }
 
@@ -968,8 +1241,8 @@ mod tests {
         .await;
         a.send_probe().await.unwrap();
         b.send_probe().await.unwrap();
-        a.receive().await.unwrap();
-        b.receive().await.unwrap();
+        recv(&mut a).await;
+        recv(&mut b).await;
 
         // Header-valid, sequence-fresh, but garbage ciphertext.
         let mut corrupt = Vec::with_capacity(HEADER_LEN + TAG_LEN);
@@ -979,12 +1252,12 @@ mod tests {
         corrupt.extend_from_slice(&[0xff_u8; TAG_LEN]);
         a.socket.send(&corrupt).await.unwrap();
 
-        let observed = b.receive().await.unwrap();
+        let observed = recv(&mut b).await;
         assert!(observed.input.is_none() && observed.reliable_messages.is_empty());
 
         let sent = pointer(host_a);
         assert!(a.try_send_pointer(&sent).unwrap());
-        let received = b.receive().await.unwrap().input.unwrap();
+        let received = recv(&mut b).await.input.unwrap();
         let WireMessage::Input(sent) = sent else {
             unreachable!()
         };
@@ -1005,8 +1278,8 @@ mod tests {
         .await;
         a.send_probe().await.unwrap();
         b.send_probe().await.unwrap();
-        a.receive().await.unwrap();
-        b.receive().await.unwrap();
+        recv(&mut a).await;
+        recv(&mut b).await;
 
         // Fill the tracking table to capacity without crafting 64 datagrams.
         for index in 0..MAX_TRACKED_DEVICES {
@@ -1016,13 +1289,13 @@ mod tests {
 
         let novel = pointer_move(host_a, WireDeviceId([0xaa; 16]), 3.0, 1.0);
         assert!(a.try_send_pointer(&novel).unwrap());
-        assert!(b.receive().await.unwrap().input.is_none());
+        assert!(recv(&mut b).await.input.is_none());
 
         let tracked = pointer_move(host_a, WireDeviceId([0; 16]), 4.0, 2.0);
         assert!(a.try_send_pointer(&tracked).unwrap());
         // The pacing window queues rather than sends; flush explicitly.
         a.flush_pending().unwrap();
-        let received = b.receive().await.unwrap().input.unwrap();
+        let received = recv(&mut b).await.input.unwrap();
         assert_eq!(received.source_device, WireDeviceId([0; 16]));
         assert!(matches!(
             received.payload,
@@ -1045,8 +1318,8 @@ mod tests {
         .await;
         a.send_probe().await.unwrap();
         b.send_probe().await.unwrap();
-        a.receive().await.unwrap();
-        b.receive().await.unwrap();
+        recv(&mut a).await;
+        recv(&mut b).await;
 
         // An authenticated reliable frame parked far beyond the reorder
         // window must not wedge the buffer ahead of drainable sequences.
@@ -1060,15 +1333,15 @@ mod tests {
         let length = a.encode_payload(&payload).unwrap();
         a.socket.send(&a.encode_scratch[..length]).await.unwrap();
 
-        let observed = b.receive().await.unwrap();
+        let observed = recv(&mut b).await;
         assert!(observed.reliable_messages.is_empty() && observed.input.is_none());
 
         let first = scroll(host_a, 20);
         let second = scroll(host_a, 21);
         assert!(a.shadow_reliable(&first).unwrap());
         assert!(a.shadow_reliable(&second).unwrap());
-        let received_first = b.receive().await.unwrap();
-        let received_second = b.receive().await.unwrap();
+        let received_first = recv(&mut b).await;
+        let received_second = recv(&mut b).await;
         let mut received = received_first.reliable_messages;
         received.extend(received_second.reliable_messages);
         assert_eq!(received, vec![first, second]);
@@ -1088,8 +1361,8 @@ mod tests {
         .await;
         a.send_probe().await.unwrap();
         b.send_probe().await.unwrap();
-        a.receive().await.unwrap();
-        b.receive().await.unwrap();
+        recv(&mut a).await;
+        recv(&mut b).await;
 
         let device = WireDeviceId([3; 16]);
         // 2^60 + 2^20 is exactly representable, but its ulp is 256, so a
@@ -1097,7 +1370,7 @@ mod tests {
         let huge = 2.0_f64.powi(60) + 2.0_f64.powi(20);
         let first = pointer_move(host_a, device, huge, 0.0);
         assert!(a.try_send_pointer(&first).unwrap());
-        let received = b.receive().await.unwrap().input.unwrap();
+        let received = recv(&mut b).await.input.unwrap();
         assert!(matches!(
             received.payload,
             WireInputPayloadV1::PointerMove { dx, dy }
@@ -1109,7 +1382,7 @@ mod tests {
         let followup = pointer_move(host_a, device, 1.0, -0.5);
         assert!(a.try_send_pointer(&followup).unwrap());
         a.flush_pending().unwrap();
-        let received = b.receive().await.unwrap().input.unwrap();
+        let received = recv(&mut b).await.input.unwrap();
         assert!(matches!(
             received.payload,
             WireInputPayloadV1::PointerMove { dx, dy }
@@ -1161,8 +1434,8 @@ mod tests {
         .await;
         a.send_probe().await.unwrap();
         b.send_probe().await.unwrap();
-        a.receive().await.unwrap();
-        b.receive().await.unwrap();
+        recv(&mut a).await;
+        recv(&mut b).await;
 
         let craft = |x: f64, y: f64| {
             let mut payload = [0_u8; POINTER_PAYLOAD_LEN];
@@ -1181,13 +1454,13 @@ mod tests {
         for totals in [craft(f64::NAN, 0.0), craft(0.0, f64::INFINITY)] {
             let length = a.encode_payload(&totals).unwrap();
             a.socket.send(&a.encode_scratch[..length]).await.unwrap();
-            let observed = b.receive().await.unwrap();
+            let observed = recv(&mut b).await;
             assert!(observed.input.is_none() && observed.reliable_messages.is_empty());
         }
 
         let sent = pointer(host_a);
         assert!(a.try_send_pointer(&sent).unwrap());
-        let received = b.receive().await.unwrap().input.unwrap();
+        let received = recv(&mut b).await.input.unwrap();
         let WireMessage::Input(sent) = sent else {
             unreachable!()
         };
@@ -1202,13 +1475,13 @@ mod tests {
             bound_pair("[::1]:24830", "[::1]:24831", [17; 32], host_a, host_b).await;
         a.send_probe().await.unwrap();
         b.send_probe().await.unwrap();
-        a.receive().await.unwrap();
-        b.receive().await.unwrap();
+        recv(&mut a).await;
+        recv(&mut b).await;
         assert!(a.is_ready() && b.is_ready());
 
         let sent = pointer(host_a);
         assert!(a.try_send_pointer(&sent).unwrap());
-        let received = b.receive().await.unwrap().input.unwrap();
+        let received = recv(&mut b).await.input.unwrap();
         let WireMessage::Input(sent) = sent else {
             unreachable!()
         };
@@ -1223,5 +1496,350 @@ mod tests {
         assert_eq!(raw.tclass_v6().unwrap(), 0xb8);
         #[cfg(not(any(target_os = "linux", target_os = "macos")))]
         let _ = raw;
+    }
+
+    // --- Configurable port --------------------------------------------------
+
+    #[test]
+    fn datagram_config_defaults_to_the_wire_port_and_validates() {
+        let config = PointerDatagramConfig::default();
+        assert_eq!(config.port, POINTER_DATAGRAM_PORT);
+        assert_eq!(config.port, 24_802);
+        assert!(config.validate().is_ok());
+        assert_eq!(
+            PointerDatagramConfig { port: 0 }.validate(),
+            Err(PointerDatagramConfigError::ZeroPort)
+        );
+    }
+
+    #[test]
+    fn persistent_peer_config_carries_and_validates_the_datagram_port() {
+        let config = crate::peer::PersistentPeerConfig::default();
+        assert_eq!(config.pointer_datagram, PointerDatagramConfig::default());
+        assert!(config.validate().is_ok());
+        let invalid = crate::peer::PersistentPeerConfig {
+            pointer_datagram: PointerDatagramConfig { port: 0 },
+            ..crate::peer::PersistentPeerConfig::default()
+        };
+        assert!(invalid.validate().is_err());
+    }
+
+    #[tokio::test]
+    async fn overridden_port_is_threaded_through_bind() {
+        // bind() must rewrite both endpoints to the configured port; the
+        // local socket's bound address is the observable proof. (A full
+        // two-path exchange cannot share one port on a single loopback
+        // address, which is why the exchange tests use explicit ports.)
+        let config = PointerDatagramConfig { port: 24_859 };
+        let path = PointerDatagramPath::bind(
+            "127.0.0.1:0".parse().unwrap(),
+            "127.0.0.1:9".parse().unwrap(),
+            [19; 32],
+            WireHostId([25; 16]),
+            WireHostId([26; 16]),
+            config,
+        )
+        .await
+        .unwrap();
+        assert_eq!(path.socket.local_addr().unwrap().port(), 24_859);
+    }
+
+    // --- Adaptive pacing and redundancy -------------------------------------
+
+    #[test]
+    fn pacing_starts_at_the_baseline_with_no_redundancy() {
+        let pacing = AdaptivePacing::new();
+        assert_eq!(pacing.pacing_interval(), POINTER_PACING_INTERVAL);
+        assert_eq!(pacing.redundancy_budget, 0);
+    }
+
+    #[test]
+    fn one_stray_feedback_does_not_escalate() {
+        let mut pacing = AdaptivePacing::new();
+        pacing.note_feedback(Duration::from_millis(10));
+        assert_eq!(pacing.pacing_interval(), POINTER_PACING_INTERVAL);
+        assert_eq!(pacing.redundancy_budget, 0);
+    }
+
+    #[test]
+    fn slow_cadence_feedback_never_escalates() {
+        let mut pacing = AdaptivePacing::new();
+        // Feedback well outside the storm window resets the streak each time.
+        for millis in [0_u64, 500, 1_000, 1_500, 2_000] {
+            pacing.note_feedback(Duration::from_millis(millis));
+        }
+        assert_eq!(pacing.pacing_interval(), POINTER_PACING_INTERVAL);
+        assert_eq!(pacing.redundancy_budget, 0);
+    }
+
+    #[test]
+    fn first_storm_engages_at_the_minimum_adaptation_level() {
+        let mut pacing = AdaptivePacing::new();
+        pacing.note_feedback(Duration::from_millis(5));
+        pacing.note_feedback(Duration::from_millis(10));
+        assert_eq!(pacing.redundancy_budget, REDUNDANCY_BUDGET_MIN);
+        assert_eq!(pacing.pacing_interval(), Duration::from_millis(8));
+    }
+
+    #[test]
+    fn sustained_storms_escalate_only_up_to_the_bounds() {
+        let mut pacing = AdaptivePacing::new();
+        // Storm pairs spaced past the cooldown: 0+10, 200+210, 400+410, ...
+        let mut elapsed = 0_u64;
+        for _ in 0..6 {
+            pacing.note_feedback(Duration::from_millis(elapsed));
+            elapsed += 10;
+            pacing.note_feedback(Duration::from_millis(elapsed));
+            elapsed += 190;
+        }
+        assert_eq!(pacing.redundancy_budget, REDUNDANCY_BUDGET_MAX);
+        assert_eq!(pacing.pacing_interval(), PACING_INTERVAL_MAX);
+    }
+
+    #[test]
+    fn quiet_windows_relax_stepwise_and_never_below_the_floor() {
+        let mut pacing = AdaptivePacing::new();
+        let mut elapsed = 0_u64;
+        for _ in 0..4 {
+            pacing.note_feedback(Duration::from_millis(elapsed));
+            elapsed += 10;
+            pacing.note_feedback(Duration::from_millis(elapsed));
+            elapsed += 190;
+        }
+        assert_eq!(pacing.redundancy_budget, REDUNDANCY_BUDGET_MAX);
+        assert_eq!(pacing.pacing_interval(), PACING_INTERVAL_MAX);
+
+        // Before the quiet window elapses nothing relaxes: 90 ms since the
+        // last feedback is still inside the 200 ms window, and so is 140 ms.
+        pacing.refresh(Duration::from_millis(700));
+        pacing.refresh(Duration::from_millis(750));
+        assert_eq!(pacing.redundancy_budget, REDUNDANCY_BUDGET_MAX);
+        assert_eq!(pacing.pacing_interval(), PACING_INTERVAL_MAX);
+
+        // Past the window each refresh relaxes one step, spaced by the
+        // cooldown: 16 → 8 → 4 → 2, then the floor holds.
+        pacing.refresh(Duration::from_millis(900));
+        assert_eq!(pacing.redundancy_budget, 8);
+        assert_eq!(pacing.pacing_interval(), Duration::from_millis(8));
+        pacing.refresh(Duration::from_secs(1));
+        assert_eq!(pacing.redundancy_budget, 4);
+        assert_eq!(pacing.pacing_interval(), Duration::from_millis(4));
+        pacing.refresh(Duration::from_millis(1_100));
+        assert_eq!(pacing.redundancy_budget, REDUNDANCY_BUDGET_MIN);
+        assert_eq!(pacing.pacing_interval(), PACING_INTERVAL_MIN);
+        pacing.refresh(Duration::from_millis(1_200));
+        pacing.refresh(Duration::from_millis(1_300));
+        assert_eq!(pacing.redundancy_budget, REDUNDANCY_BUDGET_MIN);
+        assert_eq!(pacing.pacing_interval(), PACING_INTERVAL_MIN);
+    }
+
+    #[test]
+    fn relaxation_never_grants_redundancy_before_engagement() {
+        let mut pacing = AdaptivePacing::new();
+        // No feedback observed at all: the no-evidence baseline holds.
+        pacing.refresh(Duration::from_secs(10));
+        assert_eq!(pacing.redundancy_budget, 0);
+        assert_eq!(pacing.pacing_interval, POINTER_PACING_INTERVAL);
+
+        // Once any feedback has been seen, a quiet window relaxes pacing
+        // toward the floor but never grants redundancy on its own.
+        pacing.note_feedback(Duration::from_millis(10_010));
+        pacing.refresh(Duration::from_millis(10_500));
+        assert_eq!(pacing.redundancy_budget, 0);
+        assert_eq!(pacing.pacing_interval, PACING_INTERVAL_MIN);
+    }
+
+    #[test]
+    fn escalation_after_a_relaxation_requires_a_fresh_storm() {
+        let mut pacing = AdaptivePacing::new();
+        pacing.note_feedback(Duration::from_millis(5));
+        pacing.note_feedback(Duration::from_millis(10));
+        assert_eq!(pacing.pacing_interval(), Duration::from_millis(8));
+
+        // One feedback after the quiet gap is not enough to re-escalate.
+        pacing.note_feedback(Duration::from_millis(500));
+        assert_eq!(pacing.pacing_interval(), Duration::from_millis(8));
+        assert_eq!(pacing.redundancy_budget, REDUNDANCY_BUDGET_MIN);
+
+        // A second feedback inside the storm window escalates one level.
+        pacing.note_feedback(Duration::from_millis(520));
+        assert_eq!(pacing.redundancy_budget, 4);
+        assert_eq!(pacing.pacing_interval(), Duration::from_millis(16));
+    }
+
+    #[test]
+    fn spend_redundancy_counts_down_the_grant() {
+        let mut pacing = AdaptivePacing::new();
+        assert!(!pacing.spend_redundancy());
+        pacing.note_feedback(Duration::from_millis(5));
+        pacing.note_feedback(Duration::from_millis(10));
+        assert!(pacing.spend_redundancy());
+        assert!(pacing.spend_redundancy());
+        assert!(!pacing.spend_redundancy());
+        assert_eq!(pacing.redundancy_budget, 0);
+    }
+
+    #[test]
+    fn adaptive_bounds_hold_under_arbitrary_event_sequences() {
+        // Deterministic LCG over strictly increasing timestamps: every event
+        // is a random feedback or quiet tick. The bounds must hold for any
+        // pattern, so oscillation cannot push a parameter out of range.
+        let mut state = 0x0DDB_1A5E_5BAD_5EED_u64;
+        let mut next = move || {
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            state
+        };
+        let mut pacing = AdaptivePacing::new();
+        let mut elapsed = Duration::ZERO;
+        for _ in 0..20_000 {
+            elapsed += Duration::from_millis((next() % 40) + 1);
+            if next() % 2 == 0 {
+                pacing.note_feedback(elapsed);
+            } else {
+                pacing.refresh(elapsed);
+            }
+            assert!(pacing.redundancy_budget <= REDUNDANCY_BUDGET_MAX);
+            assert!(
+                pacing.redundancy_budget == 0 || pacing.redundancy_budget >= REDUNDANCY_BUDGET_MIN
+            );
+            assert!(pacing.pacing_interval() >= PACING_INTERVAL_MIN);
+            assert!(pacing.pacing_interval() <= PACING_INTERVAL_MAX);
+        }
+    }
+
+    #[tokio::test]
+    async fn receiver_gap_reports_escalate_sender_pacing_and_redundancy() {
+        let host_a = WireHostId([27; 16]);
+        let host_b = WireHostId([28; 16]);
+        let (mut a, mut b) = bound_pair(
+            "127.0.0.1:24834",
+            "127.0.0.1:24835",
+            [20; 32],
+            host_a,
+            host_b,
+        )
+        .await;
+        a.send_probe().await.unwrap();
+        b.send_probe().await.unwrap();
+        recv(&mut a).await;
+        recv(&mut b).await;
+
+        // Establish b's receive baseline with one normally delivered move.
+        let movement = pointer(host_a);
+        assert!(a.try_send_pointer(&movement).unwrap());
+        recv(&mut b).await;
+
+        // Two separated single-datagram drops each make b's next received
+        // sequence jump, so b emits two gap reports the sender drains
+        // back-to-back: a storm, one bounded escalation.
+        let mut discarded = [0_u8; MAX_DATAGRAM];
+        for _ in 0..2 {
+            assert!(a.try_send_pointer(&movement).unwrap());
+            a.flush_pending().unwrap();
+            recv_raw(&mut b, &mut discarded).await;
+            assert!(a.try_send_pointer(&movement).unwrap());
+            a.flush_pending().unwrap();
+            assert!(recv(&mut b).await.gaps > 0);
+        }
+        recv(&mut a).await;
+        recv(&mut a).await;
+
+        assert_eq!(a.pacing.redundancy_budget, REDUNDANCY_BUDGET_MIN);
+        assert_eq!(a.pacing.pacing_interval(), Duration::from_millis(8));
+
+        // The escalation's redundant copies are actually spent on the wire.
+        assert!(a.try_send_pointer(&movement).unwrap());
+        let redundant = a.flush_pending().unwrap();
+        assert!(redundant >= 1);
+    }
+
+    // --- Reliable reorder buffer ---------------------------------------------
+
+    #[test]
+    fn reorder_buffer_delivers_in_order_despite_reordering() {
+        let first = scroll(WireHostId([1; 16]), 1);
+        let second = scroll(WireHostId([1; 16]), 2);
+        let mut buffer = ReliableReorderBuffer::new();
+        let (drained, acknowledged) = buffer.insert(1, second.clone()).unwrap();
+        assert!(drained.is_empty());
+        // Nothing contiguous has been delivered yet, so there is no
+        // cumulative acknowledgement to report.
+        assert_eq!(acknowledged, None);
+        let (drained, acknowledged) = buffer.insert(0, first.clone()).unwrap();
+        assert_eq!(drained, vec![first, second]);
+        assert_eq!(acknowledged, Some(1));
+    }
+
+    #[test]
+    fn reorder_buffer_ignores_unreachably_far_sequences() {
+        let mut buffer = ReliableReorderBuffer::new();
+        assert!(buffer
+            .insert(u64::MAX - 3, scroll(WireHostId([1; 16]), 5))
+            .is_none());
+        let (drained, acknowledged) = buffer.insert(0, scroll(WireHostId([1; 16]), 6)).unwrap();
+        assert_eq!(drained.len(), 1);
+        assert_eq!(acknowledged, Some(0));
+    }
+
+    #[test]
+    fn reorder_buffer_withholds_acknowledgement_before_any_delivery() {
+        let mut buffer = ReliableReorderBuffer::new();
+        let (drained, acknowledged) = buffer.insert(3, scroll(WireHostId([1; 16]), 7)).unwrap();
+        assert!(drained.is_empty());
+        assert_eq!(acknowledged, None);
+    }
+
+    // --- Plaintext codec invariants (mirrors the fuzz targets) ---------------
+
+    #[test]
+    fn parse_pointer_plaintext_round_trips_encoded_fields() {
+        let device = WireDeviceId([0x5a; 16]);
+        let payload = encode_pointer_plaintext(0x01, device, 123_456, (12.5, -7.25));
+        assert_eq!(
+            parse_pointer_datagram_plaintext(&payload),
+            PointerDatagramPlaintext::Pointer {
+                flags: 0x01,
+                device,
+                timestamp_ns: 123_456,
+                total_x: 12.5,
+                total_y: -7.25,
+            }
+        );
+    }
+
+    #[test]
+    fn parse_pointer_plaintext_never_panics_on_arbitrary_input() {
+        // Deterministic stand-in for the fuzz_datagram_plaintext target so
+        // the no-panic and round-trip invariants run even where libFuzzer
+        // cannot.
+        let mut state = 0x0DDB_1A5E_5BAD_5EED_u64;
+        let mut next = move || {
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            state
+        };
+        let mut bytes = [0_u8; 256];
+        for _ in 0..100_000 {
+            for byte in &mut bytes {
+                *byte = u8::try_from(next() % 256).unwrap();
+            }
+            let length = usize::try_from(next() % 200).unwrap();
+            let parsed = parse_pointer_datagram_plaintext(&bytes[..length]);
+            if let PointerDatagramPlaintext::Pointer {
+                flags,
+                device,
+                timestamp_ns,
+                total_x,
+                total_y,
+            } = &parsed
+            {
+                let encoded =
+                    encode_pointer_plaintext(*flags, *device, *timestamp_ns, (*total_x, *total_y));
+                assert_eq!(parse_pointer_datagram_plaintext(&encoded), parsed);
+            }
+        }
     }
 }
