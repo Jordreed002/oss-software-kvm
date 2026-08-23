@@ -4,6 +4,7 @@
 //! daemon core is deterministic and synchronous so a platform callback can
 //! decide whether to suppress an event without waiting for UI or disk I/O.
 
+pub mod control_service;
 mod core;
 mod device_inventory;
 #[cfg(feature = "diagnostics")]
