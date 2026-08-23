@@ -334,6 +334,62 @@ impl fmt::Debug for InputEventV1 {
     }
 }
 
+/// A cross-platform key intent, owned by the wire layer.
+///
+/// This deliberately mirrors `kvm-input`'s `SemanticCommand` instead of
+/// depending on it: `kvm-protocol` is a transport DTO crate and must stay
+/// independent of the domain model, so the daemon converts deliberately at
+/// its boundary. `Other` reserves the discriminant space exactly like
+/// [`WirePointerButton::Other`]: a newer build may send an intent this build
+/// has no binding for, and this build then falls back to the frame's
+/// originating physical event instead of guessing.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
+#[non_exhaustive]
+#[serde(rename_all = "snake_case")]
+pub enum WireSemanticCommand {
+    Copy,
+    Paste,
+    Cut,
+    Undo,
+    Redo,
+    SelectAll,
+    AppSwitch,
+    /// An intent this build does not name. The value is the sender's opaque
+    /// command discriminant; receivers must not interpret it.
+    Other(u16),
+}
+
+/// Protocol-v4 semantic input event: one resolved key intent plus the exact
+/// originating physical key press.
+///
+/// The source host resolves its own physical chord into `command` (against its
+/// own platform bindings) and carries the originating press in `physical` so a
+/// destination that cannot bind the intent — an older build, or an intent it
+/// has no native binding for — can fall back to injecting the physical press
+/// exactly as in physical mode. `physical` must be a key press
+/// (`Key { state: Down }`), which is the only transition a chord can resolve
+/// on.
+#[derive(Clone, Deserialize, PartialEq, Serialize)]
+pub struct SemanticInputV1 {
+    pub sequence: u64,
+    pub timestamp_ns: u64,
+    pub source_host: WireHostId,
+    pub source_device: WireDeviceId,
+    pub command: WireSemanticCommand,
+    pub physical: WireInputPayloadV1,
+}
+
+impl fmt::Debug for SemanticInputV1 {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SemanticInputV1")
+            .field("command", &self.command)
+            .field("physical", &self.physical)
+            .field("source", &"[REDACTED]")
+            .finish_non_exhaustive()
+    }
+}
+
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum WireEdge {

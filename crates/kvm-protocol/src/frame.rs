@@ -4,14 +4,20 @@ pub const FRAME_MAGIC: [u8; 4] = *b"SKVM";
 pub const PROTOCOL_VERSION_V1: u16 = 1;
 pub const PROTOCOL_VERSION_V2: u16 = 2;
 pub const PROTOCOL_VERSION_V3: u16 = 3;
+pub const PROTOCOL_VERSION_V4: u16 = 4;
 pub const MIN_SUPPORTED_PROTOCOL_VERSION: u16 = PROTOCOL_VERSION_V1;
-pub const CURRENT_PROTOCOL_VERSION: u16 = PROTOCOL_VERSION_V3;
+pub const CURRENT_PROTOCOL_VERSION: u16 = PROTOCOL_VERSION_V4;
 /// First protocol version which normatively requires an application-level
 /// applied-release acknowledgement before a held route may move to another
 /// peer.
 pub const RELEASE_PROOF_PROTOCOL_VERSION: u16 = PROTOCOL_VERSION_V2;
 /// First version that can negotiate the exporter-bound UDP pointer fast path.
 pub const POINTER_DATAGRAM_PROTOCOL_VERSION: u16 = PROTOCOL_VERSION_V3;
+/// First version whose input vocabulary can carry a semantic key intent
+/// (`SemanticInputV1`). Sessions negotiated below it keep the exact physical
+/// input passthrough: a source may not enqueue a semantic frame, and the
+/// framing layer rejects the message type in older versions anyway.
+pub const SEMANTIC_INPUT_PROTOCOL_VERSION: u16 = PROTOCOL_VERSION_V4;
 /// Compatibility version used by the original framing helpers.
 ///
 /// Initial Hello frames remain v1 so peers can advertise and authenticate a

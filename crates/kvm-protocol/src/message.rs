@@ -2,13 +2,13 @@ use crate::{
     AuthenticateV1, ClipboardV1, DeviceAddedV1, DeviceRemovedV1, DeviceSnapshotV1,
     DisplaySnapshotV1, DisplayUpdatedV1, HelloV1, InputEventV1, PingV1, PointerEnterV1,
     PointerLeaveV1, PointerTransitionAckV1, PointerTransitionCommitV1, PongV1, ProtocolError,
-    ReleaseAppliedAckV2, ReleaseInputV1, ReleaseInputV2, ValidationError, WireDisplayV1,
-    WireInputDeviceV1, WireInputPayloadV1, CURRENT_PROTOCOL_VERSION, MAX_AUTH_BYTES,
-    MAX_CLIPBOARD_TEXT_BYTES, MAX_DEVICE_NAME_BYTES, MAX_DISPLAY_LOGICAL_DIMENSION,
+    ReleaseAppliedAckV2, ReleaseInputV1, ReleaseInputV2, SemanticInputV1, ValidationError,
+    WireDisplayV1, WireInputDeviceV1, WireInputPayloadV1, WireKeyState, CURRENT_PROTOCOL_VERSION,
+    MAX_AUTH_BYTES, MAX_CLIPBOARD_TEXT_BYTES, MAX_DEVICE_NAME_BYTES, MAX_DISPLAY_LOGICAL_DIMENSION,
     MAX_DISPLAY_NAME_BYTES, MAX_DISPLAY_NATIVE_COORDINATE_ABS, MAX_DISPLAY_PHYSICAL_DIMENSION,
     MAX_DISPLAY_REFRESH_RATE_HZ, MAX_DISPLAY_SCALE_FACTOR, MAX_HOST_NAME_BYTES,
     MAX_RELEASE_BUTTONS, MAX_RELEASE_CONTROLS, MAX_RELEASE_KEYS, MAX_SNAPSHOT_ITEMS,
-    MIN_SUPPORTED_PROTOCOL_VERSION, PROTOCOL_VERSION_V2,
+    MIN_SUPPORTED_PROTOCOL_VERSION, PROTOCOL_VERSION_V2, SEMANTIC_INPUT_PROTOCOL_VERSION,
 };
 use serde::de::DeserializeOwned;
 use std::collections::{BTreeSet, HashSet};
@@ -60,6 +60,7 @@ pub enum MessageType {
     PointerLeave = 32,
     PointerTransitionAck = 33,
     PointerTransitionCommit = 34,
+    SemanticInput = 35,
     Clipboard = 40,
     Ping = 50,
     Pong = 51,
@@ -85,6 +86,7 @@ impl TryFrom<u16> for MessageType {
             32 => Ok(Self::PointerLeave),
             33 => Ok(Self::PointerTransitionAck),
             34 => Ok(Self::PointerTransitionCommit),
+            35 => Ok(Self::SemanticInput),
             40 => Ok(Self::Clipboard),
             50 => Ok(Self::Ping),
             51 => Ok(Self::Pong),
@@ -106,6 +108,7 @@ pub enum WireMessage {
     DisplaySnapshot(DisplaySnapshotV1),
     DisplayUpdated(DisplayUpdatedV1),
     Input(InputEventV1),
+    SemanticInput(SemanticInputV1),
     PointerEnter(PointerEnterV1),
     PointerLeave(PointerLeaveV1),
     PointerTransitionAck(PointerTransitionAckV1),
@@ -140,6 +143,7 @@ impl WireMessage {
             Self::DisplaySnapshot(_) => MessageType::DisplaySnapshot,
             Self::DisplayUpdated(_) => MessageType::DisplayUpdated,
             Self::Input(_) => MessageType::Input,
+            Self::SemanticInput(_) => MessageType::SemanticInput,
             Self::PointerEnter(_) => MessageType::PointerEnter,
             Self::PointerLeave(_) => MessageType::PointerLeave,
             Self::PointerTransitionAck(_) => MessageType::PointerTransitionAck,
@@ -213,6 +217,22 @@ impl WireMessage {
                 value.validate()?;
             }
             Self::Input(value) => validate_input(value, &invalid)?,
+            Self::SemanticInput(value) => {
+                // The physical rider is the deterministic fallback for peers
+                // which cannot bind the intent, so it must be exactly the
+                // transition a chord resolves on: a key press.
+                if !matches!(
+                    value.physical,
+                    WireInputPayloadV1::Key {
+                        state: WireKeyState::Down,
+                        ..
+                    }
+                ) {
+                    return Err(invalid(
+                        "semantic input must carry its originating key press".to_owned(),
+                    ));
+                }
+            }
             Self::PointerEnter(value) => {
                 normalized(value.normalized_position, &invalid)?;
                 if value.source_host == value.destination_host {
@@ -279,6 +299,7 @@ impl WireMessage {
             Self::DisplaySnapshot(value) => append_payload(value, buf),
             Self::DisplayUpdated(value) => append_payload(value, buf),
             Self::Input(value) => append_payload(value, buf),
+            Self::SemanticInput(value) => append_payload(value, buf),
             Self::PointerEnter(value) => append_payload(value, buf),
             Self::PointerLeave(value) => append_payload(value, buf),
             Self::PointerTransitionAck(value) => append_payload(value, buf),
@@ -328,6 +349,7 @@ impl WireMessage {
             MessageType::DisplaySnapshot => Self::DisplaySnapshot(decode(message_type, bytes)?),
             MessageType::DisplayUpdated => Self::DisplayUpdated(decode(message_type, bytes)?),
             MessageType::Input => Self::Input(decode(message_type, bytes)?),
+            MessageType::SemanticInput => Self::SemanticInput(decode(message_type, bytes)?),
             MessageType::PointerEnter => Self::PointerEnter(decode(message_type, bytes)?),
             MessageType::PointerLeave => Self::PointerLeave(decode(message_type, bytes)?),
             MessageType::PointerTransitionAck => {
@@ -354,6 +376,7 @@ impl MessageType {
     pub const fn minimum_protocol_version(self) -> u16 {
         match self {
             Self::ReleaseInputV2 | Self::ReleaseAppliedAckV2 => PROTOCOL_VERSION_V2,
+            Self::SemanticInput => SEMANTIC_INPUT_PROTOCOL_VERSION,
             Self::Hello
             | Self::Authenticate
             | Self::DeviceSnapshot
@@ -979,6 +1002,23 @@ mod tests {
         }
     }
 
+    fn semantic_input() -> SemanticInputV1 {
+        SemanticInputV1 {
+            sequence: 42,
+            timestamp_ns: 7_000,
+            source_host: HOST_A,
+            source_device: DEVICE,
+            command: crate::WireSemanticCommand::Copy,
+            physical: WireInputPayloadV1::Key {
+                code: WireKeyCode {
+                    usage_page: 0x07,
+                    usage: 0x06,
+                },
+                state: crate::WireKeyState::Down,
+            },
+        }
+    }
+
     #[allow(clippy::too_many_lines)]
     fn messages() -> Vec<WireMessage> {
         let input = InputEventV1 {
@@ -1135,6 +1175,140 @@ mod tests {
                 })
             ));
         }
+    }
+
+    #[test]
+    fn semantic_input_requires_and_round_trips_in_v4_framing() {
+        // Mirrors the v2 release proof gating: the semantic input vocabulary is
+        // unavailable below its introducing version, so older framing rejects
+        // the message type both on encode and on decode, and a v4 frame is
+        // refused by every older exact-version reader.
+        let message = WireMessage::SemanticInput(semantic_input());
+        assert_eq!(
+            message.minimum_protocol_version(),
+            SEMANTIC_INPUT_PROTOCOL_VERSION
+        );
+        assert_eq!(SEMANTIC_INPUT_PROTOCOL_VERSION, CURRENT_PROTOCOL_VERSION);
+        for version in [
+            PROTOCOL_VERSION_V1,
+            PROTOCOL_VERSION_V2,
+            crate::PROTOCOL_VERSION_V3,
+        ] {
+            assert!(matches!(
+                encode_frame_for_version(&message, version),
+                Err(ProtocolError::MessageVersionMismatch {
+                    message_type: MessageType::SemanticInput,
+                    version: rejected,
+                    ..
+                }) if rejected == version
+            ));
+        }
+
+        let encoded = encode_frame_for_version(&message, SEMANTIC_INPUT_PROTOCOL_VERSION).unwrap();
+        assert_eq!(
+            FrameHeader::decode_supported(&encoded)
+                .unwrap()
+                .protocol_version,
+            SEMANTIC_INPUT_PROTOCOL_VERSION
+        );
+        // The v1-only bootstrap header parser rejects the newer frame before
+        // any payload is buffered.
+        assert!(matches!(
+            FrameHeader::decode(&encoded),
+            Err(ProtocolError::UnsupportedVersion { .. })
+        ));
+        assert_eq!(
+            decode_frame_for_version(&encoded, SEMANTIC_INPUT_PROTOCOL_VERSION).unwrap(),
+            message
+        );
+        for version in [
+            PROTOCOL_VERSION_V1,
+            PROTOCOL_VERSION_V2,
+            crate::PROTOCOL_VERSION_V3,
+        ] {
+            assert!(matches!(
+                decode_frame_for_version(&encoded, version),
+                Err(ProtocolError::UnsupportedVersion { .. })
+            ));
+        }
+
+        // A semantic header stamped into an older frame is rejected from the
+        // fixed header alone, before payload buffering.
+        let mismatched = FrameHeader {
+            protocol_version: PROTOCOL_VERSION_V1,
+            message_type: MessageType::SemanticInput,
+            payload_length: 0,
+        }
+        .encode();
+        assert_eq!(
+            FrameHeader::decode_supported(&mismatched).unwrap_err(),
+            ProtocolError::MessageVersionMismatch {
+                message_type: MessageType::SemanticInput,
+                version: PROTOCOL_VERSION_V1,
+            }
+        );
+    }
+
+    #[test]
+    fn semantic_input_validation_requires_an_originating_key_press() {
+        let assert_invalid = |mut frame: SemanticInputV1| {
+            frame.physical = match frame.physical {
+                WireInputPayloadV1::Key { code, .. } => WireInputPayloadV1::Key {
+                    code,
+                    state: crate::WireKeyState::Up,
+                },
+                other => other,
+            };
+            assert!(WireMessage::SemanticInput(frame.clone())
+                .validate()
+                .is_err());
+            frame.physical = WireInputPayloadV1::PointerMove { dx: 1.0, dy: 2.0 };
+            assert!(WireMessage::SemanticInput(frame).validate().is_err());
+        };
+
+        // The named intents and a reserved unknown intent are all valid wire
+        // values; only the physical rider's shape is constrained.
+        let mut unknown = semantic_input();
+        unknown.command = crate::WireSemanticCommand::Other(41);
+        WireMessage::SemanticInput(unknown.clone())
+            .validate()
+            .unwrap();
+        assert_invalid(unknown);
+        let mut repeat = semantic_input();
+        repeat.physical = WireInputPayloadV1::Key {
+            code: WireKeyCode {
+                usage_page: 0x07,
+                usage: 0x06,
+            },
+            state: crate::WireKeyState::Repeat,
+        };
+        assert!(WireMessage::SemanticInput(repeat).validate().is_err());
+    }
+
+    #[test]
+    fn semantic_input_diagnostics_redact_sequence_source_and_physical_payload() {
+        let mut marked = semantic_input();
+        marked.sequence = 8_675_309;
+        marked.source_host = WireHostId([211; 16]);
+        marked.source_device = WireDeviceId([223; 16]);
+        marked.physical = WireInputPayloadV1::Key {
+            code: WireKeyCode {
+                usage_page: 53_191,
+                usage: 54_321,
+            },
+            state: crate::WireKeyState::Down,
+        };
+
+        let debug = format!("{marked:?}");
+        assert!(debug.contains("SemanticInputV1"));
+        assert!(debug.contains("Copy"));
+        assert!(debug.contains("[REDACTED]"));
+        for redacted in ["8675309", "211, 211", "223, 223", "53191", "54321", "Down"] {
+            assert!(!debug.contains(redacted));
+        }
+        let message_debug = format!("{:?}", WireMessage::SemanticInput(marked));
+        assert!(message_debug.contains("[REDACTED]"));
+        assert!(!message_debug.contains("8675309"));
     }
 
     #[test]
