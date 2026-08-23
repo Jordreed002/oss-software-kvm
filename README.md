@@ -54,6 +54,34 @@ encrypted over the local network.
 └── .spec/                  # Product, technical, and milestone specifications
 ```
 
+### Architecture diagram
+
+Two daemons, one on each host, own capture, routing, suppression, and injection. The Link
+Console is an optional local IPC client and is never part of the safety path.
+
+```mermaid
+flowchart LR
+    subgraph hostA["Host A"]
+        panelA["Link Console (Tauri)"]
+        daemonA["Daemon — capture · routing · injection"]
+        panelA <-. "local IPC" .-> daemonA
+    end
+    subgraph hostB["Host B"]
+        panelB["Link Console (Tauri)"]
+        daemonB["Daemon — capture · routing · injection"]
+        panelB <-. "local IPC" .-> daemonB
+    end
+    daemonA <-- "mutual TLS 1.3 · TCP 24800<br/>(authoritative, ordered)" --> daemonB
+    daemonA <-- "authenticated UDP 24802<br/>pointer datagrams + UDP shadow" --> daemonB
+    failsafe(["Failsafe: Ctrl+Alt+Shift+Backspace<br/>releases keys, routing stays local"])
+    daemonA --- failsafe
+    daemonB --- failsafe
+```
+
+Both daemons are built from the same core crates (protocol, router, topology, network,
+security, clipboard, diagnostics). See [docs/architecture.md](docs/architecture.md) for
+crate boundaries, the input path, and the failure invariant.
+
 ## Status
 
 The initial engineering foundation is implemented and covered by automated tests. It includes the
