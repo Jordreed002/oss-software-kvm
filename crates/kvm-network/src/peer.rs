@@ -4152,9 +4152,7 @@ mod tests {
             stream: session_stream,
             identity: identity(&remote_hello),
         };
-        let admission = TestAdmission {
-            hello: local_hello,
-        };
+        let admission = TestAdmission { hello: local_hello };
         let config = PersistentPeerConfig {
             heartbeat: HeartbeatConfig {
                 interval: Duration::from_millis(10),

@@ -125,3 +125,70 @@ What landed, in recommendation-1 terms:
   wrong-version frame rejection before payload buffering, connection-bound
   hold/release, clean shutdown and drop closure, stale vs live endpoint
   rebinding. Every await is `tokio::time::timeout`-wrapped.
+
+## Final closure 2026-08-23: daemon service, runtime wiring, and panel client landed
+
+§31 is no longer orphaned end to end: protocol → OS transport → daemon-side
+service → runtime wiring → panel client all exist and are covered by tests.
+
+What landed:
+
+- `crates/kvm-daemon/src/control_service.rs`: `ControlService` over
+  `LocalControlServer`. Read-only commands are answered from a bounded
+  `ControlViewSource` snapshot; the mutating commands travel through a
+  bounded mpsc queue (`CONTROL_COMMAND_QUEUE_CAPACITY = 8`) to the owner
+  loop; §31 events fan out from a bounded broadcast
+  (`CONTROL_EVENT_CHANNEL_CAPACITY = 16`) to every connected panel; the
+  service never locks the capture path. Lists and names are hard-capped to
+  the protocol bounds before encoding. `poll_default_control_status` gives
+  local consumers a bounded GetStatus poll with "unreachable" mapping.
+- `crates/kvm-runtime/src/active.rs`: `ControlPlane` starts the service
+  alongside the transport loop (best-effort — a bind failure logs and the
+  runtime continues, mirroring the diagnostics-server pattern), refreshes
+  the view on the existing ~8 ms service tick under the same manager lock
+  the diagnostics snapshot already takes, drains forwarded commands there,
+  and publishes `PeerChanged` / `ActiveHostChanged` on state transitions.
+  Display inventory is seeded at composition and refreshed on every hotplug
+  pass; `TriggerFailsafe` trips the documented
+  `kvm_daemon::failsafe_hook::trip()` path plus an immediate manager gate.
+- `apps/control-panel/src-tauri/src/control.rs` + `src/bridge.ts` +
+  `src/types.ts` + `src/App.tsx`: the `control_status` Tauri command polls
+  the daemon over the real UDS/pipe transport with short bounded waits and
+  maps transport absence to a friendly "daemon not running" state; the
+  Ready screen gains a minimal read-only status card (daemon link, peer
+  connection + RTT, KVM routing gate, input destination).
+
+### §31 command surface: live vs deferred
+
+Live (served by the daemon, answered honestly):
+
+| Command | Behaviour |
+|---|---|
+| `GetStatus` | Live status from the manager routing snapshot + owner-loop KVM gate; `clipboard_enabled` honestly `false` (no clipboard path exists); RTT `None` (telemetry lives on the diagnostics channel). |
+| `GetPeers` | One entry for the selected peer (identity retained at composition), state from the routing table with a count-derived fallback. |
+| `GetDevices` | Live device-inventory snapshot; routes report the default follow-active-host policy (the inventory snapshot does not carry per-device overrides). |
+| `GetDisplays` | Runtime-retained local display inventory (seeded at composition, refreshed on every hotplug pass). |
+| `GetTopology` | Configured topology edges, mapped bidirectionally per link (static in this alpha). |
+| `TriggerFailsafe` | Enqueued; executed on the owner tick via `failsafe_hook::trip()` + immediate `native_capture_discontinued` gate (fail-open). |
+| `EnableKvm` / `DisableKvm` | Enqueued; executed on the owner tick via `rearm_native_capture(Running)` / `native_capture_discontinued`. |
+
+Events live (server-initiated): `PeerChanged`, `ActiveHostChanged`.
+
+Deferred (answered with the protocol's existing `Error { Internal }`
+response — no new wire types; revisit as the matching subsystems land):
+
+- `SetDeviceRoute`, `SetTopology` — the revisioned daemon update paths
+  exist, but command ingress from the panel is not wired to them yet.
+- `EnableClipboard`, `DisableClipboard`, `SetAudioRoute` — no clipboard or
+  audio-routing subsystem exists to command.
+- Events `DeviceChanged`, `DisplayChanged`, `LatencyChanged`,
+  `ErrorOccurred` — no emitters yet (devices/displays refresh by poll;
+  RTT is not folded into the control status).
+
+Known honest limits of the live surface: `round_trip_time_ms` is always
+`None`; per-device route overrides are not readable from the inventory
+snapshot; `GetDisplays` reports the locally observed inventory only.
+
+Transport-level guarantees (frame caps, version rejection, connection
+bounds, same-user endpoint permissions) were closed by the 2026-08-23
+transport update above and are reused unchanged.
