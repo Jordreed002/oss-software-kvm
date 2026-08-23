@@ -11,6 +11,7 @@
 //! correlated with a suppressible `CGEvent` without guessing.
 
 mod capture;
+mod hotplug;
 mod identity;
 mod keymap;
 
@@ -20,6 +21,10 @@ mod native;
 mod unsupported;
 
 pub use capture::classify_quartz_user_data;
+pub use hotplug::{
+    HotplugStatistics, InventoryChange, MacHotplugWatcher, HOTPLUG_COALESCE_WINDOW,
+    HOTPLUG_EVENT_CAPACITY,
+};
 pub use identity::{derive_device_id, DeviceIdentityMaterial, IdentityStability};
 pub use keymap::mac_virtual_key;
 
@@ -155,4 +160,14 @@ pub enum MacBackendError {
     CaptureTapTerminated,
     #[error("macOS input capture {0} did not stop before the shutdown deadline")]
     CaptureStopTimedOut(&'static str),
+    #[error("a macOS hotplug watcher is already running in this process")]
+    HotplugAlreadyRunning,
+    #[error("macOS hotplug watcher thread failed during startup")]
+    HotplugStartupTerminated,
+    #[error("macOS hotplug watcher did not become ready before the startup deadline")]
+    HotplugStartupTimedOut,
+    #[error("macOS hotplug watcher did not stop before the shutdown deadline")]
+    HotplugStopTimedOut,
+    #[error("macOS hotplug watcher thread failed: {0}")]
+    HotplugRuntime(String),
 }

@@ -2639,14 +2639,17 @@ fn display_from_monitor(
     })
 }
 
-fn last_api_error(operation: &'static str) -> WindowsBackendError {
+pub(crate) fn last_api_error(operation: &'static str) -> WindowsBackendError {
     WindowsBackendError::WindowsApi {
         operation,
         source: std::io::Error::last_os_error(),
     }
 }
 
-fn binding_error(operation: &'static str, error: &windows::core::Error) -> WindowsBackendError {
+pub(crate) fn binding_error(
+    operation: &'static str,
+    error: &windows::core::Error,
+) -> WindowsBackendError {
     WindowsBackendError::WindowsApi {
         operation,
         source: std::io::Error::other(error.to_string()),

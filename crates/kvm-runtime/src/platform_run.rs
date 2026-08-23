@@ -2,10 +2,15 @@
 
 use std::fmt;
 use std::path::Path;
+use std::sync::Arc;
 
 #[cfg(any(target_os = "macos", windows))]
 use kvm_daemon::{DisplayBackend, InputCaptureBackend};
+#[cfg(any(target_os = "macos", windows))]
+use kvm_types::{Display, HostId, InputDevice};
 
+#[cfg(any(target_os = "macos", windows))]
+use crate::active::{developer_event, LocalInventoryHint, LocalInventoryWatch};
 #[cfg(any(target_os = "macos", windows))]
 use crate::prepare;
 #[cfg(any(target_os = "macos", windows))]
@@ -119,6 +124,7 @@ async fn run_windows(
     let displays = WindowsDisplayBackend::new(local_host)
         .enumerate_displays()
         .map_err(|_| NativeRuntimeError::new(NativeRuntimeErrorKind::Inventory))?;
+    let watch = windows_local_inventory_watch(local_host);
     let runtime = prepared
         .compose(output, displays, devices)
         .map_err(|_| NativeRuntimeError::new(NativeRuntimeErrorKind::Composition))?;
@@ -127,6 +133,7 @@ async fn run_windows(
             input,
             shutdown,
             Some(RuntimeStatusPublisher::for_profile(profile_path)),
+            watch,
         )
         .await
         .map_err(native_service_error)
@@ -154,6 +161,7 @@ async fn run_macos(
     let displays = MacDisplayBackend::new(local_host)
         .enumerate_displays()
         .map_err(|_| NativeRuntimeError::new(NativeRuntimeErrorKind::Inventory))?;
+    let watch = macos_local_inventory_watch(local_host);
     let runtime = prepared
         .compose(output, displays, devices)
         .map_err(|_| NativeRuntimeError::new(NativeRuntimeErrorKind::Composition))?;
@@ -162,9 +170,90 @@ async fn run_macos(
             input,
             shutdown,
             Some(RuntimeStatusPublisher::for_profile(profile_path)),
+            watch,
         )
         .await
         .map_err(native_service_error)
+}
+
+/// Builds the macOS hotplug watch or degrades to the boot-time snapshot.
+///
+/// The watcher is a monitoring capability, not an authority gate: when it
+/// cannot start, the runtime keeps running with the pre-remediation behavior
+/// (one enumeration at startup) rather than failing the whole service.
+#[cfg(target_os = "macos")]
+fn macos_local_inventory_watch(local_host: HostId) -> Option<LocalInventoryWatch> {
+    use kvm_macos::{MacDisplayBackend, MacHotplugWatcher, MacInputBackend};
+
+    let Ok(watcher) = MacHotplugWatcher::start() else {
+        developer_event("hotplug=watch_unavailable platform:macos");
+        return None;
+    };
+    // The refresh closures mirror the startup enumeration exactly (stateless
+    // backends; the whole-host device inventory matches the capture mode the
+    // runtime composes) so a refreshed snapshot is comparable to the initial
+    // one.
+    let refresh_displays: Arc<dyn Fn() -> Option<Vec<Display>> + Send + Sync> =
+        Arc::new(move || MacDisplayBackend::new(local_host).enumerate_displays().ok());
+    let refresh_devices: Arc<dyn Fn() -> Option<Vec<InputDevice>> + Send + Sync> =
+        Arc::new(move || {
+            MacInputBackend::new_whole_host_alpha(local_host)
+                .enumerate_devices()
+                .ok()
+        });
+    Some(LocalInventoryWatch::new(
+        Box::new(move || watcher.poll().map(mac_inventory_hint)),
+        refresh_displays,
+        refresh_devices,
+    ))
+}
+
+#[cfg(target_os = "macos")]
+fn mac_inventory_hint(change: kvm_macos::InventoryChange) -> LocalInventoryHint {
+    match change {
+        kvm_macos::InventoryChange::DisplayChanged => LocalInventoryHint::DisplaysChanged,
+        kvm_macos::InventoryChange::DeviceAdded | kvm_macos::InventoryChange::DeviceRemoved => {
+            LocalInventoryHint::DevicesChanged
+        }
+    }
+}
+
+/// Builds the Windows hotplug watch or degrades to the boot-time snapshot.
+#[cfg(windows)]
+fn windows_local_inventory_watch(local_host: HostId) -> Option<LocalInventoryWatch> {
+    use kvm_windows::{WindowsDisplayBackend, WindowsHotplugWatcher, WindowsInputBackend};
+
+    let Ok(watcher) = WindowsHotplugWatcher::start() else {
+        developer_event("hotplug=watch_unavailable platform:windows");
+        return None;
+    };
+    let refresh_displays: Arc<dyn Fn() -> Option<Vec<Display>> + Send + Sync> =
+        Arc::new(move || {
+            WindowsDisplayBackend::new(local_host)
+                .enumerate_displays()
+                .ok()
+        });
+    let refresh_devices: Arc<dyn Fn() -> Option<Vec<InputDevice>> + Send + Sync> =
+        Arc::new(move || {
+            WindowsInputBackend::new_whole_host_alpha(local_host)
+                .enumerate_devices()
+                .ok()
+        });
+    Some(LocalInventoryWatch::new(
+        Box::new(move || watcher.poll().map(windows_inventory_hint)),
+        refresh_displays,
+        refresh_devices,
+    ))
+}
+
+#[cfg(windows)]
+fn windows_inventory_hint(change: kvm_windows::InventoryChange) -> LocalInventoryHint {
+    match change {
+        kvm_windows::InventoryChange::DisplayChanged => LocalInventoryHint::DisplaysChanged,
+        kvm_windows::InventoryChange::DeviceAdded | kvm_windows::InventoryChange::DeviceRemoved => {
+            LocalInventoryHint::DevicesChanged
+        }
+    }
 }
 
 #[cfg(any(target_os = "macos", windows))]

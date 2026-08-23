@@ -47,6 +47,75 @@ const CAPTURE_POLL_TICK: Duration = Duration::from_millis(4);
 const TRANSPORT_SERVICE_TICK: Duration = Duration::from_millis(8);
 const SHUTDOWN_SETTLE_TIMEOUT: Duration = Duration::from_secs(3);
 
+/// Coarse local inventory-change category surfaced by a platform hotplug
+/// watcher.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum LocalInventoryHint {
+    /// The local display topology changed; re-enumerate displays.
+    DisplaysChanged,
+    /// The local input-device set changed; re-enumerate devices.
+    DevicesChanged,
+}
+
+/// Platform-supplied hotplug watch feeding the runtime's local
+/// inventory-refresh path.
+///
+/// `poll` drains a platform watcher's bounded, coalesced event channel
+/// without blocking; the refresh closures re-enumerate the local inventories
+/// (they construct fresh, stateless native backends and never touch the
+/// capture-owned backend). Enumeration itself runs on the blocking pool; only
+/// the already-serialized manager update happens on the async runtime.
+pub(crate) struct LocalInventoryWatch {
+    poll: Box<dyn FnMut() -> Option<LocalInventoryHint> + Send>,
+    refresh_displays: Arc<dyn Fn() -> Option<Vec<Display>> + Send + Sync>,
+    refresh_devices: Arc<dyn Fn() -> Option<Vec<InputDevice>> + Send + Sync>,
+}
+
+impl LocalInventoryWatch {
+    pub(crate) fn new(
+        poll: Box<dyn FnMut() -> Option<LocalInventoryHint> + Send>,
+        refresh_displays: Arc<dyn Fn() -> Option<Vec<Display>> + Send + Sync>,
+        refresh_devices: Arc<dyn Fn() -> Option<Vec<InputDevice>> + Send + Sync>,
+    ) -> Self {
+        Self {
+            poll,
+            refresh_displays,
+            refresh_devices,
+        }
+    }
+
+    fn poll_hint(&mut self) -> Option<LocalInventoryHint> {
+        (self.poll)()
+    }
+}
+
+impl fmt::Debug for LocalInventoryWatch {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("LocalInventoryWatch")
+            .finish_non_exhaustive()
+    }
+}
+
+/// Inventory kinds demanded by coalesced hints and not yet refreshed.
+#[derive(Debug, Default)]
+struct InventoryRefreshDemand {
+    displays: bool,
+    devices: bool,
+}
+
+impl InventoryRefreshDemand {
+    const fn any(&self) -> bool {
+        self.displays || self.devices
+    }
+}
+
+/// Fresh native inventories returned by one blocking refresh pass.
+struct InventoryRefreshOutcome {
+    displays: Option<Vec<Display>>,
+    devices: Option<Vec<InputDevice>>,
+}
+
 struct PreparedWorkspace {
     inventory: DisplayInventory,
     initial_state: WorkspaceState,
@@ -350,7 +419,8 @@ where
     where
         B: InputCaptureBackend + 'static,
     {
-        self.run_with_capture_status(backend, shutdown, None).await
+        self.run_with_capture_status(backend, shutdown, None, None)
+            .await
     }
 
     /// Awaits transport readiness, surfacing an early transport-task failure as
@@ -371,11 +441,16 @@ where
         }
     }
 
+    #[allow(
+        clippy::too_many_lines,
+        reason = "service select branches are clearer when kept together"
+    )]
     pub(crate) async fn run_with_capture_status<B>(
         self,
         backend: B,
         mut shutdown: tokio::sync::watch::Receiver<bool>,
         status: Option<RuntimeStatusPublisher>,
+        mut watch: Option<LocalInventoryWatch>,
     ) -> Result<(), RuntimeServiceError>
     where
         B: InputCaptureBackend + 'static,
@@ -401,7 +476,7 @@ where
             return coarse_join_outcome(transport_task.await);
         }
 
-        let mut capture = NativeCaptureSupervisor::new(backend, manager);
+        let mut capture = NativeCaptureSupervisor::new(backend, Arc::clone(&manager));
         if capture.start(now_ns(started)).is_err() {
             developer_event("capture=start_failed");
             let _ = transport_shutdown.send(true);
@@ -414,6 +489,13 @@ where
         let mut last_capture_metrics = capture.metrics();
         let mut next_capture_report = Instant::now() + Duration::from_secs(1);
         let mut transport_finished = false;
+        // Local hotplug refresh state: hints accumulate as demand while a
+        // refresh pass is in flight; each pass consumes the demand captured at
+        // spawn time so late hints trigger a follow-up pass.
+        let mut inventory_demand = InventoryRefreshDemand::default();
+        let mut inventory_refresh: Option<tokio::task::JoinHandle<InventoryRefreshOutcome>> = None;
+        let mut next_display_revision = INITIAL_DISPLAY_REVISION + 1;
+        let mut next_device_revision = INITIAL_DEVICE_REVISION + 1;
         let service_result = loop {
             tokio::select! {
                 biased;
@@ -428,6 +510,24 @@ where
                         .map_err(|_| RuntimeServiceError::new(RuntimeServiceErrorKind::Task))?
                         .map_err(|_| RuntimeServiceError::new(RuntimeServiceErrorKind::Transport));
                 }
+                result = async {
+                    match inventory_refresh.as_mut() {
+                        Some(handle) => handle.await,
+                        None => std::future::pending().await,
+                    }
+                }, if inventory_refresh.is_some() => {
+                    inventory_refresh = None;
+                    match result {
+                        Ok(outcome) => apply_local_inventory_refresh(
+                            &manager,
+                            outcome,
+                            &mut next_display_revision,
+                            &mut next_device_revision,
+                            now_ns(started),
+                        ),
+                        Err(_) => developer_event("hotplug=refresh_task_failed"),
+                    }
+                }
                 _ = lifecycle_tick.tick() => {
                     if capture.poll_lifecycle(now_ns(started)).is_err() {
                         developer_event("capture=lifecycle_fault");
@@ -441,6 +541,40 @@ where
                             &mut last_capture_metrics,
                             &mut next_capture_report,
                         );
+                    }
+                    if let Some(watch) = watch.as_mut() {
+                        while let Some(hint) = watch.poll_hint() {
+                            match hint {
+                                LocalInventoryHint::DisplaysChanged => {
+                                    inventory_demand.displays = true;
+                                }
+                                LocalInventoryHint::DevicesChanged => {
+                                    inventory_demand.devices = true;
+                                }
+                            }
+                        }
+                    }
+                    if inventory_refresh.is_none() && inventory_demand.any() {
+                        if let Some(watch) = watch.as_ref() {
+                            let refresh_displays = Arc::clone(&watch.refresh_displays);
+                            let refresh_devices = Arc::clone(&watch.refresh_devices);
+                            let want_displays = inventory_demand.displays;
+                            let want_devices = inventory_demand.devices;
+                            inventory_demand = InventoryRefreshDemand::default();
+                            developer_event("hotplug=refresh_started");
+                            inventory_refresh = Some(tokio::task::spawn_blocking(move || {
+                                InventoryRefreshOutcome {
+                                    displays: want_displays
+                                        .then(|| refresh_displays())
+                                        .flatten(),
+                                    devices: want_devices
+                                        .then(|| refresh_devices())
+                                        .flatten(),
+                                }
+                            }));
+                        } else {
+                            inventory_demand = InventoryRefreshDemand::default();
+                        }
                     }
                 }
             }
@@ -1321,6 +1455,57 @@ fn now_duration(started: Instant) -> Duration {
     started.elapsed().saturating_add(Duration::from_nanos(1))
 }
 
+/// Applies one fresh local inventory snapshot through the existing, already
+/// revisioned manager paths. Best-effort by design: a rejected update (for
+/// example a newly attached display with no configured topology placement, or
+/// a busy pointer transition) is logged and abandoned — the next physical
+/// change produces a fresh hint, and the daemon's own retry machinery
+/// reconciles any partially staged device update.
+fn apply_local_inventory_refresh<I>(
+    manager: &Arc<Mutex<PeerManager<I, ManagedSessionOutbound>>>,
+    outcome: InventoryRefreshOutcome,
+    next_display_revision: &mut u64,
+    next_device_revision: &mut u64,
+    now_ns: u64,
+) where
+    I: OutputInjectionBackend,
+{
+    if let Some(displays) = outcome.displays {
+        let revision = *next_display_revision;
+        *next_display_revision = next_display_revision.saturating_add(1);
+        match lock_manager(manager) {
+            Ok(mut manager) => {
+                if manager
+                    .apply_local_display_snapshot(revision, displays, now_ns)
+                    .is_ok()
+                {
+                    developer_event("hotplug=display_inventory_refreshed");
+                } else {
+                    developer_event("hotplug=display_inventory_refresh_rejected");
+                }
+            }
+            Err(_) => developer_event("hotplug=refresh_manager_unavailable detail:display"),
+        }
+    }
+    if let Some(devices) = outcome.devices {
+        let revision = *next_device_revision;
+        *next_device_revision = next_device_revision.saturating_add(1);
+        match lock_manager(manager) {
+            Ok(mut manager) => {
+                if manager
+                    .replace_local_device_inventory(revision, devices, now_ns)
+                    .is_ok()
+                {
+                    developer_event("hotplug=device_inventory_refreshed");
+                } else {
+                    developer_event("hotplug=device_inventory_refresh_rejected");
+                }
+            }
+            Err(_) => developer_event("hotplug=refresh_manager_unavailable detail:device"),
+        }
+    }
+}
+
 fn now_ns(started: Instant) -> u64 {
     duration_ns(now_duration(started))
 }
@@ -1329,7 +1514,7 @@ fn duration_ns(duration: Duration) -> u64 {
     u64::try_from(duration.as_nanos()).unwrap_or(u64::MAX)
 }
 
-fn developer_event(message: &str) {
+pub(crate) fn developer_event(message: &str) {
     if developer_logging_enabled() {
         eprintln!("[dev] {message}");
     }
@@ -1370,8 +1555,14 @@ impl PreparedTwoHostAlpha {
         let remote_peer = parts.remote_identity.peer_id();
         let prepared_workspace = prepare_workspace(&parts.config, local_host, local_displays)?;
 
-        let core = DaemonCore::new(parts.config.clone(), prepared_workspace.initial_state)
-            .map_err(|_| RuntimeCompositionError::new(RuntimeCompositionErrorKind::Authority))?;
+        // `LOCAL_PLATFORM` is the binding domain of the compiled-in native
+        // backend, which is exactly what compose assembles here.
+        let core = DaemonCore::new(
+            parts.config.clone(),
+            prepared_workspace.initial_state,
+            LOCAL_PLATFORM,
+        )
+        .map_err(|_| RuntimeCompositionError::new(RuntimeCompositionErrorKind::Authority))?;
         let coordinator = PeerSessionCoordinator::new(
             core,
             parts.remote_identity.clone(),

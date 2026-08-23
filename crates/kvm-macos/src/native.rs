@@ -36,14 +36,14 @@ use crate::{
 
 type CFIndex = isize;
 type CFTypeId = usize;
-type CFTypeRef = *const c_void;
-type CFStringRef = *const c_void;
+pub(crate) type CFTypeRef = *const c_void;
+pub(crate) type CFStringRef = *const c_void;
 type CFSetRef = *const c_void;
-type IOHIDManagerRef = *mut c_void;
-type IOHIDDeviceRef = *mut c_void;
+pub(crate) type IOHIDManagerRef = *mut c_void;
+pub(crate) type IOHIDDeviceRef = *mut c_void;
 type IOHIDElementRef = *mut c_void;
 type IOHIDValueRef = *mut c_void;
-type CFRunLoopRef = *mut c_void;
+pub(crate) type CFRunLoopRef = *mut c_void;
 type CFRunLoopSourceRef = *mut c_void;
 type CFMachPortRef = *mut c_void;
 type CGEventRef = *mut c_void;
@@ -52,8 +52,8 @@ type CGDisplayModeRef = *const c_void;
 
 const UTF8_ENCODING: u32 = 0x0800_0100;
 const NUMBER_SINT64_TYPE: i32 = 4;
-const IO_OPTION_NONE: u32 = 0;
-const CG_ERROR_SUCCESS: i32 = 0;
+pub(crate) const IO_OPTION_NONE: u32 = 0;
+pub(crate) const CG_ERROR_SUCCESS: i32 = 0;
 const CG_HID_EVENT_TAP: u32 = 0;
 const CG_EVENT_SOURCE_USER_DATA: u32 = 42;
 const CG_SCROLL_EVENT_UNIT_LINE: u32 = 1;
@@ -115,7 +115,7 @@ struct MachTimebaseInfo {
 
 #[link(name = "CoreFoundation", kind = "framework")]
 extern "C" {
-    fn CFRetain(value: CFTypeRef) -> CFTypeRef;
+    pub(crate) fn CFRetain(value: CFTypeRef) -> CFTypeRef;
     fn CFRelease(value: CFTypeRef);
     fn CFGetTypeID(value: CFTypeRef) -> CFTypeId;
     fn CFStringGetTypeID() -> CFTypeId;
@@ -136,10 +136,14 @@ extern "C" {
     fn CFBooleanGetValue(value: CFTypeRef) -> u8;
     fn CFSetGetCount(set: CFSetRef) -> CFIndex;
     fn CFSetGetValues(set: CFSetRef, values: *mut *const c_void);
-    fn CFRunLoopGetCurrent() -> CFRunLoopRef;
-    fn CFRunLoopRunInMode(mode: CFStringRef, seconds: f64, return_after_source_handled: u8) -> i32;
-    fn CFRunLoopStop(run_loop: CFRunLoopRef);
-    fn CFRunLoopWakeUp(run_loop: CFRunLoopRef);
+    pub(crate) fn CFRunLoopGetCurrent() -> CFRunLoopRef;
+    pub(crate) fn CFRunLoopRunInMode(
+        mode: CFStringRef,
+        seconds: f64,
+        return_after_source_handled: u8,
+    ) -> i32;
+    pub(crate) fn CFRunLoopStop(run_loop: CFRunLoopRef);
+    pub(crate) fn CFRunLoopWakeUp(run_loop: CFRunLoopRef);
     fn CFRunLoopAddSource(run_loop: CFRunLoopRef, source: CFRunLoopSourceRef, mode: CFStringRef);
     fn CFRunLoopRemoveSource(run_loop: CFRunLoopRef, source: CFRunLoopSourceRef, mode: CFStringRef);
     fn CFMachPortCreateRunLoopSource(
@@ -151,37 +155,37 @@ extern "C" {
     fn CFMachPortIsValid(port: CFMachPortRef) -> u8;
 
     #[allow(non_upper_case_globals)]
-    static kCFRunLoopDefaultMode: CFStringRef;
+    pub(crate) static kCFRunLoopDefaultMode: CFStringRef;
 }
 
 #[link(name = "IOKit", kind = "framework")]
 extern "C" {
-    fn IOHIDManagerCreate(allocator: *const c_void, options: u32) -> IOHIDManagerRef;
-    fn IOHIDManagerSetDeviceMatching(manager: IOHIDManagerRef, matching: CFTypeRef);
-    fn IOHIDManagerOpen(manager: IOHIDManagerRef, options: u32) -> i32;
-    fn IOHIDManagerClose(manager: IOHIDManagerRef, options: u32) -> i32;
+    pub(crate) fn IOHIDManagerCreate(allocator: *const c_void, options: u32) -> IOHIDManagerRef;
+    pub(crate) fn IOHIDManagerSetDeviceMatching(manager: IOHIDManagerRef, matching: CFTypeRef);
+    pub(crate) fn IOHIDManagerOpen(manager: IOHIDManagerRef, options: u32) -> i32;
+    pub(crate) fn IOHIDManagerClose(manager: IOHIDManagerRef, options: u32) -> i32;
     fn IOHIDManagerCopyDevices(manager: IOHIDManagerRef) -> CFSetRef;
     fn IOHIDManagerRegisterInputValueCallback(
         manager: IOHIDManagerRef,
         callback: Option<extern "C" fn(*mut c_void, i32, *mut c_void, IOHIDValueRef)>,
         context: *mut c_void,
     );
-    fn IOHIDManagerRegisterDeviceMatchingCallback(
+    pub(crate) fn IOHIDManagerRegisterDeviceMatchingCallback(
         manager: IOHIDManagerRef,
         callback: Option<extern "C" fn(*mut c_void, i32, *mut c_void, IOHIDDeviceRef)>,
         context: *mut c_void,
     );
-    fn IOHIDManagerRegisterDeviceRemovalCallback(
+    pub(crate) fn IOHIDManagerRegisterDeviceRemovalCallback(
         manager: IOHIDManagerRef,
         callback: Option<extern "C" fn(*mut c_void, i32, *mut c_void, IOHIDDeviceRef)>,
         context: *mut c_void,
     );
-    fn IOHIDManagerScheduleWithRunLoop(
+    pub(crate) fn IOHIDManagerScheduleWithRunLoop(
         manager: IOHIDManagerRef,
         run_loop: CFRunLoopRef,
         run_loop_mode: CFStringRef,
     );
-    fn IOHIDManagerUnscheduleFromRunLoop(
+    pub(crate) fn IOHIDManagerUnscheduleFromRunLoop(
         manager: IOHIDManagerRef,
         run_loop: CFRunLoopRef,
         run_loop_mode: CFStringRef,
@@ -269,13 +273,21 @@ extern "C" {
     fn CGDisplayIsMain(display: u32) -> u32;
     fn CGDisplayCopyDisplayMode(display: u32) -> CGDisplayModeRef;
     fn CGDisplayModeGetRefreshRate(mode: CGDisplayModeRef) -> f64;
+    pub(crate) fn CGDisplayRegisterReconfigurationCallback(
+        callback: Option<extern "C" fn(display: u32, flags: u32, user_info: *mut c_void)>,
+        user_info: *mut c_void,
+    ) -> i32;
+    pub(crate) fn CGDisplayRemoveReconfigurationCallback(
+        callback: Option<extern "C" fn(display: u32, flags: u32, user_info: *mut c_void)>,
+        user_info: *mut c_void,
+    ) -> i32;
 }
 
 #[derive(Debug)]
-struct OwnedCF(CFTypeRef);
+pub(crate) struct OwnedCF(CFTypeRef);
 
 impl OwnedCF {
-    fn new(value: CFTypeRef, operation: &'static str) -> Result<Self, MacBackendError> {
+    pub(crate) fn new(value: CFTypeRef, operation: &'static str) -> Result<Self, MacBackendError> {
         if value.is_null() {
             Err(MacBackendError::NullResult { operation })
         } else {
@@ -439,10 +451,10 @@ struct WholeHostCallbackContext {
 }
 
 #[derive(Debug)]
-struct RetainedRunLoop(usize);
+pub(crate) struct RetainedRunLoop(pub(crate) usize);
 
 impl RetainedRunLoop {
-    fn as_ptr(&self) -> CFRunLoopRef {
+    pub(crate) fn as_ptr(&self) -> CFRunLoopRef {
         self.0 as CFRunLoopRef
     }
 }

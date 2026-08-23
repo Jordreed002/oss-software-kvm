@@ -108,3 +108,85 @@ deferred to an improvement cycle.
   rejects unsupported versions.
 - **§27/§30 Clipboard:** text-only is spec-compliant (images/files/rich types are
   explicitly "Later"); loop-suppression is implemented.
+
+## Update 2026-08-23 — remediation landed (code complete; hardware validation pending)
+
+The local display-change detector recommended in this audit is implemented and
+wired into the runtime's inventory-refresh path. Full closure still requires
+physical-hardware validation entries (see below); this repository requires
+hardware validation before any native-behavior claim is accepted.
+
+### What landed
+
+- **macOS** (`crates/kvm-macos/src/hotplug.rs`, plus FFI exposure in
+  `native.rs`): `MacHotplugWatcher` registers
+  `CGDisplayRegisterReconfigurationCallback` on a dedicated watcher thread that
+  owns its own `CFRunLoop`. The native callback performs exactly one
+  non-blocking `try_send` into a bounded raw channel (capacity 64) — no work
+  runs on the Carbon/CG callback thread. The watcher thread drains the raw
+  channel and coalesces bursts.
+- **Windows** (`crates/kvm-windows/src/hotplug.rs`): `WindowsHotplugWatcher`
+  runs a dedicated message thread with a hidden **top-level** window (not the
+  message-only capture window — message-only windows do not receive system
+  broadcasts) receiving `WM_DISPLAYCHANGE`, and a 50 ms `WM_TIMER` tick driving
+  the coalescer's trailing edge. A `cfg(windows)` const-assertion pins the
+  local message constants to the `windows` crate values.
+- **Coalescing** (both platforms): a leading-edge + single-trailing-edge
+  debouncer collapses each burst to at most one hint per 200 ms quiet window
+  per kind (`HOTPLUG_COALESCE_WINDOW`), so one physical dock/undock yields at
+  most two re-enumerations (immediate plus post-settle).
+- **Runtime wiring** (`crates/kvm-runtime/src/active.rs`,
+  `platform_run.rs`): each platform entry point starts its watcher (degrading
+  to the previous boot-time-snapshot behavior, with a developer event, if the
+  watcher cannot start — monitoring is not an authority gate). The service
+  loop polls the bounded hint channel on its existing 4 ms lifecycle tick,
+  re-enumerates through fresh stateless backends on `spawn_blocking` (never
+  through the capture-owned backend), and applies the snapshot via the
+  existing `PeerManager::apply_local_display_snapshot` path with
+  monotonically increasing revisions. Rejected applies (for example a newly
+  attached display with no configured topology placement) are logged and
+  abandoned; the daemon's own retry machinery reconciles partial updates, and
+  the next physical change produces a fresh hint.
+
+### Verification
+
+- `cargo fmt --all --package kvm-macos --package kvm-windows --package kvm-runtime` — clean.
+- `cargo clippy --workspace --all-targets -- -D warnings` — clean (cfg hygiene
+  proven on a macOS host; internals are `cfg(any(platform, test))`-gated so
+  Linux CI stays green).
+- `cargo test --package kvm-macos --package kvm-windows --package kvm-runtime --all-targets` —
+  42 + 45 + 2 + 35 passing. Platform-neutral coverage: burst coalescing
+  (leading/trailing edge, per-window bound, kind independence), bounded-channel
+  drop accounting (never blocks or panics on a full or disconnected channel),
+  full dock-burst collapse, and — on the macOS host — direct invocation of the
+  native callback bodies with injected contexts, plus a native watcher
+  start/stop/exclusivity lifecycle test.
+- The `cfg(windows)` watcher code cannot run on this host; it was
+  type-checked against the real `windows` 0.62 crate for the
+  `x86_64-pc-windows-gnu` target via a throwaway out-of-tree harness (zero
+  warnings). Runtime behavior on Windows remains compile-verified only.
+
+### Hardware validation still required before full closure
+
+Record entries under `docs/validation/{macos,windows}/` per the repository's
+hardware-validation workflow. Minimum matrix:
+
+- **macOS:** plug/unplug a monitor (direct and via USB-C/Thunderbolt/HDMI
+  dock) mid-session; change resolution, refresh rate, and scaling in System
+  Settings mid-session; rearrange displays; sleep/wake with an external
+  monitor attached. For each: exactly the expected re-enumeration cadence (one
+  immediate plus at most one post-settle refresh per 200 ms window), the local
+  `DisplayUpdated` is re-published to the peer, workspace topology recompiles,
+  and pointer handoff geometry tracks the new layout. Also: revoke Input
+  Monitoring while the daemon runs and confirm display watching continues
+  (device watching degrades by design; see the device-hotplug audit).
+- **Windows:** dock/undock and resolution/DPI/scale changes on single- and
+  mixed-DPI multi-monitor setups; confirm the hidden top-level window receives
+  `WM_DISPLAYCHANGE` on the target Windows builds (10/11), the snapshot is
+  re-published, and virtual-screen coordinates remain consistent for handoff
+  geometry.
+- **Both:** confirm the watcher threads add no measurable input-latency
+  regression (they never touch the capture/injection hot path) and that
+  repeated watcher start/stop (daemon restart, profile reload) leaks no native
+  resources (CFRunLoop retain/release balance on macOS; window/timer/device
+  notification teardown on Windows).
