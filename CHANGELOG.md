@@ -34,9 +34,31 @@ era — the full earlier history remains in the git log.
   stale-pairing replacement from the ready screen.
 - A spec-conformance audit trail under `docs/audit/` and Windows physical validation
   entries under `docs/validation/windows/`.
+- Process panic failsafe: a lock-free panic hook trips a flag the armed peer manager
+  observes on every capture callback and service tick, releasing held input and gating
+  suppression through the existing native-capture-discontinuity cleanup path.
+- Routing-budget watchdog (default 50 ms), pressed-state reconciliation sweep, and a
+  bounded failsafe audit trail recording every tripwire.
+- Pairing failure lockout (5 attempts / 60 s cooldown, injectable clock) and a
+  constant-time comparison audit across `kvm-security`.
+- Discovery conflict detection: the same peer-ID advertised with differing address or
+  port is excluded from scheduling and surfaced through
+  `DiscoverySnapshot::conflicted()`.
+- Per-origin clipboard rate limiting (default 16 updates/s, memory-capped across
+  origins).
+- Repository infrastructure: `CHANGELOG.md`, `SECURITY.md`, ADRs, performance-budget
+  and validation-matrix docs, a `justfile`, dependabot, and CI jobs for the control
+  panel, cargo-deny, MSRV (1.91), coverage, cargo-machete, and `cargo doc`.
 
 ### Fixed
 
+- UDP pointer path resilience: corrupt or forged ciphertext, non-finite totals,
+  receive-side device-capacity overruns, and far-future reliable sequences now drop the
+  single packet instead of permanently downgrading the session to the TLS path; pointer
+  totals rebase past 2^40 to protect f64 delta resolution (wire format gains a flags
+  byte); datagram key material is zeroized on drop; IPv6 datagrams are marked for
+  expedited forwarding; packet encoding no longer allocates per datagram; reconnect
+  backoff gained optional ±25% jitter.
 - Failsafe: the emergency chord now releases peer-injected inbound keys (§25/F-02), and
   failsafe routing suspension is enforced on all egress paths (§24).
 - Pointer handoff across display edges: an edge dwell is required before handoff, dwell
