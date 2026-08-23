@@ -29,6 +29,12 @@ pub use credential::{
     CredentialKey, CredentialPurpose, CredentialStore, CredentialStoreError, MemoryCredentialStore,
     SecretBytes, SecretError,
 };
+// Purely additive re-export so platform crates can implement the OS-neutral
+// service/account credential-store trait; declared in credential.rs.
+pub use credential::credential_store::{
+    validate_secret_length, AccountName, CredentialLabelError, FileCredentialStore,
+    KeyedCredentialStore, ServiceCredentialStore, ServiceName, MAX_LABEL_BYTES, MAX_SECRET_BYTES,
+};
 pub use identity::{
     DiscoveredPeer, IdentityError, IdentityFingerprint, ParseFingerprintError, PeerIdentity,
 };

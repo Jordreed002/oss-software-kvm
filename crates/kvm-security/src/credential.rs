@@ -5,6 +5,15 @@ use kvm_types::PeerId;
 use thiserror::Error;
 use zeroize::Zeroize;
 
+/// OS-neutral service/account credential-store primitives and the plain-file
+/// reference store for tests and non-native hosts.
+///
+/// Declared with an explicit `#[path]` beside this file so the existing module
+/// tree stays unchanged for current consumers; the items are re-exported at
+/// the crate root.
+#[path = "credential_store.rs"]
+pub(crate) mod credential_store;
+
 /// Purpose-specific key for private credential material.
 #[derive(Clone, Copy, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub enum CredentialKey {

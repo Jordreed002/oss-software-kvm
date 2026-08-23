@@ -51,5 +51,16 @@ ledgers are positively bounded, and cleanup is discarded only after confirmed tr
 termination. Normal diagnostics redact input payloads, stable identities, routes, and connection
 generation values.
 
-Certificate issuance and rotation, scoped IPv6 link-local dialing, physical-host multicast
-validation, and native credential-store adapters remain deferred.
+Native credential-store adapters have landed as a capability, not yet wired into the daemon:
+kvm-security defines an OS-neutral service/account store boundary with bounded, redacted
+labels plus a permission-restricted plain-file reference store (0600/0700 on Unix) for tests
+and non-native hosts, macOS stores secrets as Keychain generic passwords through reviewed
+FFI with replace-on-store and idempotent delete, and Windows stores them as
+machine-persistent Credential Manager generic credentials. Retrieved secrets are zeroized
+in memory and bounded below the Credential Manager blob limit, and store diagnostics carry
+only operation names and status codes — never label text or key material. Integrating
+host-identity key persistence through these adapters, replacing today's in-memory-only
+handling, remains deferred.
+
+Certificate issuance and rotation, scoped IPv6 link-local dialing, and physical-host
+multicast validation remain deferred.
