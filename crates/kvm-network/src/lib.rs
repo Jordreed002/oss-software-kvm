@@ -14,6 +14,7 @@ mod connector;
 mod diagnostics;
 mod heartbeat;
 mod listener;
+mod local_ipc;
 mod peer;
 mod pointer_datagram;
 mod queue;
@@ -45,6 +46,10 @@ pub use listener::{
     BoundedLanListener, LanAddressError, LanListenerBuildError, LanListenerConfig,
     LanListenerConfigError, LanListenerEvent, LanListenerRejection, LanListenerReport,
     LanPeerAddress,
+};
+pub use local_ipc::{
+    default_control_path, LocalControlClient, LocalControlConnection, LocalControlServer,
+    LocalControlServerConfig, LocalIpcConfigError, LocalIpcError,
 };
 pub use peer::{
     AdmissionError, AdmittedPeer, AppliedGenerationEvent, ConnectionState, DisconnectReason,

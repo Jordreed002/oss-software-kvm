@@ -102,3 +102,26 @@ Did not modify code. Updated the cycle-3 picture with the post-cycle-4/6 reality
 the protocol and loopback transport are themselves orphaned (zero callers), and
 no OS-backed transport or daemon server exists. §31 remains the keystone blocker
 for §32-34 and for exposing §35/§36.
+
+## Update 2026-08-23
+
+Update 2026-08-23: OS transport landed (`kvm-network::local_ipc`, UDS + named
+pipe, framed via kvm-protocol control codec, loopback tests). Remaining for
+full §31 closure: daemon-side service wiring and panel-side client (next).
+
+What landed, in recommendation-1 terms:
+
+- `crates/kvm-network/src/local_ipc.rs`: `LocalControlServer` (bind/accept,
+  bounded concurrent connections, default 1, hard max 16) and
+  `LocalControlClient` (connect with startup-race retry), exchanging
+  `ControlFrame`s over a length-prefixed reuse of `encode_control`/
+  `decode_control` — no new wire format.
+- Platform split: `#[cfg(unix)]` Unix domain socket (caller-supplied path,
+  `default_control_path()` under `$TMPDIR`, stale-socket-file recovery,
+  `0600` file permissions as the same-user local trust boundary);
+  `#[cfg(windows)]` named pipe (`\\.\pipe\software-kvm-control`,
+  remote clients rejected), mirroring tokio's documented server pattern.
+- Tests (Unix): loopback command/response/event round trip, oversized and
+  wrong-version frame rejection before payload buffering, connection-bound
+  hold/release, clean shutdown and drop closure, stale vs live endpoint
+  rebinding. Every await is `tokio::time::timeout`-wrapped.
