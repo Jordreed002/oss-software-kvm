@@ -1,4 +1,5 @@
 use core::{fmt, str::FromStr};
+use std::time::Duration;
 
 use thiserror::Error;
 
@@ -7,7 +8,17 @@ use crate::{ChannelBindingError, PairedPeer, PairingChannelBinding, PairingConte
 const PAIRING_EXPORTER_LABEL: &[u8] = b"EXPORTER-software-kvm-pairing-code-v1";
 const VERIFICATION_CODE_MODULUS: u32 = 1_000_000;
 
+/// Default failed verification attempts allowed before lockout engages.
+pub const DEFAULT_MAX_FAILED_VERIFICATION_ATTEMPTS: u32 = 5;
+
+/// Default cooldown rejecting further pairing attempts after lockout.
+pub const DEFAULT_VERIFICATION_LOCKOUT_COOLDOWN: Duration = Duration::from_mins(1);
+
 /// Six-digit short authentication string shown on both machines.
+///
+/// Derived equality exists for tests and UI plumbing only. The secret is
+/// never compared programmatically across the untrusted channel: humans
+/// compare the two displays, so no timing-equality requirement applies.
 #[derive(Clone, Copy, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct VerificationCode(u32);
 
@@ -113,6 +124,8 @@ impl PairingSession {
         pairing_context: PairingContext,
         channel_binding: &impl PairingChannelBinding,
     ) -> Result<Self, PairingError> {
+        // Peer IDs are public non-secret identifiers; a short-circuit
+        // comparison cannot leak credential material here.
         if local_identity.peer_id() == remote_identity.peer_id() {
             return Err(PairingError::SelfPairing);
         }
@@ -195,26 +208,6 @@ impl PairingSession {
         Ok(())
     }
 
-    /// Records that the human-visible codes did not match and permanently fails
-    /// this attempt. A retry requires a fresh TLS session and pairing context.
-    ///
-    /// # Errors
-    ///
-    /// Returns a terminal-state error if the attempt already completed or was
-    /// cancelled. Repeated mismatch reports are idempotent.
-    pub fn report_verification_mismatch(&mut self) -> Result<(), PairingError> {
-        self.state = match self.state {
-            PairingState::AwaitingBothApprovals
-            | PairingState::AwaitingLocalApproval
-            | PairingState::AwaitingRemoteApproval
-            | PairingState::VerificationFailed => PairingState::VerificationFailed,
-            PairingState::Complete | PairingState::Cancelled => {
-                return Err(PairingError::TerminalState(self.state));
-            }
-        };
-        Ok(())
-    }
-
     /// Cancels an incomplete attempt. Cancellation is idempotent.
     ///
     /// Completed pairing cannot be retroactively cancelled; revoke its allowlist
@@ -247,6 +240,30 @@ impl PairingSession {
         }
         Ok(PairedPeer::new(self.remote_identity))
     }
+
+    /// Records that the human-visible codes did not match and permanently fails
+    /// this attempt. A retry requires a fresh TLS session and pairing context.
+    ///
+    /// Session owners that enforce brute-force resistance should also pass the
+    /// failure to their [`PairingAttemptTracker`] so repeated mismatches
+    /// eventually engage its cooldown.
+    ///
+    /// # Errors
+    ///
+    /// Returns a terminal-state error if the attempt already completed or was
+    /// cancelled. Repeated mismatch reports are idempotent.
+    pub fn report_verification_mismatch(&mut self) -> Result<(), PairingError> {
+        self.state = match self.state {
+            PairingState::AwaitingBothApprovals
+            | PairingState::AwaitingLocalApproval
+            | PairingState::AwaitingRemoteApproval
+            | PairingState::VerificationFailed => PairingState::VerificationFailed,
+            PairingState::Complete | PairingState::Cancelled => {
+                return Err(PairingError::TerminalState(self.state));
+            }
+        };
+        Ok(())
+    }
 }
 
 fn exporter_context(
@@ -268,6 +285,177 @@ fn exporter_context(
     context
 }
 
+/// Lockout policy for failed pairing verification attempts.
+///
+/// Each [`PairingSession`] is single-use, so failures are aggregated across
+/// attempts by the daemon-held [`PairingAttemptTracker`] using this policy.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PairingLockoutPolicy {
+    max_failed_attempts: u32,
+    cooldown: Duration,
+}
+
+impl PairingLockoutPolicy {
+    /// Creates a validated lockout policy.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when either bound is zero.
+    pub fn new(
+        max_failed_attempts: u32,
+        cooldown: Duration,
+    ) -> Result<Self, PairingLockoutPolicyError> {
+        if max_failed_attempts == 0 {
+            return Err(PairingLockoutPolicyError::ZeroMaxFailedAttempts);
+        }
+        if cooldown.is_zero() {
+            return Err(PairingLockoutPolicyError::ZeroCooldown);
+        }
+        Ok(Self {
+            max_failed_attempts,
+            cooldown,
+        })
+    }
+
+    /// Failed attempts tolerated before lockout engages.
+    #[must_use]
+    pub const fn max_failed_attempts(self) -> u32 {
+        self.max_failed_attempts
+    }
+
+    /// Cooldown rejecting further attempts once lockout engages.
+    #[must_use]
+    pub const fn cooldown(self) -> Duration {
+        self.cooldown
+    }
+}
+
+impl Default for PairingLockoutPolicy {
+    fn default() -> Self {
+        Self {
+            max_failed_attempts: DEFAULT_MAX_FAILED_VERIFICATION_ATTEMPTS,
+            cooldown: DEFAULT_VERIFICATION_LOCKOUT_COOLDOWN,
+        }
+    }
+}
+
+/// Invalid pairing lockout policy bounds.
+#[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
+pub enum PairingLockoutPolicyError {
+    /// The failure allowance was zero.
+    #[error("maximum failed pairing attempts must be non-zero")]
+    ZeroMaxFailedAttempts,
+    /// The cooldown was zero.
+    #[error("pairing lockout cooldown must be non-zero")]
+    ZeroCooldown,
+}
+
+/// Cross-attempt brute-force tracker for pairing verification.
+///
+/// The session owner calls [`Self::check`] before offering a new pairing
+/// attempt, feeds every human mismatch report into
+/// [`Self::record_verification_failure`], and resets after a legitimately
+/// successful pairing with [`Self::record_verification_success`].
+///
+/// Time is injected as nanoseconds since a caller-chosen monotonic epoch
+/// (`now_ns`), matching the workspace convention; the tracker performs no
+/// I/O and reads no clocks itself. Once a cooldown elapses, the lock clears
+/// and the full failure budget is restored.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PairingAttemptTracker {
+    policy: PairingLockoutPolicy,
+    failed_attempts: u32,
+    locked_until_ns: Option<u64>,
+}
+
+impl Default for PairingAttemptTracker {
+    fn default() -> Self {
+        Self::new(PairingLockoutPolicy::default())
+    }
+}
+
+impl PairingAttemptTracker {
+    /// Creates a tracker enforcing an already-validated policy.
+    #[must_use]
+    pub const fn new(policy: PairingLockoutPolicy) -> Self {
+        Self {
+            policy,
+            failed_attempts: 0,
+            locked_until_ns: None,
+        }
+    }
+
+    /// Policy currently in force.
+    #[must_use]
+    pub const fn policy(&self) -> PairingLockoutPolicy {
+        self.policy
+    }
+
+    /// Failures recorded since the last success or expired lockout.
+    #[must_use]
+    pub const fn failed_attempts(&self) -> u32 {
+        self.failed_attempts
+    }
+
+    /// Remaining cooldown at `now_ns`, or zero when not locked out.
+    #[must_use]
+    pub fn remaining_cooldown(&self, now_ns: u64) -> Duration {
+        self.locked_until_ns.map_or(Duration::ZERO, |until| {
+            Duration::from_nanos(until.saturating_sub(now_ns))
+        })
+    }
+
+    /// Clears an expired lockout together with its failure budget.
+    fn clear_expired(&mut self, now_ns: u64) {
+        if self.locked_until_ns.is_some_and(|until| now_ns >= until) {
+            self.locked_until_ns = None;
+            self.failed_attempts = 0;
+        }
+    }
+
+    /// Admits or rejects a new pairing attempt.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PairingError::LockedOut`] while the cooldown has not yet
+    /// elapsed, carrying the remaining cooldown.
+    pub fn check(&mut self, now_ns: u64) -> Result<(), PairingError> {
+        self.clear_expired(now_ns);
+        if self.locked_until_ns.is_some() {
+            return Err(PairingError::LockedOut {
+                remaining_cooldown: self.remaining_cooldown(now_ns),
+            });
+        }
+        Ok(())
+    }
+
+    /// Records one failed human verification (the displayed codes differed).
+    ///
+    /// Failures arriving while a lockout is active are ignored: those attempts
+    /// were already rejected by [`Self::check`] and must not extend the
+    /// cooldown into an unbounded lockout.
+    pub fn record_verification_failure(&mut self, now_ns: u64) {
+        self.clear_expired(now_ns);
+        if self.locked_until_ns.is_some() {
+            return;
+        }
+        self.failed_attempts = self.failed_attempts.saturating_add(1);
+        if self.failed_attempts >= self.policy.max_failed_attempts {
+            self.locked_until_ns = Some(now_ns.saturating_add(cooldown_ns(self.policy.cooldown)));
+        }
+    }
+
+    /// Resets tracking after a legitimately successful pairing.
+    pub fn record_verification_success(&mut self) {
+        self.failed_attempts = 0;
+        self.locked_until_ns = None;
+    }
+}
+
+fn cooldown_ns(cooldown: Duration) -> u64 {
+    u64::try_from(cooldown.as_nanos()).unwrap_or(u64::MAX)
+}
+
 /// Pairing state-machine or authenticated channel-binding failure.
 #[derive(Clone, Debug, Eq, Error, PartialEq)]
 pub enum PairingError {
@@ -283,6 +471,16 @@ pub enum PairingError {
     /// The caller tried to persist the peer before both approvals arrived.
     #[error("pairing is not fully approved (state: {0:?})")]
     NotFullyApproved(PairingState),
+    /// Too many failed verification attempts; further attempts are rejected
+    /// until the remaining cooldown elapses.
+    #[error(
+        "pairing attempts are locked out for {} more seconds",
+        remaining_cooldown.as_secs()
+    )]
+    LockedOut {
+        /// Time until further attempts are admitted again.
+        remaining_cooldown: Duration,
+    },
 }
 
 #[cfg(test)]
@@ -457,5 +655,152 @@ mod tests {
         let rendered = format!("{error:?} {error}");
 
         assert!(!rendered.contains(MARKER));
+    }
+
+    const SECOND_NS: u64 = 1_000_000_000;
+
+    #[test]
+    fn lockout_engages_at_the_configured_failure_count() {
+        let mut tracker = PairingAttemptTracker::default();
+        assert_eq!(tracker.policy(), PairingLockoutPolicy::default());
+
+        for attempt in 0_u64..4 {
+            tracker.record_verification_failure(attempt * SECOND_NS);
+            assert_eq!(
+                tracker.failed_attempts(),
+                u32::try_from(attempt + 1).unwrap()
+            );
+            assert_eq!(tracker.check(attempt * SECOND_NS), Ok(()));
+        }
+
+        tracker.record_verification_failure(4 * SECOND_NS);
+        assert_eq!(
+            tracker.check(4 * SECOND_NS),
+            Err(PairingError::LockedOut {
+                remaining_cooldown: Duration::from_mins(1)
+            })
+        );
+    }
+
+    #[test]
+    fn lockout_rejects_during_cooldown_and_admits_after_it_elapses() {
+        let mut tracker = PairingAttemptTracker::default();
+        for _ in 0..5 {
+            tracker.record_verification_failure(0);
+        }
+
+        assert_eq!(
+            tracker.check(SECOND_NS),
+            Err(PairingError::LockedOut {
+                remaining_cooldown: Duration::from_secs(59)
+            })
+        );
+        assert_eq!(
+            tracker.check(59 * SECOND_NS),
+            Err(PairingError::LockedOut {
+                remaining_cooldown: Duration::from_secs(1)
+            })
+        );
+        assert_eq!(
+            tracker.remaining_cooldown(59 * SECOND_NS),
+            Duration::from_secs(1)
+        );
+
+        assert_eq!(tracker.check(60 * SECOND_NS), Ok(()));
+        assert_eq!(tracker.remaining_cooldown(60 * SECOND_NS), Duration::ZERO);
+        assert_eq!(
+            tracker.failed_attempts(),
+            0,
+            "cooldown expiry restores the budget"
+        );
+    }
+
+    #[test]
+    fn successful_pairing_resets_the_failure_budget() {
+        let mut tracker = PairingAttemptTracker::default();
+        for _ in 0..3 {
+            tracker.record_verification_failure(0);
+        }
+        tracker.record_verification_success();
+        assert_eq!(tracker.failed_attempts(), 0);
+
+        for failure in 1_u64..5 {
+            tracker.record_verification_failure(failure * SECOND_NS);
+        }
+        assert_eq!(tracker.check(4 * SECOND_NS), Ok(()));
+
+        tracker.record_verification_failure(4 * SECOND_NS);
+        assert!(matches!(
+            tracker.check(4 * SECOND_NS),
+            Err(PairingError::LockedOut { .. })
+        ));
+    }
+
+    #[test]
+    fn failures_during_active_lockout_do_not_extend_the_cooldown() {
+        let mut tracker = PairingAttemptTracker::default();
+        for _ in 0..5 {
+            tracker.record_verification_failure(0);
+        }
+
+        tracker.record_verification_failure(10 * SECOND_NS);
+        assert_eq!(
+            tracker.remaining_cooldown(10 * SECOND_NS),
+            Duration::from_secs(50)
+        );
+    }
+
+    #[test]
+    fn lockout_policy_is_configurable_and_validated() {
+        assert_eq!(
+            PairingLockoutPolicy::new(0, Duration::from_mins(1)),
+            Err(PairingLockoutPolicyError::ZeroMaxFailedAttempts)
+        );
+        assert_eq!(
+            PairingLockoutPolicy::new(5, Duration::ZERO),
+            Err(PairingLockoutPolicyError::ZeroCooldown)
+        );
+
+        let policy = PairingLockoutPolicy::new(2, Duration::from_secs(30)).unwrap();
+        assert_eq!(policy.max_failed_attempts(), 2);
+        assert_eq!(policy.cooldown(), Duration::from_secs(30));
+
+        let mut tracker = PairingAttemptTracker::new(policy);
+        tracker.record_verification_failure(0);
+        assert_eq!(tracker.check(0), Ok(()));
+        tracker.record_verification_failure(0);
+        assert_eq!(
+            tracker.check(0),
+            Err(PairingError::LockedOut {
+                remaining_cooldown: Duration::from_secs(30)
+            })
+        );
+        assert_eq!(tracker.check(30 * SECOND_NS), Ok(()));
+    }
+
+    #[test]
+    fn mismatching_sessions_drive_the_tracker_until_lockout_blocks_new_attempts() {
+        let (local, remote) = identities();
+        let mut tracker = PairingAttemptTracker::default();
+
+        for attempt in 1_u64..=5 {
+            assert_eq!(tracker.check(attempt * SECOND_NS), Ok(()));
+            let mut pairing = PairingSession::start(
+                &local,
+                remote.clone(),
+                PairingContext::from_bytes([u8::try_from(attempt).unwrap(); 32]),
+                &FakeBinding([0xff; 32]),
+            )
+            .unwrap();
+            pairing.report_verification_mismatch().unwrap();
+            tracker.record_verification_failure(attempt * SECOND_NS);
+        }
+
+        assert_eq!(
+            tracker.check(6 * SECOND_NS),
+            Err(PairingError::LockedOut {
+                remaining_cooldown: Duration::from_secs(59)
+            })
+        );
     }
 }

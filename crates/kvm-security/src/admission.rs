@@ -100,6 +100,10 @@ where
         remote_hello: &HelloV1,
         transport: &TransportPeerIdentity,
         authentication: &AuthenticateV1,
+        // Proof bytes are secret-adjacent: the production verifier
+        // (`HandshakeTranscript::verify_remote_exporter_proof`) compares them
+        // with constant-time equality inside kvm-network; only their length
+        // is inspected here.
         verify_proof: impl FnOnce(&[u8]) -> bool,
     ) -> Result<(), AdmissionError> {
         if authentication.peer_id != remote_hello.peer_id

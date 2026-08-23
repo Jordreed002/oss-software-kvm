@@ -266,6 +266,9 @@ where
             .ok_or(AuthorizationError::PeerNotPaired(presented.peer_id()))?;
 
         let expected = paired.identity();
+        // Host/peer IDs are public non-secret identifiers, so short-circuit
+        // comparison is safe; the credential fingerprint below is the only
+        // secret-adjacent field and already uses constant-time equality.
         if expected.host_id() != presented.host_id()
             || !bool::from(expected.fingerprint().ct_eq(&presented.fingerprint()))
         {

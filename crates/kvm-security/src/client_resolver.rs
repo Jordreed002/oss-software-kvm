@@ -11,6 +11,7 @@ use kvm_network::{
 };
 use kvm_protocol::{WireHostId, WirePeerId};
 use kvm_types::{HostId, PeerId};
+use subtle::ConstantTimeEq;
 use thiserror::Error;
 
 use crate::PairedPeer;
@@ -42,6 +43,16 @@ impl StableIdentity {
             credential_fingerprint: self.fingerprint,
         }
     }
+
+    /// Equality for snapshot consistency checks. Stable peer/host IDs are
+    /// public non-secret identifiers and may short-circuit; the credential
+    /// fingerprint uses constant-time equality to mirror the F-24 convention
+    /// used by the TLS layer and [`crate::IdentityFingerprint`].
+    fn matches(&self, other: &Self) -> bool {
+        self.peer_id == other.peer_id
+            && self.host_id == other.host_id
+            && bool::from(self.fingerprint.ct_eq(&other.fingerprint))
+    }
 }
 
 /// A bounded, immutable view of currently paired public client identities.
@@ -68,9 +79,9 @@ impl PairedClientResolverSnapshot {
     pub fn from_paired_peers(
         peers: impl IntoIterator<Item = PairedPeer>,
     ) -> Result<Self, PairedClientResolverSnapshotError> {
-        let mut by_fingerprint = BTreeMap::new();
-        let mut by_peer = BTreeMap::new();
-        let mut by_host = BTreeMap::new();
+        let mut by_fingerprint: BTreeMap<[u8; 32], StableIdentity> = BTreeMap::new();
+        let mut by_peer: BTreeMap<PeerId, StableIdentity> = BTreeMap::new();
+        let mut by_host: BTreeMap<HostId, StableIdentity> = BTreeMap::new();
 
         for (index, peer) in peers.into_iter().enumerate() {
             if index >= MAX_PAIRED_CLIENT_RESOLVER_ENTRIES {
@@ -83,16 +94,16 @@ impl PairedClientResolverSnapshot {
             }
             if by_peer
                 .get(&stable.peer_id)
-                .is_some_and(|existing| existing != &stable)
+                .is_some_and(|existing| !existing.matches(&stable))
                 || by_host
                     .get(&stable.host_id)
-                    .is_some_and(|existing| existing != &stable)
+                    .is_some_and(|existing| !existing.matches(&stable))
             {
                 return Err(PairedClientResolverSnapshotError::IdentityMismatch);
             }
             if by_fingerprint
                 .get(&stable.fingerprint)
-                .is_some_and(|existing| existing != &stable)
+                .is_some_and(|existing| !existing.matches(&stable))
             {
                 return Err(PairedClientResolverSnapshotError::AmbiguousFingerprint);
             }
@@ -137,7 +148,10 @@ impl PairedClientIdentityResolver for PairedClientResolverSnapshot {
             .get(credential_fingerprint)
             .copied()
             .ok_or(ClientIdentityResolutionError::Unknown)?;
-        if &identity.fingerprint != credential_fingerprint {
+        // The BTreeMap lookup already pins the key, but this explicit digest
+        // comparison is attacker-reachable through the presented credential,
+        // so it must not short-circuit (F-24: constant-time fingerprint eq).
+        if !bool::from(identity.fingerprint.ct_eq(credential_fingerprint)) {
             return Err(ClientIdentityResolutionError::InvalidIdentity);
         }
         Ok(identity.into_transport())
@@ -204,6 +218,24 @@ mod tests {
             snapshot.resolve(&near_match),
             Err(ClientIdentityResolutionError::Unknown)
         );
+    }
+
+    #[test]
+    fn every_single_byte_fingerprint_mutation_fails_resolution() {
+        let fingerprint = [7; 32];
+        let snapshot =
+            PairedClientResolverSnapshot::from_paired_peers([paired(1, 2, fingerprint, "peer")])
+                .unwrap();
+
+        for position in 0..32 {
+            let mut presented = fingerprint;
+            presented[position] ^= 1;
+            assert_eq!(
+                snapshot.resolve(&presented),
+                Err(ClientIdentityResolutionError::Unknown),
+                "byte position {position} must participate in resolution"
+            );
+        }
     }
 
     #[test]

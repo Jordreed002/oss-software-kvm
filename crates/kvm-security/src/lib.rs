@@ -33,5 +33,7 @@ pub use identity::{
     DiscoveredPeer, IdentityError, IdentityFingerprint, ParseFingerprintError, PeerIdentity,
 };
 pub use pairing::{
-    PairingError, PairingSession, PairingState, VerificationCode, VerificationCodeParseError,
+    PairingAttemptTracker, PairingError, PairingLockoutPolicy, PairingLockoutPolicyError,
+    PairingSession, PairingState, VerificationCode, VerificationCodeParseError,
+    DEFAULT_MAX_FAILED_VERIFICATION_ATTEMPTS, DEFAULT_VERIFICATION_LOCKOUT_COOLDOWN,
 };

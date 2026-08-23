@@ -11,6 +11,11 @@ const MAX_DISPLAY_NAME_BYTES: usize = 128;
 ///
 /// Hashing is deliberately performed by the TLS/credential implementation;
 /// this type only carries the resulting digest.
+///
+/// Derived `PartialEq`/`Ord` exist only so the digest can key maps/sets and
+/// participate in structural equality of public metadata records; secret-
+/// sensitive authentication comparisons must use the [`ConstantTimeEq`]
+/// impl below.
 #[derive(Clone, Copy, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct IdentityFingerprint([u8; FINGERPRINT_BYTES]);
 
@@ -220,6 +225,22 @@ mod tests {
         assert_eq!(encoded.len(), 64);
         assert_eq!(encoded.parse(), Ok(fingerprint));
         assert_eq!(encoded.to_uppercase().parse(), Ok(fingerprint));
+    }
+
+    #[test]
+    fn fingerprint_constant_time_eq_rejects_every_single_byte_mutation() {
+        let fingerprint = IdentityFingerprint::from_sha256([0x5c; 32]);
+
+        assert!(bool::from(fingerprint.ct_eq(&fingerprint)));
+        for position in 0..FINGERPRINT_BYTES {
+            let mut mutated = *fingerprint.as_bytes();
+            mutated[position] ^= 1;
+            let mutated = IdentityFingerprint::from_sha256(mutated);
+
+            assert!(!bool::from(fingerprint.ct_eq(&mutated)));
+            // Derived equality stays available for map/struct usage and agrees.
+            assert_ne!(fingerprint, mutated);
+        }
     }
 
     #[test]
