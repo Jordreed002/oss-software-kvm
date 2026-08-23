@@ -1,3 +1,4 @@
+mod control;
 mod nearby;
 mod setup;
 
@@ -31,6 +32,7 @@ pub fn run() {
             setup::validate_setup,
             setup::start_runtime,
             setup::stop_runtime,
+            control::control_status,
         ])
         .run(tauri::generate_context!())
         .expect("control-panel runtime failed");

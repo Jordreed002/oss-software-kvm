@@ -767,9 +767,11 @@ version = "0.1.0"
 dependencies = [
  "kvm-daemon",
  "kvm-input",
+ "kvm-security",
  "kvm-types",
  "sha2",
  "thiserror",
+ "uuid",
 ]
 
 [[package]]
@@ -874,9 +876,11 @@ version = "0.1.0"
 dependencies = [
  "kvm-daemon",
  "kvm-input",
+ "kvm-security",
  "kvm-types",
  "sha2",
  "thiserror",
+ "uuid",
  "windows",
 ]
 

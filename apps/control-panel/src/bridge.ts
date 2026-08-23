@@ -1,7 +1,21 @@
 import { invoke } from "@tauri-apps/api/core";
-import type { DiagnosticsReport, DisplayPlacement, Placement, SetupSnapshot } from "./types";
+import type {
+  ControlDaemonStatus, DiagnosticsReport, DisplayPlacement, Placement, SetupSnapshot,
+} from "./types";
 
 const inTauri = () => "__TAURI_INTERNALS__" in window;
+
+/** Parses a canonical UUID string into its 16 bytes, or null when malformed.
+ *  Used to compare the daemon's §31 active-host id against the local identity. */
+export const uuidToBytes = (uuid: string): number[] | null => {
+  const hex = uuid.replaceAll("-", "");
+  if (!/^[0-9a-fA-F]{32}$/.test(hex)) return null;
+  const bytes: number[] = [];
+  for (let index = 0; index < 32; index += 2) {
+    bytes.push(Number.parseInt(hex.slice(index, index + 2), 16));
+  }
+  return bytes;
+};
 
 const mock: SetupSnapshot = {
   platform: navigator.platform.toLowerCase().includes("mac") ? "macos" : "windows",
@@ -208,6 +222,28 @@ const invokeOrPreview = async <T>(command: string, args?: Record<string, unknown
       },
     } as DiagnosticsReport as T;
   }
+  if (command === "control_status") {
+    // Preview: when the runtime is not running there is no daemon behind the
+    // §31 endpoint; otherwise synthesize a live-looking status so the card
+    // can be built in the web preview. The runtime's preview input authority
+    // is local, so the active host is this computer.
+    if (previewState.runtime !== "running") {
+      return { state: "unreachable", status: null, error: null } as T;
+    }
+    const activeHost = previewState.local ? uuidToBytes(previewState.local.hostId) : [];
+    return {
+      state: "responded",
+      status: {
+        kvmEnabled: true,
+        clipboardEnabled: false,
+        peerState: "connected",
+        roundTripTimeMs: 4,
+        activeHost,
+        protocolVersion: 3,
+      },
+      error: null,
+    } as T;
+  }
   return structuredClone(previewState) as T;
 };
 
@@ -231,4 +267,8 @@ export const api = {
    *  Pass "local" for this host, or a peer LAN IP. Returns null when offline. */
   fetchDiagnostics: (host: string, port?: number) =>
     invokeOrPreview<DiagnosticsReport | null>("fetch_diagnostics", { host, port }),
+  /** Reads the daemon's live status over the §31 local control endpoint
+   *  (UDS / named pipe). Resolves to `{ state: "unreachable", ... }` when the
+   *  daemon is not running — never rejects for a missing daemon. */
+  controlStatus: () => invokeOrPreview<ControlDaemonStatus>("control_status"),
 };

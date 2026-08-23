@@ -180,3 +180,35 @@ export interface DiagnosticsReport {
   /** Aggregate capture counters, or null before the capture supervisor reports. */
   capture: CaptureDiagnostics | null;
 }
+
+/** §31 peer connection state reported by the daemon's control endpoint. */
+export type ControlPeerState =
+  | "disconnected"
+  | "discovering"
+  | "connecting"
+  | "authenticating"
+  | "connected"
+  | "degraded";
+
+/** Outcome of one §31 status poll against the local daemon. */
+export type DaemonControlState = "unreachable" | "responded" | "refused";
+
+/** Live daemon status from the §31 local control endpoint (UDS / named pipe).
+ *  Mirrors the `control_status` Tauri reply's status payload. */
+export interface DaemonControlStatus {
+  kvmEnabled: boolean;
+  clipboardEnabled: boolean;
+  peerState: ControlPeerState;
+  roundTripTimeMs: number | null;
+  /** 16-byte active host id; compare against the local identity's UUID bytes. */
+  activeHost: number[];
+  protocolVersion: number;
+}
+
+/** Reply of the `control_status` Tauri command: the daemon's live §31 state,
+ *  with `status` present only for "responded" and `error` for "refused". */
+export interface ControlDaemonStatus {
+  state: DaemonControlState;
+  status: DaemonControlStatus | null;
+  error: string | null;
+}

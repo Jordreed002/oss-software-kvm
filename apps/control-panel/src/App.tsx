@@ -3,11 +3,11 @@ import {
     Activity, ArrowLeftRight, Check, CircleAlert, Copy, KeyRound,
   Handshake, Laptop, Link2, LoaderCircle, Monitor, MousePointer2, Play, Radio, ShieldCheck, Square, Unplug, X,
 } from "lucide-react";
-import { api } from "./bridge";
+import { api, uuidToBytes } from "./bridge";
 import { ArrangeStep } from "./components/DisplayLayoutEditor";
 import { PrimaryButton, SectionHeading } from "./components/shared";
 import { DiagnosticsDashboard } from "./DiagnosticsDashboard";
-import type { SetupSnapshot } from "./types";
+import type { ControlDaemonStatus, ControlPeerState, SetupSnapshot } from "./types";
 
 const steps = ["This computer", "Pair", "Arrange", "Ready"] as const;
 
@@ -194,6 +194,7 @@ function ReadyStep({ snapshot, busy, onValidate, onStart, onStop, onReplace, onR
   return <div className="step-content enter">
     <SectionHeading number="04" kicker="ACTIVATE" title={running ? "Your desk is linked." : "One last safety check."} copy={running ? "Pointer and keyboard routing are active. Closing this console does not terminate the runtime." : "Validate identities, certificates, network addresses, topology, and file protections before capture can start."} />
     {running && <InputAuthorityPanel snapshot={snapshot}/>}
+    {running && <DaemonStatusCard snapshot={snapshot}/>}
     <NearbyPanel snapshot={snapshot}/>
     <div className="checklist">
       <CheckRow label="Local identity" detail="Private credential is protected" good={!!snapshot.local}/>
@@ -271,6 +272,62 @@ function InputAuthorityPanel({ snapshot }: { snapshot: SetupSnapshot }) {
     </div>
     <div className="authority-foot"><ShieldCheck size={13}/>Exactly one destination can receive routed input at a time. Move through the configured screen edge to switch.</div>
   </section>;
+}
+
+function DaemonStatusCard({ snapshot }: { snapshot: SetupSnapshot }) {
+  const [status, setStatus] = useState<ControlDaemonStatus | null>(null);
+
+  useEffect(() => {
+    let alive = true;
+    const pull = () => {
+      api.controlStatus().then((reply) => { if (alive) setStatus(reply); }).catch(() => undefined);
+    };
+    pull();
+    const timer = window.setInterval(pull, 2000);
+    return () => { alive = false; window.clearInterval(timer); };
+  }, []);
+
+  const live = status?.state === "responded" ? status.status : null;
+  const localBytes = snapshot.local ? uuidToBytes(snapshot.local.hostId) : null;
+  const activeHostLocal = !!live && !!localBytes && bytesEqual(live.activeHost, localBytes);
+  const peerName = snapshot.peer?.displayName ?? "Paired computer";
+  const connectionDetail: [string, boolean] =
+    status === null
+      ? ["Contacting the daemon's local control endpoint…", false]
+      : status.state === "unreachable"
+        ? ["Daemon not running at the local control endpoint", false]
+        : status.state === "refused"
+          ? [`Daemon refused the status request (${status.error ?? "error"})`, false]
+          : [peerConnectionDetail(live?.peerState ?? "disconnected", live?.roundTripTimeMs ?? null), live?.peerState === "connected"];
+  const routingDetail: [string, boolean] = live
+    ? live.kvmEnabled
+      ? ["Input routing is armed between both computers", true]
+      : ["Input stays local (routing gated or failsafe released)", false]
+    : ["Waiting for the daemon's routing state…", false];
+
+  return <section className="checklist" aria-label="Live daemon status (spec 31 control link)">
+    <CheckRow label="Daemon control link" detail={connectionDetail[0]} good={status?.state === "responded"} />
+    <CheckRow label="Peer connection" detail={connectionDetail[0]} good={connectionDetail[1]} />
+    <CheckRow label="KVM routing" detail={routingDetail[0]} good={routingDetail[1]} />
+    {live && (
+      <CheckRow
+        label="Input destination"
+        detail={activeHostLocal ? `Active host is this computer (protocol v${live.protocolVersion})` : `Active host is ${peerName} (protocol v${live.protocolVersion})`}
+        good={live.peerState === "connected"}
+      />
+    )}
+  </section>;
+}
+
+function peerConnectionDetail(state: ControlPeerState, roundTripTimeMs: number | null): string {
+  const stateText = state.replaceAll("_", " ");
+  return roundTripTimeMs === null
+    ? `Peer link: ${stateText}`
+    : `Peer link: ${stateText} · round trip ${roundTripTimeMs} ms`;
+}
+
+function bytesEqual(left: number[], right: number[]): boolean {
+  return left.length === right.length && left.every((byte, index) => byte === right[index]);
 }
 
 function DeveloperDiagnosticsPanel({ diagnostics, busy, onRepair }: { diagnostics: NonNullable<SetupSnapshot["developerDiagnostics"]>; busy: string | null; onRepair: () => void }) {

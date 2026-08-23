@@ -5,7 +5,7 @@ import { invoke } from "@tauri-apps/api/core";
 // these tests verify command names and argument shaping without a webview.
 vi.mock("@tauri-apps/api/core", () => ({ invoke: vi.fn() }));
 
-import { api } from "./bridge";
+import { api, uuidToBytes } from "./bridge";
 
 const invokeMock = vi.mocked(invoke);
 
@@ -61,6 +61,38 @@ describe("api command shaping under a mocked Tauri invoke", () => {
       ["fetch_diagnostics", { host: "192.168.1.31", port: undefined }],
     ]);
   });
+
+  it("controlStatus issues control_status with no arguments and resolves the typed reply", async () => {
+    invokeMock.mockResolvedValue({
+      state: "responded",
+      status: {
+        kvmEnabled: true,
+        clipboardEnabled: false,
+        peerState: "connected",
+        roundTripTimeMs: 4,
+        activeHost: [17, 17, 17, 17, 17, 17, 17, 17, 17, 17, 17, 17, 17, 17, 17, 17],
+        protocolVersion: 3,
+      },
+      error: null,
+    });
+    const reply = await api.controlStatus();
+    expect(invokeMock.mock.calls).toEqual([["control_status", undefined]]);
+    expect(reply.state).toBe("responded");
+    expect(reply.status?.kvmEnabled).toBe(true);
+    expect(reply.status?.peerState).toBe("connected");
+    expect(reply.status?.roundTripTimeMs).toBe(4);
+    expect(reply.error).toBeNull();
+  });
+
+  it("uuidToBytes parses canonical uuids and rejects malformed input", () => {
+    const uuid = "11111111-2222-4333-8444-555555555555";
+    expect(uuidToBytes(uuid)).toEqual([
+      0x11, 0x11, 0x11, 0x11, 0x22, 0x22, 0x43, 0x33,
+      0x84, 0x44, 0x55, 0x55, 0x55, 0x55, 0x55, 0x55,
+    ]);
+    expect(uuidToBytes("not-a-uuid")).toBeNull();
+    expect(uuidToBytes("")).toBeNull();
+  });
 });
 
 describe("api web-preview fallback", () => {
@@ -84,6 +116,32 @@ describe("api web-preview fallback", () => {
       expect(invokeMock).not.toHaveBeenCalled();
     } finally {
       vi.useRealTimers();
+    }
+  });
+
+  it("serves an unreachable §31 daemon while the runtime is stopped and a live status once running", async () => {
+    vi.useFakeTimers();
+    try {
+      delete (window as unknown as Record<string, unknown>).__TAURI_INTERNALS__;
+      const stoppedPending = api.controlStatus();
+      await vi.advanceTimersByTimeAsync(320);
+      const stopped = await stoppedPending;
+      expect(stopped.state).toBe("unreachable");
+      expect(stopped.status).toBeNull();
+
+      const startPending = api.start();
+      await vi.advanceTimersByTimeAsync(320);
+      await startPending;
+      const runningPending = api.controlStatus();
+      await vi.advanceTimersByTimeAsync(320);
+      const running = await runningPending;
+      expect(running.state).toBe("responded");
+      expect(running.status?.kvmEnabled).toBe(true);
+      expect(running.status?.peerState).toBe("connected");
+      expect(invokeMock).not.toHaveBeenCalled();
+    } finally {
+      vi.useRealTimers();
+      await api.stop().catch(() => undefined);
     }
   });
 });
