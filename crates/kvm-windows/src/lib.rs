@@ -8,6 +8,8 @@
 
 #[cfg(any(windows, test))]
 mod capture;
+#[cfg(windows)]
+mod credential_store;
 mod hotplug;
 mod identity;
 mod mapping;
@@ -19,6 +21,8 @@ mod native;
 #[cfg(not(windows))]
 mod unsupported;
 
+#[cfg(windows)]
+pub use credential_store::WindowsCredentialStore;
 #[cfg(windows)]
 pub use native::{
     probe_capabilities, WindowsDisplayBackend, WindowsInputBackend, WindowsOutputBackend,
