@@ -12,7 +12,9 @@ kvm-types = { path = "../kvm-types" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.11"
-socket2 = "0.6"
+# "all" unlocks the unix IPv6 traffic-class setter (`set_tclass_v6`) used for
+# expedited-forwarding marking on the UDP fast path.
+socket2 = { version = "0.6", features = ["all"] }
 subtle = "2.6"
 thiserror = "2"
 tokio = { version = "1", features = ["io-util", "macros", "net", "rt", "sync", "time"] }
