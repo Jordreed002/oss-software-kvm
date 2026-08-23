@@ -3,10 +3,13 @@
 //! This module is intentionally kept in the composition crate. Neither the
 //! domain model nor the public protocol silently depends on the other.
 
-use kvm_input::{ButtonState, InputEvent, InputPayload, KeyCode, KeyState, PointerButton};
+use kvm_input::{
+    ButtonState, InputEvent, InputPayload, KeyCode, KeyState, PointerButton, SemanticCommand,
+};
 use kvm_protocol::{
-    InputEventV1, ReleaseInputV1, ReleaseReasonV1, WireButtonState, WireDeviceId, WireHostId,
-    WireInputPayloadV1, WireKeyCode, WireKeyState, WirePointerButton,
+    InputEventV1, ReleaseInputV1, ReleaseReasonV1, SemanticInputV1, WireButtonState, WireDeviceId,
+    WireHostId, WireInputPayloadV1, WireKeyCode, WireKeyState, WirePointerButton,
+    WireSemanticCommand,
 };
 use kvm_types::{DeviceId, HostId};
 use thiserror::Error;
@@ -25,6 +28,10 @@ pub enum WireConversionError {
     UnsupportedKey,
     #[error("a remote release may contain only a key or pointer-button release")]
     UnsupportedReleasePayload,
+    #[error("a semantic input frame must carry an originating key press")]
+    UnsupportedSemanticPayload,
+    #[error("a semantic command has no wire representation on this build")]
+    UnsupportedSemanticCommand,
 }
 
 /// Converts one validated v1 input DTO into the canonical domain event.
@@ -67,6 +74,134 @@ pub fn input_to_wire(input: &InputEvent) -> Result<InputEventV1, WireConversionE
         source_device: WireDeviceId(input.source_device.into_bytes()),
         payload: payload_to_wire(input.payload)?,
     })
+}
+
+/// Converts the wire's semantic intent vocabulary into the domain command.
+///
+/// Returns `None` for any intent this build does not name — the reserved
+/// [`WireSemanticCommand::Other`] discriminant or a `non_exhaustive` future
+/// variant: this build has no native binding for it, so the caller must fail
+/// open to the frame's originating physical event rather than guess. The
+/// named variants are total — both vocabularies name the same seven intents —
+/// so `None` is reachable only for a newer peer's vocabulary, never for a
+/// peer on this build.
+#[must_use]
+pub(crate) fn semantic_command_from_wire(command: WireSemanticCommand) -> Option<SemanticCommand> {
+    match command {
+        WireSemanticCommand::Copy => Some(SemanticCommand::Copy),
+        WireSemanticCommand::Paste => Some(SemanticCommand::Paste),
+        WireSemanticCommand::Cut => Some(SemanticCommand::Cut),
+        WireSemanticCommand::Undo => Some(SemanticCommand::Undo),
+        WireSemanticCommand::Redo => Some(SemanticCommand::Redo),
+        WireSemanticCommand::SelectAll => Some(SemanticCommand::SelectAll),
+        WireSemanticCommand::AppSwitch => Some(SemanticCommand::AppSwitch),
+        // `Other` and any future `non_exhaustive` variant alike.
+        _ => None,
+    }
+}
+
+/// Converts a domain command into the wire vocabulary.
+///
+/// Returns `None` for a `non_exhaustive` future domain command that has no
+/// wire name on this build; the resolver only produces the seven named
+/// intents, so outbound frames never hit that arm in practice.
+#[must_use]
+pub(crate) fn semantic_command_to_wire(command: SemanticCommand) -> Option<WireSemanticCommand> {
+    match command {
+        SemanticCommand::Copy => Some(WireSemanticCommand::Copy),
+        SemanticCommand::Paste => Some(WireSemanticCommand::Paste),
+        SemanticCommand::Cut => Some(WireSemanticCommand::Cut),
+        SemanticCommand::Undo => Some(WireSemanticCommand::Undo),
+        SemanticCommand::Redo => Some(WireSemanticCommand::Redo),
+        SemanticCommand::SelectAll => Some(WireSemanticCommand::SelectAll),
+        SemanticCommand::AppSwitch => Some(WireSemanticCommand::AppSwitch),
+        _ => None,
+    }
+}
+
+/// Projects one semantic frame onto its originating physical event.
+///
+/// The projection reuses the frame's sequence, timestamp, and source identity,
+/// so it is exactly the event a pre-semantic build would have injected (the
+/// deterministic fallback) and can feed the same duplicate-detection window as
+/// physical input.
+///
+/// # Errors
+///
+/// Returns [`WireConversionError::NonFiniteInput`] for unsafe rider values
+/// (defense in depth; validation already rejects non-key riders).
+pub(crate) fn semantic_physical_from_wire(
+    input: &SemanticInputV1,
+) -> Result<InputEvent, WireConversionError> {
+    let payload = payload_from_wire(&input.physical);
+    if !payload.is_finite() {
+        return Err(WireConversionError::NonFiniteInput);
+    }
+    Ok(InputEvent::new(
+        input.sequence,
+        input.timestamp_ns,
+        HostId::from_bytes(input.source_host.0),
+        DeviceId::from_bytes(input.source_device.0),
+        payload,
+    ))
+}
+
+/// Builds the protocol-v4 semantic frame for one resolved press.
+///
+/// `event` must be the exact originating physical key press; its payload rides
+/// along as the destination's fallback, and the frame keeps its sequence and
+/// source identity so the destination's ordering and duplicate windows see the
+/// same stream position a physical frame would have occupied.
+///
+/// # Errors
+///
+/// Returns [`WireConversionError::UnsupportedSemanticPayload`] when the event
+/// is not a key press (unreachable through the resolution stage, which only
+/// resolves presses — kept so the fail-open path stays total),
+/// [`WireConversionError::UnsupportedSemanticCommand`] for a domain command
+/// without a wire name (likewise unreachable: the resolver only produces the
+/// seven named intents), or [`WireConversionError::UnsupportedKey`] for a key
+/// with no v1 HID usage.
+pub(crate) fn semantic_input_to_wire(
+    event: &InputEvent,
+    command: SemanticCommand,
+) -> Result<SemanticInputV1, WireConversionError> {
+    let physical = payload_to_wire(event.payload)?;
+    if !matches!(
+        physical,
+        WireInputPayloadV1::Key {
+            state: WireKeyState::Down,
+            ..
+        }
+    ) {
+        return Err(WireConversionError::UnsupportedSemanticPayload);
+    }
+    let Some(command) = semantic_command_to_wire(command) else {
+        return Err(WireConversionError::UnsupportedSemanticCommand);
+    };
+    Ok(SemanticInputV1 {
+        sequence: event.sequence,
+        timestamp_ns: event.timestamp_ns,
+        source_host: WireHostId(event.source_host.into_bytes()),
+        source_device: WireDeviceId(event.source_device.into_bytes()),
+        command,
+        physical,
+    })
+}
+
+/// Wire-level projection of a semantic frame onto its originating physical
+/// input event, for the destination's duplicate-detection window. The frame
+/// occupies exactly the stream position its physical press would have, so the
+/// projection keeps the frame's sequence, timestamp, and source identity.
+#[must_use]
+pub(crate) fn semantic_input_projection(input: &SemanticInputV1) -> InputEventV1 {
+    InputEventV1 {
+        sequence: input.sequence,
+        timestamp_ns: input.timestamp_ns,
+        source_host: input.source_host,
+        source_device: input.source_device,
+        payload: input.physical.clone(),
+    }
 }
 
 /// Converts one daemon cleanup action into a conservative resynchronization
@@ -602,6 +737,74 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn semantic_commands_convert_deliberately_and_unknown_intents_fail_open() {
+        // Every domain command has a named wire variant and converts back
+        // exactly; a reserved unknown wire intent deliberately does not.
+        for command in [
+            SemanticCommand::Copy,
+            SemanticCommand::Paste,
+            SemanticCommand::Cut,
+            SemanticCommand::Undo,
+            SemanticCommand::Redo,
+            SemanticCommand::SelectAll,
+            SemanticCommand::AppSwitch,
+        ] {
+            let wire = semantic_command_to_wire(command).unwrap();
+            assert_eq!(semantic_command_from_wire(wire), Some(command));
+        }
+        assert_eq!(
+            semantic_command_from_wire(WireSemanticCommand::Other(41)),
+            None,
+            "an intent this build cannot bind must convert to None (physical fallback)"
+        );
+    }
+
+    #[test]
+    fn semantic_input_conversion_carries_the_exact_originating_press() {
+        let press = InputEvent::new(
+            11,
+            12,
+            HOST,
+            DEVICE,
+            InputPayload::Key {
+                code: KeyCode::KeyC,
+                state: KeyState::Pressed,
+            },
+        );
+        let frame = semantic_input_to_wire(&press, SemanticCommand::Copy).unwrap();
+        assert_eq!(frame.command, WireSemanticCommand::Copy);
+        assert_eq!(frame.sequence, 11);
+        assert_eq!(frame.timestamp_ns, 12);
+        assert_eq!(
+            frame.physical,
+            input_to_wire(&press).unwrap().payload,
+            "the rider is the exact physical press"
+        );
+        assert_eq!(
+            semantic_physical_from_wire(&frame).unwrap(),
+            press,
+            "the physical projection round-trips to the originating event"
+        );
+    }
+
+    #[test]
+    fn semantic_input_conversion_rejects_non_press_events_without_echoing_them() {
+        for payload in [
+            InputPayload::Key {
+                code: KeyCode::KeyC,
+                state: KeyState::Released,
+            },
+            InputPayload::PointerMove { dx: 1.0, dy: 2.0 },
+        ] {
+            let event = InputEvent::new(1, 2, HOST, DEVICE, payload);
+            let error = semantic_input_to_wire(&event, SemanticCommand::Copy).unwrap_err();
+            assert_eq!(error, WireConversionError::UnsupportedSemanticPayload);
+            assert!(!format!("{error:?}").contains("KeyC"));
+            assert!(!error.to_string().contains("KeyC"));
+        }
     }
 
     #[test]

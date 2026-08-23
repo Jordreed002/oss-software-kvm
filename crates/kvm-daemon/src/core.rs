@@ -227,10 +227,12 @@ pub(crate) struct RemoteInputEffect {
     event: InputEvent,
     /// Present when `keyboard.mode = Semantic` resolved this press into a
     /// semantic intent against the local platform and translated it to the
-    /// destination platform's native binding. The wire input vocabulary has
-    /// no variant which can carry it, so the enqueue boundary sends the exact
-    /// physical `event` unchanged (fail-open); the translation is carried for
-    /// tests and diagnostics until the protocol gains a semantic payload.
+    /// destination platform's native binding. The enqueue boundary
+    /// (`dispatch_remote_effect`) dispatches this as a protocol-v4
+    /// `SemanticInputV1` frame when the admitted session negotiated that
+    /// version or newer, and fails open to the exact physical `event` on older
+    /// sessions. The destination binding is retained for tests and diagnostics;
+    /// the destination re-derives it from its own local platform.
     semantic: Option<SemanticTranslation>,
     affine: AffineSeal,
 }
@@ -709,6 +711,14 @@ impl DaemonCore {
     #[must_use]
     pub fn config(&self) -> &Config {
         &self.config
+    }
+
+    /// Platform of this host: the binding domain used both to resolve captured
+    /// chords (source side, §17/§26) and to translate inbound semantic intents
+    /// into this host's native chord (destination side, `session.rs`).
+    #[must_use]
+    pub(crate) const fn local_platform(&self) -> Platform {
+        self.local_platform
     }
 
     /// §35 input-event-rate snapshot for the diagnostics surface (spec §35).
@@ -2115,8 +2125,9 @@ impl DaemonCore {
         // captured physical key press becomes a prepared remote enqueue, so
         // it is where the semantic layer is consulted. `semantic_resolution`
         // only ever *annotates* the effect — the enqueued event stays the
-        // exact physical capture because the wire has no semantic payload
-        // variant (see `semantic_capture` and `dispatch_remote_effect`).
+        // exact physical capture, and `dispatch_remote_effect` decides
+        // whether the session's wire version can carry the intent as a
+        // semantic frame or must fail open to that physical event.
         let semantic = self.semantic_resolution(&event, endpoint);
         Ok(CaptureDecision::Remote(RemoteInputEffect {
             decision_id: id,

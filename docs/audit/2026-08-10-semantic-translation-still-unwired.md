@@ -180,7 +180,7 @@ workspace lints include `clippy::all` + `clippy::pedantic`), `cargo test --packa
 kvm-daemon --all-targets` = 224 passed / 0 failed, and with `--features diagnostics`
 = 234 passed / 0 failed.
 
-### What remains (needs `kvm-protocol`, out of this remediation's file ownership)
+### What remains (needs `kvm-protocol`, out of that remediation's file ownership)
 
 1. Extend the wire so an intent can travel: a semantic variant of the `Input` payload
    (versioned like `ReleaseInputV2`) or a v3 input message, carrying at minimum the
@@ -202,3 +202,124 @@ The audit-recommended alternative (translate at the destination from the source 
 platform metadata) also remains open; this closure deliberately implemented the
 source-side variant because it keeps the intent unambiguous and the destination simple,
 which is where the audit's option 2 pointed.
+
+---
+
+## Closure (final) — 2026-08-23
+
+**Status: CLOSED. The three remaining steps above are implemented. Semantic mode is
+now observationally distinct from Physical mode end-to-end: the source dispatches the
+resolved intent as a versioned wire frame, the destination replays it as its own
+platform's native chord, and every degradation (older peer, unbindable intent,
+physical mode) deterministically fails open to the exact physical event.**
+
+### 1. Wire extension (`crates/kvm-protocol`)
+
+- New framing version `PROTOCOL_VERSION_V4 = 4`; `CURRENT_PROTOCOL_VERSION` is now v4.
+  Negotiation (`negotiate_protocol_version`) already derives the selection from the
+  advertised windows capped at `CURRENT_PROTOCOL_VERSION`, so same-build pairs select
+  v4 with no network-layer change.
+- `SEMANTIC_INPUT_PROTOCOL_VERSION = PROTOCOL_VERSION_V4`, mirroring
+  `RELEASE_PROOF_PROTOCOL_VERSION` / `POINTER_DATAGRAM_PROTOCOL_VERSION`.
+- New message type `MessageType::SemanticInput = 35` with
+  `minimum_protocol_version() = v4` — exactly the `ReleaseInputV2` pattern: encoding
+  the type into v1/v2/v3 framing fails with `MessageVersionMismatch`, older
+  exact-version readers reject a v4 frame from its fixed header
+  (`UnsupportedVersion`), and a semantic header stamped into an older frame is
+  rejected before payload buffering.
+- Payload `SemanticInputV1 { sequence, timestamp_ns, source_host, source_device,
+  command: WireSemanticCommand, physical: WireInputPayloadV1 }`. `WireSemanticCommand`
+  is a kvm-protocol-owned mirror of the seven intents plus `Other(u16)` (the
+  `WirePointerButton::Other` forward-compatibility pattern) — kvm-protocol still does
+  not depend on kvm-input; the daemon converts deliberately in `wire.rs`. The
+  `physical` rider is validated to be exactly the originating key press
+  (`Key { state: Down }`) so a destination that cannot bind the intent can fall back
+  to it. Debug output redacts sequence, sources, and payload values (the intent name
+  itself is coarse and safe, matching the capture-side discipline).
+
+### 2. Source dispatch swap (`crates/kvm-daemon/src/session.rs`,
+`dispatch_remote_effect`)
+
+A prepared effect carrying a `SemanticTranslation` now dispatches
+`WireMessage::SemanticInput(semantic_input_to_wire(...))` — but only when the effect's
+admitted session negotiated `SEMANTIC_INPUT_PROTOCOL_VERSION` or newer. On an older
+session (mixed-build pair), or on any conversion failure, the exact physical event is
+enqueued unchanged with a coarse debug log: the fail-open is now a *version
+degradation*, not a missing feature. Modifier transitions, repeats, and releases
+around the resolved press keep traveling as ordinary physical `Input` frames, so the
+source-side ledgers and the destination's physical stream are untouched. Physical
+mode is unchanged.
+
+### 3. Destination consumption (`session.rs::consume_semantic_input` /
+`replay_native_chord` / the anchor hook in `inject_received`)
+
+The destination replays the intent as its own native chord via
+`kvm_input::native_binding(command, core.local_platform())`:
+
+- **Modifier reinterpretation first.** The source forwards its modifier presses
+  physically; exact-match resolution guarantees those held modifiers are exactly the
+  source binding's. They are released (per-device, modifiers only, buttons and
+  ordinary keys untouched) through the ordinary inject path before the chord presses,
+  so the native chord is never blended with the source's modifiers.
+- **Lifecycle replay, not an atomic blip.** The binding's modifiers press in a fixed
+  canonical order (Shift, Ctrl, Alt, Meta → left positions), then the anchor key. All
+  synthetic events flow through `inject_received`, so capacity bounds, the
+  `inbound_pressed` ledger, §35/§36 instrumentation, and the failure discipline apply
+  unchanged. A `SemanticChord` hold records the anchor and synthetic modifiers.
+- **Exact teardown.** When the anchor key's release arrives — physically, or
+  synthetically via `ReleaseInput`/device-release/failsafe sweeps — the chord's
+  modifiers are released in reverse press order. The source's later modifier release
+  is an unmatched no-op (injected, ledger untouched), so releases of the source's
+  physical keys still release the destination exactly; no synthetic modifier can stay
+  stuck. Repeats of the chord key replay with the native modifiers still held (a real
+  `Cmd+C` repeat on macOS).
+- **Deterministic fallback.** An intent this build cannot bind
+  (`WireSemanticCommand::Other`, or a future `non_exhaustive` variant) injects the
+  frame's originating physical press — byte-identical to physical mode; input can
+  never be dropped by a newer peer's vocabulary.
+- A hold exists only while its anchor is held in `inbound_pressed`
+  (`scrub_semantic_chords`), so the chord map is bounded by the inbound device bound
+  and every cleanup path (degraded, disconnect, revoke, shutdown, failsafe) drains it
+  with the same sweep as all other holds.
+
+### Tests added (10)
+
+- kvm-protocol (3): v4 gating + round-trip + older-version rejection from both encode
+  and decode plus the fixed-header bootstrap rejection; validation requires the
+  originating key press (Up/Repeat/pointer riders rejected, `Other` accepted);
+  semantic diagnostics redaction.
+- daemon wire (3): all seven intents round-trip deliberately with `Other(41)` → `None`
+  (the fallback); the frame carries the exact originating press and its physical
+  projection round-trips; non-press conversion fails without echoing the payload.
+- daemon session (4): semantic frame dispatched on a v4 session (modifier press →
+  semantic frame → key release → modifier release, one increasing sequence space)
+  while physical mode on a v4 session stays four `Input` frames; destination replay of
+  Windows Ctrl+C as macOS Cmd+C with the full press/repeat/release/teardown injection
+  sequence and exact ledger drain; `Other`-intent physical fallback with exact
+  lifecycle; chord teardown through `ReleaseInput` (named key and whole-device) and
+  per-device modifier isolation; failsafe chord with an active semantic chord held.
+
+The pre-existing mixed-version test (`semantic_mode_enqueues_exact_physical_events_at_
+the_wire_boundary`, v1 session) now pins the cross-version fail-open, and every
+existing release-ledger, capacity, failsafe, and lifecycle test passes unchanged.
+
+### Verification
+
+`cargo fmt --all --package kvm-protocol --package kvm-daemon` (clean);
+`cargo clippy --package kvm-protocol --package kvm-daemon --all-targets --features
+kvm-daemon/diagnostics -- -D warnings` (clean); `cargo test --package kvm-protocol
+--package kvm-daemon --all-targets [--features kvm-daemon/diagnostics]`: kvm-protocol
+35 passed / 0 failed; kvm-daemon 245 passed / 0 failed (255 with `diagnostics`) —
+the daemon counts include concurrent unrelated work landing in the same tree; the ten
+tests listed above are this closure's.
+
+### Residual notes
+
+- `supervisor.rs` routes `SemanticInput` through its generic `handle_endpoint_message`
+  arm, so it skips `workspace_control::validate_remote_input`'s device-capability
+  check (the coordinator still enforces host identity, sequencing, dedup, and every
+  injection bound). Wiring the semantic frame into that pre-validation lives outside
+  this remediation's file ownership.
+- The translator's reset-under-count property (previous closure, note 4) is preserved:
+  a mid-chord reset can only miss a translation; the destination's fallback then
+  injects the exact physical press.

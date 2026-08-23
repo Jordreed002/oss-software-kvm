@@ -9,14 +9,17 @@ use std::collections::{BTreeMap, VecDeque};
 use std::fmt;
 
 use kvm_config::Config;
-use kvm_input::{ButtonState, InputEvent, InputPayload, KeyState, PressedState};
+use kvm_input::{
+    native_binding, ButtonState, InputEvent, InputPayload, KeyCode, KeyState, Modifiers,
+    PressedState, SemanticCommand,
+};
 use kvm_network::{
     AdmittedPeer, ConnectionGeneration, ConnectionState, OutboundSendError, PeerEvent, PeerSender,
     TransportPeerIdentity,
 };
 use kvm_protocol::{
-    HelloV1, InputEventV1, MessageType, ReleaseInputV1, ValidationError, WireInputPayloadV1,
-    WireMessage,
+    HelloV1, InputEventV1, MessageType, ReleaseInputV1, SemanticInputV1, ValidationError,
+    WireInputPayloadV1, WireMessage,
 };
 use kvm_security::{IdentityFingerprint, PeerIdentity};
 use kvm_types::{DeviceId, HostId, PeerId, WorkspaceState};
@@ -28,7 +31,10 @@ use crate::core::{
     RoutePolicyUpdateStatus,
 };
 use crate::session_endpoint::SessionEndpoint;
-use crate::wire::{key_code_from_wire, pointer_button_from_wire};
+use crate::wire::{
+    key_code_from_wire, pointer_button_from_wire, semantic_command_from_wire,
+    semantic_input_projection, semantic_input_to_wire, semantic_physical_from_wire,
+};
 use crate::CapturedInput;
 #[cfg(test)]
 use crate::CoreAction;
@@ -43,6 +49,43 @@ pub const MAX_INBOUND_PRESSED_DEVICES: usize = 64;
 pub const MAX_INBOUND_HELD_PER_DEVICE: usize = 256;
 /// Maximum combined keys and pointer buttons retained across the peer session.
 pub const MAX_INBOUND_HELD_TOTAL: usize = 1_024;
+
+/// Destination-side replay state for one inbound semantic chord (§17/§26).
+///
+/// When a semantic frame is consumed, the local platform's native binding for
+/// the intent is pressed through the ordinary inject path: its modifiers
+/// first, then its key. The hold records those synthetic modifiers so the
+/// anchor key's release — physical, or synthetic from a `ReleaseInput` — also
+/// synthesizes their releases in reverse press order. A chord therefore can
+/// never leave a synthetic modifier stuck on this host.
+///
+/// An entry exists only while its anchor key is held in `inbound_pressed`
+/// (enforced by [`PeerSessionCoordinator::scrub_semantic_chords`]), so the
+/// map is bounded by the inbound device bound and never outlives its chord.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct SemanticChord {
+    /// The binding's ordinary key. Never a modifier position: resolution
+    /// refuses modifier keys, and every binding's key is an ordinary key.
+    anchor: KeyCode,
+    /// Synthetic modifier key positions pressed for the chord, in press order.
+    modifiers: Vec<KeyCode>,
+}
+
+/// Canonical synthetic modifier positions for one binding, in press order.
+///
+/// Fixed order (Shift, Control, Alt, Meta) keeps chord press and teardown
+/// deterministic; left positions are used because `Modifiers` collapses each
+/// left/right pair into a single logical group.
+fn canonical_modifier_positions(modifiers: Modifiers) -> impl Iterator<Item = KeyCode> {
+    [
+        modifiers.shift.then_some(KeyCode::ShiftLeft),
+        modifiers.control.then_some(KeyCode::ControlLeft),
+        modifiers.alt.then_some(KeyCode::AltLeft),
+        modifiers.meta.then_some(KeyCode::MetaLeft),
+    ]
+    .into_iter()
+    .flatten()
+}
 
 /// A bounded, non-blocking outbound session boundary.
 pub trait OutboundPeer: Send {
@@ -333,6 +376,9 @@ pub struct PeerSessionCoordinator<I, O> {
     outbound: O,
     authorized: Option<AuthorizedSession>,
     inbound_pressed: BTreeMap<DeviceId, PressedState>,
+    /// §17/§26 destination-side semantic chord holds: one per device, present
+    /// only while the chord's anchor key is held in `inbound_pressed`.
+    semantic_chords: BTreeMap<DeviceId, SemanticChord>,
     synthetic_sequence: u64,
     outbound_sequence: u64,
     /// §36 capture→injection latency ring; present only with the `diagnostics` feature.
@@ -533,6 +579,7 @@ impl<I, O> fmt::Debug for PeerSessionCoordinator<I, O> {
                     .map(pressed_state_len)
                     .sum::<usize>(),
             )
+            .field("semantic_chord_devices", &self.semantic_chords.len())
             .finish_non_exhaustive()
     }
 }
@@ -575,6 +622,7 @@ where
             outbound,
             authorized: None,
             inbound_pressed: BTreeMap::new(),
+            semantic_chords: BTreeMap::new(),
             synthetic_sequence: 0,
             outbound_sequence: 1,
             #[cfg(feature = "diagnostics")]
@@ -1299,6 +1347,27 @@ where
                 self.inject_received(event, now_ns)?;
                 Ok(PeerEventOutcome::Applied)
             }
+            WireMessage::SemanticInput(semantic) => {
+                if HostId::from_bytes(semantic.source_host.0) != self.expected.host_id() {
+                    return Err(self.fail_session(CoordinatorError::IdentityMismatch, now_ns));
+                }
+                // The frame rides the same duplicate window and sequence
+                // discipline as ordinary input: it occupies exactly the stream
+                // position its originating physical press would have occupied.
+                let projection = semantic_input_projection(&semantic);
+                if self.is_recent_duplicate(&projection) {
+                    return Ok(PeerEventOutcome::Ignored);
+                }
+                self.accept_sequence(semantic.sequence, now_ns)?;
+                if let Some(session) = self.authorized.as_mut() {
+                    if session.recent_inputs.len() == 128 {
+                        session.recent_inputs.pop_front();
+                    }
+                    session.recent_inputs.push_back(projection);
+                }
+                self.consume_semantic_input(&semantic, now_ns)?;
+                Ok(PeerEventOutcome::Applied)
+            }
             WireMessage::ReleaseInput(release) => {
                 self.handle_release(&release, now_ns)?;
                 Ok(PeerEventOutcome::Applied)
@@ -1446,10 +1515,175 @@ where
                 state.apply(&event.payload);
                 if state.is_empty() {
                     self.inbound_pressed.remove(&event.source_device);
+                    // A chord hold cannot outlive its anchor; if the device's
+                    // ledger emptied by another route the hold is stale.
+                    self.scrub_semantic_chords();
+                }
+            }
+            // §17/§26 semantic chord teardown: the anchor key's release
+            // completes an inbound semantic chord. Its synthetic modifiers
+            // were pressed ahead of the anchor, so they are released now in
+            // reverse press order and the destination ends the chord exactly.
+            // Physical and synthetic releases (a route-change `ReleaseInput`
+            // naming the anchor) both flow through here, so every release
+            // path tears the chord down the same way.
+            if let InputPayload::Key { code, .. } = event.payload {
+                if self
+                    .semantic_chords
+                    .get(&event.source_device)
+                    .is_some_and(|chord| chord.anchor == code)
+                {
+                    let modifiers = self
+                        .semantic_chords
+                        .remove(&event.source_device)
+                        .map(|chord| chord.modifiers)
+                        .unwrap_or_default();
+                    for code in modifiers.into_iter().rev() {
+                        let release = self.synthetic_event(
+                            event.source_device,
+                            InputPayload::Key {
+                                code,
+                                state: KeyState::Released,
+                            },
+                            now_ns,
+                        )?;
+                        self.inject_received(release, now_ns)?;
+                    }
                 }
             }
         }
         Ok(())
+    }
+
+    /// Consumes one inbound semantic input frame (§17/§26).
+    ///
+    /// A bindable intent is replayed as this host's native chord
+    /// ([`Self::replay_native_chord`]). An intent this build has no binding
+    /// for fails open to the frame's originating physical press — the frame
+    /// carries it exactly for this case — so a newer peer's vocabulary can
+    /// never drop input at the destination.
+    fn consume_semantic_input(
+        &mut self,
+        frame: &SemanticInputV1,
+        now_ns: u64,
+    ) -> Result<(), CoordinatorError> {
+        let device = DeviceId::from_bytes(frame.source_device.0);
+        let Some(command) = semantic_command_from_wire(frame.command) else {
+            debug!(
+                "semantic intent has no native binding on this build; \
+                 injecting the originating physical press"
+            );
+            let event = semantic_physical_from_wire(frame)?;
+            return self.inject_received(event, now_ns);
+        };
+        self.replay_native_chord(device, command, now_ns)
+    }
+
+    /// Presses this host's native binding for `command` through the ordinary
+    /// inject path, replacing the device's held modifiers and prior chord.
+    ///
+    /// The source forwards its modifier presses physically ahead of the
+    /// chord, and its exact-match resolution guarantees those held modifiers
+    /// are exactly the source binding's — so they are released first (via
+    /// [`Self::release_inbound_modifiers`]) and the native chord is never
+    /// blended with the source's modifiers. The binding's synthetic modifiers
+    /// then press in a fixed canonical order ahead of the anchor key, and the
+    /// hold is recorded so the anchor's release tears the chord down in
+    /// reverse. Every synthetic press goes through [`Self::inject_received`],
+    /// so capacity bounds, the pressed-state ledger, diagnostics, and the
+    /// injection failure discipline all apply unchanged.
+    fn replay_native_chord(
+        &mut self,
+        device: DeviceId,
+        command: SemanticCommand,
+        now_ns: u64,
+    ) -> Result<(), CoordinatorError> {
+        self.release_inbound_modifiers(device, now_ns)?;
+        let binding = native_binding(command, self.core.local_platform());
+        let mut modifiers = Vec::new();
+        for code in canonical_modifier_positions(binding.modifiers) {
+            let press = self.synthetic_event(
+                device,
+                InputPayload::Key {
+                    code,
+                    state: KeyState::Pressed,
+                },
+                now_ns,
+            )?;
+            self.inject_received(press, now_ns)?;
+            modifiers.push(code);
+        }
+        let anchor_press = self.synthetic_event(
+            device,
+            InputPayload::Key {
+                code: binding.key,
+                state: KeyState::Pressed,
+            },
+            now_ns,
+        )?;
+        self.inject_received(anchor_press, now_ns)?;
+        self.semantic_chords.insert(
+            device,
+            SemanticChord {
+                anchor: binding.key,
+                modifiers,
+            },
+        );
+        Ok(())
+    }
+
+    /// Releases every held inbound *modifier-position* key for one device
+    /// through the ordinary inject path, and drops the device's chord hold.
+    ///
+    /// Only modifiers are released: an ordinary key the user genuinely holds
+    /// for an unrelated reason must survive a chord replay, while the
+    /// physically forwarded source modifiers are exactly what the chord
+    /// reinterprets. Pointer buttons are untouched. A prior chord's synthetic
+    /// modifiers are modifier positions in the ledger, so they are released
+    /// here too; the hold entry is dropped because its modifiers no longer
+    /// press.
+    fn release_inbound_modifiers(
+        &mut self,
+        device: DeviceId,
+        now_ns: u64,
+    ) -> Result<(), CoordinatorError> {
+        let held: Vec<KeyCode> = self
+            .inbound_pressed
+            .get(&device)
+            .map(|state| {
+                state
+                    .pressed_keys()
+                    .filter(|code| code.is_modifier())
+                    .collect()
+            })
+            .unwrap_or_default();
+        if !held.is_empty() {
+            self.semantic_chords.remove(&device);
+            for code in held {
+                let release = self.synthetic_event(
+                    device,
+                    InputPayload::Key {
+                        code,
+                        state: KeyState::Released,
+                    },
+                    now_ns,
+                )?;
+                self.inject_received(release, now_ns)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Drops chord holds whose anchor key is no longer pressed. A hold exists
+    /// only while its anchor is held in `inbound_pressed`, so the map stays
+    /// bounded by the inbound device bound and never outlives its chord.
+    fn scrub_semantic_chords(&mut self) {
+        let pressed = &self.inbound_pressed;
+        self.semantic_chords.retain(|device, chord| {
+            pressed
+                .get(device)
+                .is_some_and(|state| state.key_is_pressed(chord.anchor))
+        });
     }
 
     fn ensure_inbound_press_capacity(
@@ -1588,6 +1822,10 @@ where
             }
         }
         self.inbound_pressed.retain(|_, state| !state.is_empty());
+        // Chord modifiers were pressed into the same ledger, so the sweep
+        // released them too; only holds whose anchor is still physically held
+        // (a partially failed sweep) remain meaningful.
+        self.scrub_semantic_chords();
         first_error.map_or(Ok(()), Err)
     }
 
@@ -1671,20 +1909,34 @@ where
         {
             return Err(CoordinatorError::WrongActionTarget);
         }
-        // §17/§26 semantic-mode enqueue boundary. When the source resolved
-        // this press into a semantic intent, the intent itself cannot be
-        // dispatched: the wire input vocabulary (`WireInputPayloadV1`) carries
-        // only Key/PointerMove/PointerButton/Scroll and has no semantic
-        // payload variant, and kvm-protocol is deliberately not extended by
-        // the daemon. The exact physical event is therefore enqueued
-        // unchanged (fail-open) so `Semantic` mode is strictly additive — it
-        // can never drop, reorder, or rewrite user input. Making the intent
-        // observable on the wire (a semantic `Input` payload variant or a v3
-        // input message) is the remaining protocol work; the resolved
-        // translation is carried on the effect for tests and diagnostics.
-        if effect.semantic_translation().is_some() {
+        // §17/§26 semantic-mode dispatch. A press the source resolved into a
+        // semantic intent travels as a protocol-v4 `SemanticInputV1` frame —
+        // but only when the admitted session actually negotiated that wire
+        // version. A peer on a pre-semantic build negotiates an older version
+        // and cannot decode the frame, so the exact physical event is
+        // enqueued unchanged (fail-open): mixed-build fleets degrade Semantic
+        // mode to physical passthrough instead of dropping or rewriting user
+        // input. The conversion-failure arm is the same fail-open; it is
+        // unreachable through the resolution stage (which only resolves
+        // ordinary key presses) and exists so dispatch can never drop the
+        // prepared effect.
+        let negotiated = effect.endpoint().selected_protocol_version();
+        if let Some(translation) = effect
+            .semantic_translation()
+            .filter(|_| negotiated >= kvm_protocol::SEMANTIC_INPUT_PROTOCOL_VERSION)
+        {
+            if let Ok(mut frame) = semantic_input_to_wire(&effect.event(), translation.command) {
+                let accepted_sequence = self.next_outbound_sequence()?;
+                frame.sequence = accepted_sequence;
+                self.outbound
+                    .try_send(WireMessage::SemanticInput(frame))
+                    .map_err(CoordinatorError::from)?;
+                return Ok(accepted_sequence);
+            }
+            debug!("semantic translation could not be framed; enqueueing the exact physical event");
+        } else if effect.semantic_translation().is_some() {
             debug!(
-                "semantic translation resolved but not dispatchable on this wire; \
+                "semantic translation resolved on a pre-semantic wire version; \
                  enqueueing the exact physical event"
             );
         }
@@ -1837,7 +2089,7 @@ mod tests {
     use kvm_protocol::{
         InputEventV1, ReleaseAppliedAckV2, ReleaseInputV2, ReleaseReasonV1, ReleaseReasonV2,
         WireButtonState, WireDeviceId, WireHostId, WireInputPayloadV1, WireKeyCode, WireKeyState,
-        WirePeerId, WirePlatform, WirePointerButton,
+        WirePeerId, WirePlatform, WirePointerButton, WireSemanticCommand,
     };
     use kvm_security::IdentityFingerprint;
     use kvm_types::{DisplayId, LogicalPointer, Platform, WorkspaceState};
@@ -2097,12 +2349,12 @@ mod tests {
 
     #[test]
     fn semantic_mode_enqueues_exact_physical_events_at_the_wire_boundary() {
-        // §17/§26 wire boundary: the resolved semantic intent cannot be
-        // dispatched because `WireInputPayloadV1` has no semantic payload
-        // variant, so Semantic mode must fail open — enqueue the exact
-        // physical chord, byte-identical to Physical mode, in capture order.
-        // (The translation itself is asserted on the prepared effect in the
-        // core tests; this pins the enqueue boundary.)
+        // §17/§26 mixed-version fail-open: this session negotiated a
+        // pre-semantic wire version, so the semantic frame type is
+        // unavailable on it and Semantic mode must degrade to enqueueing the
+        // exact physical chord, byte-identical to Physical mode, in capture
+        // order. (Same-build pairs negotiate protocol v4 and dispatch the
+        // intent instead; the test below pins that path.)
         let mut coord = coordinator_with_mode(LOCAL, REMOTE, KeyboardMode::Semantic);
         admit(&mut coord);
         coord.core.mark_workspace_routing_ready(0).unwrap();
@@ -2158,6 +2410,416 @@ mod tests {
             .unwrap();
             assert_eq!(input.payload, expected.payload);
         }
+    }
+
+    /// Activates an admitted session whose endpoint and binding negotiated an
+    /// exact protocol version, for version-dependent dispatch tests.
+    fn admit_at_version(
+        coordinator: &mut PeerSessionCoordinator<RecordingInjection, RecordingOutbound>,
+        version: u16,
+    ) {
+        let mut gate = ConnectionGenerationGate::new(
+            WirePeerId(LOCAL.into_bytes()),
+            WirePeerId(REMOTE.into_bytes()),
+        )
+        .unwrap();
+        let pending = gate.begin_pending(gate.role().direction()).unwrap();
+        let endpoint =
+            SessionEndpoint::for_test(PEER, REMOTE, pending.generation(), version, [1; 32])
+                .unwrap();
+        let mut binding = binding(1);
+        binding.selected_protocol_version = version;
+        assert_eq!(
+            coordinator.activate_binding(endpoint, binding, 0).unwrap(),
+            PeerEventOutcome::Applied
+        );
+    }
+
+    /// Drives the full Ctrl+C chord through `route_captured` with the remote
+    /// host active, returning the wire frames in dispatch order.
+    fn dispatch_chord(
+        coordinator: &mut PeerSessionCoordinator<RecordingInjection, RecordingOutbound>,
+    ) {
+        coordinator.core.mark_workspace_routing_ready(0).unwrap();
+        coordinator
+            .core
+            .update_workspace(
+                WorkspaceState::new(LOCAL, REMOTE, LogicalPointer::new(DISPLAY, 1.0, 1.0)),
+                1,
+            )
+            .unwrap();
+        for (index, (code, state)) in [
+            (KeyCode::ControlLeft, KeyState::Pressed),
+            (KeyCode::KeyC, KeyState::Pressed),
+            (KeyCode::KeyC, KeyState::Released),
+            (KeyCode::ControlLeft, KeyState::Released),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let sequence = u64::try_from(index + 1).unwrap();
+            coordinator
+                .route_captured(
+                    CapturedInput::new(
+                        InputEvent::new(
+                            sequence,
+                            1_000 + sequence,
+                            LOCAL,
+                            DEVICE,
+                            InputPayload::Key { code, state },
+                        ),
+                        crate::EventClassification::Physical,
+                    ),
+                    5_000,
+                )
+                .unwrap();
+        }
+    }
+
+    #[test]
+    fn semantic_mode_dispatches_the_semantic_frame_on_a_v4_session() {
+        // §17/§26 dispatch swap: on a session that negotiated the semantic
+        // wire version, the resolved press travels as a SemanticInput frame
+        // carrying the intent and the exact originating press; the modifier
+        // transitions and releases around it stay physical frames, and every
+        // frame shares one strictly increasing sequence space.
+        let mut coord = coordinator_with_mode(LOCAL, REMOTE, KeyboardMode::Semantic);
+        admit_at_version(&mut coord, kvm_protocol::SEMANTIC_INPUT_PROTOCOL_VERSION);
+        dispatch_chord(&mut coord);
+
+        let frames = &coord.outbound.messages;
+        assert_eq!(frames.len(), 4, "one frame per captured event");
+        let WireMessage::Input(modifier_press) = &frames[0] else {
+            panic!("modifier press stays a physical frame")
+        };
+        let WireMessage::SemanticInput(semantic) = &frames[1] else {
+            panic!("the resolved press must dispatch as the semantic frame")
+        };
+        let WireMessage::Input(key_release) = &frames[2] else {
+            panic!("key release stays a physical frame")
+        };
+        let WireMessage::Input(modifier_release) = &frames[3] else {
+            panic!("modifier release stays a physical frame")
+        };
+        assert_eq!(
+            semantic.command,
+            WireSemanticCommand::Copy,
+            "windows ctrl+c resolves to the copy intent"
+        );
+        assert_eq!(
+            semantic.physical,
+            WireInputPayloadV1::Key {
+                code: WireKeyCode {
+                    usage_page: 0x07,
+                    usage: 0x06,
+                },
+                state: WireKeyState::Down,
+            },
+            "the rider is the exact originating physical press payload"
+        );
+        assert_eq!(semantic.sequence, 2);
+        let mut previous_sequence = 0_u64;
+        for sequence in [
+            modifier_press.sequence,
+            semantic.sequence,
+            key_release.sequence,
+            modifier_release.sequence,
+        ] {
+            assert!(sequence > previous_sequence, "frames stay in order");
+            previous_sequence = sequence;
+        }
+    }
+
+    #[test]
+    fn physical_mode_on_a_v4_session_stays_physical() {
+        // The dispatch swap is semantic-mode-only: with mode Physical the
+        // same chord on the same v4 session produces four ordinary Input
+        // frames and no semantic frame.
+        let mut coord = coordinator_with_mode(LOCAL, REMOTE, KeyboardMode::Physical);
+        admit_at_version(&mut coord, kvm_protocol::SEMANTIC_INPUT_PROTOCOL_VERSION);
+        dispatch_chord(&mut coord);
+        assert_eq!(coord.outbound.messages.len(), 4);
+        assert!(coord
+            .outbound
+            .messages
+            .iter()
+            .all(|frame| matches!(frame, WireMessage::Input(_))));
+    }
+
+    /// Destination-side helper: one inbound semantic frame.
+    fn semantic(
+        sequence: u64,
+        device: DeviceId,
+        command: WireSemanticCommand,
+        usage: u16,
+    ) -> WireMessage {
+        WireMessage::SemanticInput(SemanticInputV1 {
+            sequence,
+            timestamp_ns: sequence * 10,
+            source_host: WireHostId(REMOTE.into_bytes()),
+            source_device: WireDeviceId(device.into_bytes()),
+            command,
+            physical: WireInputPayloadV1::Key {
+                code: WireKeyCode {
+                    usage_page: 0x07,
+                    usage,
+                },
+                state: WireKeyState::Down,
+            },
+        })
+    }
+
+    /// A destination coordinator whose local platform is macOS: the lone
+    /// Command-based platform, so a Windows source chord visibly translates.
+    fn mac_destination() -> PeerSessionCoordinator<RecordingInjection, RecordingOutbound> {
+        let mut config = Config::default();
+        config.paired_hosts.push(PairedHostConfig {
+            host_id: REMOTE,
+            peer_id: PEER,
+            name: "remote".into(),
+            platform: Platform::Windows,
+            identity_fingerprint: IdentityFingerprint::from_sha256(FINGERPRINT).to_string(),
+            last_address: None,
+        });
+        let workspace = WorkspaceState::new(LOCAL, LOCAL, LogicalPointer::new(DISPLAY, 0.0, 0.0));
+        PeerSessionCoordinator::new(
+            DaemonCore::new(config, workspace, Platform::MacOS).unwrap(),
+            expected(),
+            RecordingInjection::default(),
+            RecordingOutbound::default(),
+        )
+        .unwrap()
+    }
+
+    fn injected_payloads(
+        coordinator: &PeerSessionCoordinator<RecordingInjection, RecordingOutbound>,
+    ) -> Vec<InputPayload> {
+        coordinator
+            .injection
+            .events
+            .iter()
+            .map(|event| event.payload)
+            .collect()
+    }
+
+    #[test]
+    fn destination_replays_the_native_binding_and_tears_down_on_release() {
+        // §17/§26 destination consumption: a Windows Ctrl+C arriving at a
+        // macOS host replays as the native Cmd+C chord through `native_binding`
+        // and tracks the chord in the pressed ledger so the source's physical
+        // lifecycle releases the destination exactly:
+        //   ctrl down (forwarded) -> ctrl released (reinterpreted by the chord)
+        //   -> meta pressed, c pressed (the native binding)
+        //   -> c repeat replays with meta held
+        //   -> c release tears the chord down (meta released in reverse)
+        //   -> ctrl release is an unmatched no-op.
+        let mut coord = mac_destination();
+        admit(&mut coord);
+        coord
+            .handle_authorized_message(key(1, DEVICE, 0xe0, WireKeyState::Down), 1)
+            .unwrap();
+        coord
+            .handle_authorized_message(semantic(2, DEVICE, WireSemanticCommand::Copy, 0x06), 2)
+            .unwrap();
+        coord
+            .handle_authorized_message(key(3, DEVICE, 0x06, WireKeyState::Repeat), 3)
+            .unwrap();
+        coord
+            .handle_authorized_message(key(4, DEVICE, 0x06, WireKeyState::Up), 4)
+            .unwrap();
+        coord
+            .handle_authorized_message(key(5, DEVICE, 0xe0, WireKeyState::Up), 5)
+            .unwrap();
+
+        assert_eq!(
+            injected_payloads(&coord),
+            vec![
+                InputPayload::Key {
+                    code: KeyCode::ControlLeft,
+                    state: KeyState::Pressed,
+                },
+                InputPayload::Key {
+                    code: KeyCode::ControlLeft,
+                    state: KeyState::Released,
+                },
+                InputPayload::Key {
+                    code: KeyCode::MetaLeft,
+                    state: KeyState::Pressed,
+                },
+                InputPayload::Key {
+                    code: KeyCode::KeyC,
+                    state: KeyState::Pressed,
+                },
+                InputPayload::Key {
+                    code: KeyCode::KeyC,
+                    state: KeyState::Repeated,
+                },
+                InputPayload::Key {
+                    code: KeyCode::KeyC,
+                    state: KeyState::Released,
+                },
+                InputPayload::Key {
+                    code: KeyCode::MetaLeft,
+                    state: KeyState::Released,
+                },
+                InputPayload::Key {
+                    code: KeyCode::ControlLeft,
+                    state: KeyState::Released,
+                },
+            ]
+        );
+        assert!(coord.inbound_pressed.is_empty(), "ledger drains exactly");
+        assert!(coord.semantic_chords.is_empty(), "chord hold drains");
+    }
+
+    #[test]
+    fn untranslatable_semantic_intents_fall_back_to_the_physical_press() {
+        // A newer peer may send an intent this build has no binding for; the
+        // frame's originating physical press is injected instead — exactly
+        // what physical mode would have done — and its lifecycle stays exact.
+        let mut coord = mac_destination();
+        admit(&mut coord);
+        coord
+            .handle_authorized_message(semantic(1, DEVICE, WireSemanticCommand::Other(41), 0x06), 1)
+            .unwrap();
+        assert_eq!(
+            injected_payloads(&coord),
+            vec![InputPayload::Key {
+                code: KeyCode::KeyC,
+                state: KeyState::Pressed,
+            }]
+        );
+        assert!(coord
+            .inbound_pressed
+            .get(&DEVICE)
+            .is_some_and(|state| state.key_is_pressed(KeyCode::KeyC)));
+        coord
+            .handle_authorized_message(key(2, DEVICE, 0x06, WireKeyState::Up), 2)
+            .unwrap();
+        assert!(coord.inbound_pressed.is_empty());
+        assert!(coord.semantic_chords.is_empty());
+    }
+
+    #[test]
+    fn semantic_chord_releases_through_release_input_and_device_releases() {
+        // The source releases its physical keys through the ordinary release
+        // machinery; naming the anchor key tears the synthetic chord down too,
+        // and an everything-release drains the whole ledger.
+        let mut coord = mac_destination();
+        admit(&mut coord);
+        coord
+            .handle_authorized_message(semantic(1, DEVICE, WireSemanticCommand::Copy, 0x06), 1)
+            .unwrap();
+        assert!(
+            !coord.inbound_pressed.is_empty(),
+            "chord modifiers are held in the ledger"
+        );
+        coord
+            .handle_authorized_message(
+                WireMessage::ReleaseInput(ReleaseInputV1 {
+                    sequence: 2,
+                    source_host: WireHostId(REMOTE.into_bytes()),
+                    source_device: Some(WireDeviceId(DEVICE.into_bytes())),
+                    reason: ReleaseReasonV1::RouteChanged,
+                    keys: vec![WireKeyCode {
+                        usage_page: 0x07,
+                        usage: 0x06,
+                    }],
+                    buttons: Vec::new(),
+                }),
+                2,
+            )
+            .unwrap();
+        assert!(coord.inbound_pressed.is_empty());
+        assert!(coord.semantic_chords.is_empty());
+
+        // Second chord on another device, drained by a whole-device release.
+        coord
+            .handle_authorized_message(
+                semantic(3, OTHER_DEVICE, WireSemanticCommand::Copy, 0x06),
+                3,
+            )
+            .unwrap();
+        assert!(coord.semantic_chords.contains_key(&OTHER_DEVICE));
+        coord
+            .handle_authorized_message(
+                WireMessage::ReleaseInput(ReleaseInputV1 {
+                    sequence: 4,
+                    source_host: WireHostId(REMOTE.into_bytes()),
+                    source_device: Some(WireDeviceId(OTHER_DEVICE.into_bytes())),
+                    reason: ReleaseReasonV1::RouteChanged,
+                    keys: Vec::new(),
+                    buttons: Vec::new(),
+                }),
+                4,
+            )
+            .unwrap();
+        assert!(coord.inbound_pressed.is_empty());
+        assert!(coord.semantic_chords.is_empty());
+    }
+
+    #[test]
+    fn semantic_replay_releases_only_the_originating_devices_modifiers() {
+        // Modifier release before a chord replay is per-device: a modifier
+        // held by another peer device must survive untouched.
+        let mut coord = mac_destination();
+        admit(&mut coord);
+        coord
+            .handle_authorized_message(key(1, OTHER_DEVICE, 0xe0, WireKeyState::Down), 1)
+            .unwrap();
+        coord
+            .handle_authorized_message(semantic(2, DEVICE, WireSemanticCommand::Copy, 0x06), 2)
+            .unwrap();
+        assert_eq!(
+            injected_payloads(&coord),
+            vec![
+                InputPayload::Key {
+                    code: KeyCode::ControlLeft,
+                    state: KeyState::Pressed,
+                },
+                InputPayload::Key {
+                    code: KeyCode::MetaLeft,
+                    state: KeyState::Pressed,
+                },
+                InputPayload::Key {
+                    code: KeyCode::KeyC,
+                    state: KeyState::Pressed,
+                },
+            ],
+            "the other device's modifier is not released and no force-release runs"
+        );
+        assert!(coord
+            .inbound_pressed
+            .get(&OTHER_DEVICE)
+            .is_some_and(|state| state.key_is_pressed(KeyCode::ControlLeft)));
+        assert!(coord.semantic_chords.contains_key(&DEVICE));
+    }
+
+    #[test]
+    fn failsafe_chord_releases_an_active_semantic_chord() {
+        // The §25 escape must survive semantic dispatch: with a synthetic
+        // chord held on this destination, the failsafe chord releases it —
+        // modifiers and anchor — through the same inbound sweep as every
+        // other hold.
+        let mut coord = mac_destination();
+        admit(&mut coord);
+        coord.core.mark_workspace_routing_ready(0).unwrap();
+        coord
+            .handle_authorized_message(semantic(1, DEVICE, WireSemanticCommand::Copy, 0x06), 1)
+            .unwrap();
+        assert!(!coord.inbound_pressed.is_empty());
+        assert!(!coord.semantic_chords.is_empty());
+
+        let outcome = drive_failsafe_chord(&mut coord);
+        assert!(
+            outcome.failsafe_activated(),
+            "the chord must activate the failsafe"
+        );
+        assert!(
+            coord.inbound_pressed.is_empty(),
+            "the semantic chord must not survive the failsafe"
+        );
+        assert!(coord.semantic_chords.is_empty());
     }
 
     #[test]

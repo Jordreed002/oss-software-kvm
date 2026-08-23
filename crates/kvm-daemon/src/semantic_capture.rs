@@ -11,17 +11,16 @@
 //! The result is the [`SemanticTranslation`] carried on the core's prepared
 //! remote effect (`RemoteInputEffect`).
 //!
-//! # Wire boundary (why translation stops here)
+//! # Wire boundary (how the intent travels)
 //!
-//! `WireInputPayloadV1` carries exactly `Key`, `PointerMove`, `PointerButton`,
-//! and `Scroll` — there is no semantic payload variant, and `kvm-protocol` is
-//! deliberately not extended by this stage. A resolved translation therefore
-//! cannot be dispatched as intent: the enqueue boundary
-//! (`PeerSessionCoordinator::dispatch_remote_effect`) fails open and sends the
-//! exact physical event unchanged, so `Semantic` mode is strictly additive and
-//! never drops or reorders user input. The translation is still computed and
-//! carried on the effect so tests and diagnostics can prove it end-to-end;
-//! extending the wire with a semantic payload variant is the remaining work.
+//! `dispatch_remote_effect` sends the resolved intent as a protocol-v4
+//! `SemanticInputV1` frame whenever the admitted session negotiated that wire
+//! version or newer, carrying the command plus the exact originating physical
+//! press (the destination's deterministic fallback). A session negotiated
+//! below v4 — a peer on a pre-semantic build — cannot decode the frame, so
+//! the enqueue boundary fails open and sends the exact physical event
+//! unchanged: `Semantic` mode degrades to physical passthrough on
+//! mixed-build pairs and can never drop or reorder user input.
 //!
 //! # Release exactness
 //!
@@ -33,10 +32,13 @@
 //! - a physical release of a tracked modifier position clears it immediately
 //!   (`Modifiers::apply` is level-driven, so a release observed without its
 //!   press still clears the group — it can only under-count, never over-count);
-//! - the enqueued event is never rewritten, so the daemon's held-state
-//!   ledgers, latches, failsafe releases, and route-change cleanup remain
-//!   byte-identical to physical mode. An under-counted snapshot merely fails
-//!   to resolve (physical passthrough); it cannot invent a held modifier.
+//! - the source's enqueued event is never rewritten, so the daemon's
+//!   held-state ledgers, latches, failsafe releases, and route-change cleanup
+//!   stay byte-identical to physical mode. An under-counted snapshot merely
+//!   fails to resolve (physical passthrough); it cannot invent a held
+//!   modifier. (The *destination* replays the resolved chord as its own
+//!   native binding and tracks that synthetic chord in its inbound ledger;
+//!   see `session.rs`.)
 //!
 //! # Fail-open policy
 //!
