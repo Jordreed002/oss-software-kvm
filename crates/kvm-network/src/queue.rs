@@ -21,6 +21,7 @@ impl TrafficClass {
     pub const fn for_message(message: &WireMessage) -> Self {
         match message.message_type() {
             MessageType::Input
+            | MessageType::SemanticInput
             | MessageType::DeviceSnapshot
             | MessageType::DeviceAdded
             | MessageType::DeviceRemoved

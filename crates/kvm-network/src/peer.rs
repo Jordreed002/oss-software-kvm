@@ -2313,6 +2313,7 @@ fn validate_message_identity(
         WireMessage::DisplaySnapshot(value) => value.host_id == remote,
         WireMessage::DisplayUpdated(value) => value.display.host_id == remote,
         WireMessage::Input(value) => value.source_host == remote,
+        WireMessage::SemanticInput(value) => value.source_host == remote,
         WireMessage::PointerEnter(value) => {
             value.source_host == remote && value.destination_host == local
         }
@@ -4135,6 +4136,132 @@ mod tests {
         assert!(admitted.supports_release_proof());
         assert_ne!(admitted.session_id(), [0; 32]);
         assert_eq!(format!("{admitted:?}"), "AdmittedPeer([REDACTED])");
+    }
+
+    // A mid-session bidirectional blackhole (the peer neither reads nor
+    // writes but the stream stays open, so there is no FIN to observe) must
+    // surface through the heartbeat deadline — the session keeps failing
+    // safe: it exits, reports the disconnect reason, and never wedges.
+    #[allow(clippy::too_many_lines)] // One linear scenario; splitting hides the sequence.
+    #[tokio::test(start_paused = true)]
+    async fn admitted_session_blackholed_midstream_times_out_via_heartbeat() {
+        let local_hello = hello(1);
+        let remote_hello = hello(20);
+        let (session_stream, mut peer_stream) = tokio::io::duplex(8_192);
+        let secure_stream = TestSecureStream {
+            stream: session_stream,
+            identity: identity(&remote_hello),
+        };
+        let admission = TestAdmission {
+            hello: local_hello,
+        };
+        let config = PersistentPeerConfig {
+            heartbeat: HeartbeatConfig {
+                interval: Duration::from_millis(10),
+                degraded_after: Duration::from_millis(20),
+                disconnect_after: Duration::from_millis(30),
+                maximum_outstanding_pings: 8,
+            },
+            ..test_config()
+        };
+        let (outbound_sender, mut outbound) = mpsc::channel(8);
+        let (events, event_receiver) = mpsc::channel(16);
+        let (_shutdown_sender, mut shutdown) = watch::channel(false);
+
+        let session = run_session(
+            secure_stream,
+            &admission,
+            config,
+            &mut outbound,
+            &events,
+            &mut shutdown,
+        );
+        // The peer completes admission, answers one ping to prove the session
+        // is healthy, then parks forever holding its half of the stream open:
+        // no reads, no writes, no close — a true bidirectional blackhole.
+        let peer = tokio::spawn(async move {
+            let received_hello =
+                match read_message_for_version(&mut peer_stream, PROTOCOL_VERSION_V1)
+                    .await
+                    .unwrap()
+                {
+                    WireMessage::Hello(hello) => hello,
+                    other => panic!("expected hello, got {other:?}"),
+                };
+            write_test_message_for_version(
+                &mut peer_stream,
+                &WireMessage::Hello(remote_hello.clone()),
+                PROTOCOL_VERSION_V1,
+            )
+            .await;
+            assert!(matches!(
+                read_message_for_version(&mut peer_stream, PROTOCOL_VERSION_V1)
+                    .await
+                    .unwrap(),
+                WireMessage::Authenticate(_)
+            ));
+            write_test_message_for_version(
+                &mut peer_stream,
+                &WireMessage::Authenticate(AuthenticateV1 {
+                    peer_id: remote_hello.peer_id,
+                    scheme: "test-channel-binding-v1".to_owned(),
+                    proof: received_hello.nonce.to_vec(),
+                }),
+                PROTOCOL_VERSION_V1,
+            )
+            .await;
+            write_test_message_for_version(
+                &mut peer_stream,
+                &WireMessage::Ping(kvm_protocol::PingV1 {
+                    nonce: 7,
+                    sent_at_ns: 8,
+                }),
+                PROTOCOL_VERSION_V1,
+            )
+            .await;
+            assert!(matches!(
+                read_message_for_version(&mut peer_stream, PROTOCOL_VERSION_V1)
+                    .await
+                    .unwrap(),
+                WireMessage::Pong(_)
+            ));
+            std::future::pending::<()>().await;
+        });
+
+        // Outbound traffic keeps flowing into the void during the blackhole:
+        // the sender parks after queueing one pointer move so the outbound
+        // channel stays open (a dropped sender would end the session as
+        // OutboundClosed before the heartbeat deadline could fire).
+        let enqueued = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+            let _ = outbound_sender
+                .send(WireMessage::Input(InputEventV1 {
+                    sequence: 99,
+                    timestamp_ns: 100,
+                    source_host: WireHostId([7; 16]),
+                    source_device: WireDeviceId([9; 16]),
+                    payload: WireInputPayloadV1::PointerMove { dx: 1.0, dy: 2.0 },
+                }))
+                .await;
+            std::future::pending::<()>().await;
+        });
+
+        tokio::time::advance(Duration::from_millis(60)).await;
+        let result = tokio::time::timeout(Duration::from_secs(5), session)
+            .await
+            .expect("blackholed session must exit via heartbeat, not wedge");
+        peer.abort();
+        enqueued.abort();
+        let failure = result.unwrap_err();
+        assert!(matches!(failure.error, SessionError::HeartbeatTimeout));
+        // The failure report carries the reconciliation signal the daemon's
+        // cleanup path keys on, and no lifecycle event may be left unsent
+        // beyond what the channel already drained during admission.
+        assert_eq!(
+            disconnect_reason(&failure.error),
+            DisconnectReason::HeartbeatTimeout
+        );
+        drop(event_receiver);
     }
 
     #[tokio::test]
