@@ -35,3 +35,95 @@ jobs:
         run: cargo clippy --workspace --all-targets --features kvm-daemon/diagnostics -- -D warnings
       - name: Run tests (diagnostics feature)
         run: cargo test --workspace --all-targets --features kvm-daemon/diagnostics
+
+  msrv:
+    name: MSRV (1.91)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.91
+      - uses: Swatinem/rust-cache@v2
+      # `cargo check` only, no clippy/rustfmt: lint sets drift across compiler
+      # versions and are already enforced on stable in the `rust` job. The
+      # MSRV is declared as [workspace.package] rust-version in Cargo.toml;
+      # the floor is set by const Duration::from_mins (stable since 1.91)
+      # and by rcgen/time dev-dependencies that require 1.88+.
+      - name: Check workspace compiles on the MSRV
+        run: cargo check --workspace --all-targets
+
+  panel:
+    name: Control panel
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: apps/control-panel
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: apps/control-panel/package-lock.json
+      - name: Install dependencies
+        run: npm ci
+      # There is no ESLint/Prettier (or other lint) configuration in
+      # apps/control-panel yet; add a lint step here when one lands.
+      - name: Type-check
+        run: npx tsc --noEmit
+      - name: Build
+        run: npm run build
+
+  cargo-deny:
+    name: cargo-deny
+    runs-on: ubuntu-latest
+    # The action defaults to `cargo deny --all-features check` against the
+    # root manifest, enforcing deny.toml: vulnerabilities, yanked, unmaintained
+    # and unsound advisories denied; licenses restricted to the allowlist;
+    # duplicate versions warned.
+    continue-on-error: false
+    steps:
+      - uses: actions/checkout@v4
+      - uses: EmbarkStudios/cargo-deny-action@v2
+
+  coverage:
+    name: Coverage (informational)
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: llvm-tools-preview
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@cargo-llvm-cov
+      - name: Generate lcov report
+        run: cargo llvm-cov --workspace --all-targets --lcov --output-path lcov.info
+      - name: Upload coverage report
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-lcov
+          path: lcov.info
+          if-no-files-found: warn
+
+  machete:
+    name: cargo-machete (informational)
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: taiki-e/install-action@cargo-machete
+      - name: Check for unused dependencies
+        run: cargo machete
+
+  docs:
+    name: Rustdoc
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build documentation with warnings denied
+        env:
+          RUSTDOCFLAGS: "-D warnings"
+        run: cargo doc --workspace --no-deps --document-private-items

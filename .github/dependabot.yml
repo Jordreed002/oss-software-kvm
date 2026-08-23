@@ -1,0 +1,25 @@
+version: 2
+updates:
+  # Rust workspace (root Cargo.toml / Cargo.lock).
+  - package-ecosystem: "cargo"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    commit-message:
+      prefix: "chore"
+    groups:
+      rust-dependencies:
+        patterns:
+          - "*"
+
+  # Link Console control panel (apps/control-panel).
+  - package-ecosystem: "npm"
+    directory: "/apps/control-panel"
+    schedule:
+      interval: "weekly"
+    commit-message:
+      prefix: "chore"
+    groups:
+      npm-dependencies:
+        patterns:
+          - "*"
