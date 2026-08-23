@@ -1400,6 +1400,24 @@ where
         Ok(changed)
     }
 
+    /// Drives the stuck-key sweep through the exact coordinator's held-state
+    /// ledger and its ordinary release queue.
+    ///
+    /// # Errors
+    ///
+    /// Returns a redacted coordinator cleanup error; swept entries stay owned
+    /// for retry.
+    pub(crate) fn reconcile_pressed_state(
+        &mut self,
+        now_ns: u64,
+        max_hold_ns: u64,
+    ) -> Result<usize, PeerSessionSupervisorError> {
+        self.engine
+            .coordinator
+            .reconcile_pressed_state(now_ns, max_hold_ns)
+            .map_err(PeerSessionSupervisorError::Coordinator)
+    }
+
     #[cfg(test)]
     pub(crate) fn activate_workspace_test_session(
         &mut self,

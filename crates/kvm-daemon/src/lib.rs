@@ -9,6 +9,8 @@ mod device_inventory;
 #[cfg(feature = "diagnostics")]
 mod diagnostics_snapshot;
 mod display_inventory;
+pub mod failsafe_audit;
+pub mod failsafe_hook;
 mod peer_manager;
 mod platform;
 mod pointer_handoff;
@@ -33,6 +35,10 @@ pub use display_inventory::{
     DisplayInventory, DisplayInventoryConfig, DisplayInventoryError, DisplayInventorySnapshot,
     HostDisplayInventorySnapshot, MAX_INVENTORY_DISPLAYS_PER_HOST, MAX_INVENTORY_REMOTE_HOSTS,
     MAX_INVENTORY_TOTAL_DISPLAYS,
+};
+pub use failsafe_audit::{
+    FailsafeAuditEvent, FailsafeEventCause, FAILSAFE_AUDIT_CAPACITY, FAILSAFE_AUDIT_FILENAME,
+    FAILSAFE_AUDIT_FILE_CAP_BYTES,
 };
 pub use peer_manager::{
     DeviceInventoryUpdateOutcome, DeviceInventoryUpdateState, DeviceRouteUpdateOutcome,

@@ -893,6 +893,29 @@ where
         self.core.tick(now_ns)
     }
 
+    /// Stuck-key sweep over the outbound held ledger: queues and then drains
+    /// releases for every remotely held control the session can no longer
+    /// prove alive (held longer than `max_hold_ns` since its press or last
+    /// repeat). Reuses the ordinary cleanup queue; no parallel ledger exists.
+    ///
+    /// # Errors
+    ///
+    /// Returns a cleanup-capacity or FIFO delivery error; the entries stay
+    /// owned for retry exactly like every other cleanup path.
+    pub(crate) fn reconcile_pressed_state(
+        &mut self,
+        now_ns: u64,
+        max_hold_ns: u64,
+    ) -> Result<usize, CoordinatorError> {
+        let queued = self
+            .core
+            .queue_stale_remote_held_cleanup(now_ns, max_hold_ns)?;
+        if queued > 0 {
+            self.drain_remote_cleanup(now_ns)?;
+        }
+        Ok(queued)
+    }
+
     fn trigger_capture_emergency(&mut self, now_ns: u64) -> Result<(), CoordinatorError> {
         self.core.trigger_emergency(now_ns)?;
         // Emergency chord must release locally-injected inbound keys too, not just

@@ -9,7 +9,7 @@ use std::fmt;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use kvm_config::{ConfigStore, ConfigStoreAuthority, ConfiguredDeviceRoute, DeviceRouteConfig};
 use kvm_discovery::DiscoverySnapshot;
@@ -27,9 +27,11 @@ use kvm_topology::{WorkspaceLink, WorkspacePlacement};
 use kvm_types::{DeviceId, DeviceRoute, Display, Edge, InputDevice, PeerId, Point};
 use thiserror::Error;
 use tokio::sync::{mpsc, watch};
+use tracing::warn;
 
 use crate::core::{CaptureRouteState, RoutePolicyUpdateError, RoutePolicyUpdateStatus};
 use crate::device_inventory::DeviceInventorySnapshot;
+use crate::failsafe_audit::{FailsafeAuditEvent, FailsafeAuditLog, FailsafeEventCause};
 use crate::session::RoutePolicyCoordinatorError;
 use crate::{
     CaptureDisposition, CaptureLifecycleState, CapturedInput, ManagedSessionOutbound, OutboundPeer,
@@ -39,6 +41,13 @@ use crate::{
 
 pub const MAX_MANAGED_PEERS: usize = 256;
 pub const MAX_CANDIDATES_PER_PEER: usize = 32;
+
+/// Default synchronous routing budget for one captured record. A routing call
+/// slower than this gates suppression through the native-capture gate: the
+/// capture callback must never be held hostage by an unbounded routing path.
+pub(crate) const DEFAULT_ROUTING_BUDGET: Duration = Duration::from_millis(50);
+/// Default stuck-key bound for the pressed-state reconciliation sweep.
+pub(crate) const DEFAULT_MAXIMUM_KEY_HOLD: Duration = Duration::from_mins(1);
 
 static NEXT_MANAGER_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -58,6 +67,14 @@ pub struct PeerManagerConfig {
     /// Operator-provided candidates ([`PeerManager::replace_selected_outbound_candidate`])
     /// bypass this pin — an explicit operator address is trusted verbatim.
     pub expected_service_port: Option<u16>,
+    /// Synchronous budget for one selected routing call. A call that exceeds
+    /// it trips the routing budget watchdog: the same gate native capture
+    /// discontinuation uses is set, the held-input cleanup path runs, and the
+    /// event is counted. Injectable so tests can trip it deterministically.
+    pub routing_budget: Duration,
+    /// A remotely held key or button with no press/repeat traffic for longer
+    /// than this bound is released by the pressed-state reconciliation sweep.
+    pub maximum_key_hold: Duration,
 }
 
 impl Default for PeerManagerConfig {
@@ -67,6 +84,8 @@ impl Default for PeerManagerConfig {
             maximum_candidates_per_peer: MAX_CANDIDATES_PER_PEER,
             reconnect: ReconnectPolicy::default(),
             expected_service_port: None,
+            routing_budget: DEFAULT_ROUTING_BUDGET,
+            maximum_key_hold: DEFAULT_MAXIMUM_KEY_HOLD,
         }
     }
 }
@@ -79,6 +98,8 @@ impl PeerManagerConfig {
             || self.maximum_candidates_per_peer > MAX_CANDIDATES_PER_PEER
             || self.reconnect.validate().is_err()
             || self.expected_service_port == Some(0)
+            || self.routing_budget.is_zero()
+            || self.maximum_key_hold.is_zero()
         {
             return Err(PeerManagerError::InvalidConfiguration);
         }
@@ -270,6 +291,16 @@ impl fmt::Debug for DeviceRouteUpdateOutcome {
     }
 }
 
+/// Fail-safe routing state shared by the panic-hook gate, the routing-budget
+/// watchdog, and the pressed-state reconciliation sweep.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct FailsafeRoutingState {
+    armed: bool,
+    panic_released: bool,
+    budget_gated: bool,
+    budget_exceeded: u64,
+}
+
 /// Deterministic scheduler for one immutable paired-peer snapshot.
 pub struct PeerManager<I, O> {
     manager_id: u64,
@@ -279,6 +310,8 @@ pub struct PeerManager<I, O> {
     shutting_down: bool,
     selected_capture_available: bool,
     workspace: Option<WorkspaceControlPlane>,
+    failsafe: FailsafeRoutingState,
+    failsafe_audit: FailsafeAuditLog,
 }
 
 impl<I, O> fmt::Debug for PeerManager<I, O>
@@ -373,6 +406,8 @@ where
             shutting_down: false,
             selected_capture_available: false,
             workspace: None,
+            failsafe: FailsafeRoutingState::default(),
+            failsafe_audit: FailsafeAuditLog::default(),
         })
     }
 
@@ -501,14 +536,32 @@ where
     /// Remote suppression is reported only after queue acceptance. Every
     /// rejected or unavailable decision remains local; an `Inert` outcome is
     /// the core's explicit quarantine/handoff suppression decision.
+    ///
+    /// Two manager-side failsafes run here: a tripped process panic failsafe
+    /// (observed only when armed via [`Self::arm_panic_failsafe`]) releases
+    /// held input and fails open before any routing, and the routing budget
+    /// watchdog measures the routing call itself — a call slower than the
+    /// configured budget sets the native-capture gate so later callbacks can
+    /// never be blocked on a degraded routing path.
     #[must_use]
     pub fn route_selected_capture(
         &mut self,
         captured: CapturedInput,
         now_ns: u64,
     ) -> SelectedCaptureOutcome {
-        if self.shutting_down || !self.selected_capture_available {
+        if self.shutting_down {
             return SelectedCaptureOutcome::rejected(SelectedCaptureState::Rejected);
+        }
+        if self.failsafe.armed && crate::failsafe_hook::tripped() {
+            self.release_for_panic_failsafe(now_ns);
+            return SelectedCaptureOutcome::rejected(SelectedCaptureState::Local);
+        }
+        if !self.selected_capture_available {
+            return SelectedCaptureOutcome::rejected(if self.failsafe.budget_gated {
+                SelectedCaptureState::Local
+            } else {
+                SelectedCaptureState::Rejected
+            });
         }
         let boundary_result = if captured.classification == crate::EventClassification::Physical
             && matches!(captured.event.payload, InputPayload::PointerMove { .. })
@@ -530,60 +583,54 @@ where
         let Some(workspace) = self.workspace.as_mut() else {
             return SelectedCaptureOutcome::rejected(SelectedCaptureState::Rejected);
         };
+        if let Some(rejection) = gate_selected_session(&mut self.peers, workspace, now_ns) {
+            return rejection;
+        }
         let selected = workspace.selected_pointer_peer();
         let Some(peer) = self.peers.get_mut(&selected) else {
             return SelectedCaptureOutcome::rejected(SelectedCaptureState::Rejected);
         };
-        if peer.revoked {
-            return SelectedCaptureOutcome::rejected(SelectedCaptureState::Rejected);
-        }
-        if let Some(generation) = peer.supervisor.active_generation() {
-            if peer.task != (PeerTaskSlot::Session { generation }) {
-                let _ = peer
-                    .supervisor
-                    .connection_lost_with_workspace(generation, workspace, now_ns);
-                return SelectedCaptureOutcome::rejected(
-                    if peer.supervisor.active_generation().is_some() {
-                        SelectedCaptureState::CleanupPending
-                    } else {
-                        SelectedCaptureState::SessionRetired
-                    },
-                );
-            }
-        } else if let PeerTaskSlot::Session { generation } = peer.task {
-            if peer.supervisor.pending_generation() == Some(generation) {
-                return SelectedCaptureOutcome::rejected(SelectedCaptureState::Gated);
-            }
-            peer.task = PeerTaskSlot::Idle;
-            schedule_retry(peer, Duration::from_nanos(now_ns));
-            return SelectedCaptureOutcome::rejected(SelectedCaptureState::SessionRetired);
+
+        // Routing budget watchdog: `now_ns` is sampled by the runtime before
+        // this call, so a wall-clock Instant is the only way to observe the
+        // routing call's own duration. Only the comparison is configurable;
+        // the measurement itself is one monotonic clock read per event.
+        let routing_started = Instant::now();
+        let routed = peer
+            .supervisor
+            .route_capture_with_workspace(workspace, captured, now_ns);
+        let routing_elapsed = routing_started.elapsed();
+        if routing_elapsed > self.config.routing_budget {
+            self.trip_routing_budget_watchdog(now_ns);
         }
 
-        match peer
-            .supervisor
-            .route_capture_with_workspace(workspace, captured, now_ns)
-        {
-            Ok(outcome) => SelectedCaptureOutcome {
-                disposition: outcome.disposition(),
-                failsafe_activated: outcome.failsafe_activated(),
-                state: match (outcome.disposition(), outcome.state()) {
-                    (CaptureDisposition::SuppressLocal, CaptureRouteState::RemoteQueued) => {
-                        SelectedCaptureState::RemoteQueued
-                    }
-                    (CaptureDisposition::SuppressLocal, _) => SelectedCaptureState::Inert,
-                    (CaptureDisposition::AllowLocal, CaptureRouteState::Local) => {
-                        SelectedCaptureState::Local
-                    }
-                    (CaptureDisposition::AllowLocal, _) => SelectedCaptureState::Gated,
-                },
-            },
+        match routed {
+            Ok(outcome) => {
+                if outcome.failsafe_activated() {
+                    self.failsafe_audit
+                        .record(FailsafeEventCause::ChordActivated, now_ns);
+                }
+                selected_outcome_from_capture(outcome)
+            }
             Err(failure) => {
                 let safe = failure.outcome();
                 let _ = failure.into_error();
-                let active = peer.supervisor.active_generation().is_some();
+                // The watchdog above may have re-borrowed the manager, so the
+                // selected peer is re-derived here instead of reusing the
+                // pre-call borrow.
+                let active = self
+                    .peers
+                    .get(&selected)
+                    .is_some_and(|peer| peer.supervisor.active_generation().is_some());
                 if !active {
-                    peer.task = PeerTaskSlot::Idle;
-                    schedule_retry(peer, Duration::from_nanos(now_ns));
+                    if let Some(peer) = self.peers.get_mut(&selected) {
+                        peer.task = PeerTaskSlot::Idle;
+                        schedule_retry(peer, Duration::from_nanos(now_ns));
+                    }
+                }
+                if safe.is_some_and(crate::core::CaptureOutcome::failsafe_activated) {
+                    self.failsafe_audit
+                        .record(FailsafeEventCause::ChordActivated, now_ns);
                 }
                 let disposition = safe.map_or(
                     CaptureDisposition::AllowLocal,
@@ -618,6 +665,8 @@ where
     ///
     /// Returns a coarse reconciliation error while retaining the routing gate.
     pub fn native_capture_discontinued(&mut self, now_ns: u64) -> Result<(), PeerManagerError> {
+        self.failsafe_audit
+            .record(FailsafeEventCause::CaptureDiscontinuity, now_ns);
         self.selected_capture_available = false;
         let workspace = self
             .workspace
@@ -638,11 +687,81 @@ where
         result.map_err(Into::into)
     }
 
+    /// Arms this manager's observation of the process panic failsafe.
+    ///
+    /// The panic hook itself only flips a lock-free flag; a manager that has
+    /// not armed observation ignores it. Production composition must call
+    /// this once (the daemon binary documents the pairing with
+    /// [`crate::failsafe_hook::install`]).
+    pub fn arm_panic_failsafe(&mut self) {
+        self.failsafe.armed = true;
+    }
+
+    /// Best-effort release used by the panic-failsafe and watchdog paths.
+    ///
+    /// Unlike [`Self::native_capture_discontinued`] this never fails: it is
+    /// already executing on a degraded path, so a missing workspace or peer
+    /// only means there is nothing left to release. The gate is published
+    /// before any fallible cleanup.
+    fn fail_open_selected_session(&mut self, now_ns: u64) {
+        self.selected_capture_available = false;
+        let Some(workspace) = self.workspace.as_mut() else {
+            return;
+        };
+        let selected = workspace.selected_pointer_peer();
+        let Some(peer) = self.peers.get_mut(&selected) else {
+            return;
+        };
+        let result = peer
+            .supervisor
+            .native_capture_discontinued_with_workspace(workspace, now_ns);
+        if result.is_err() && peer.supervisor.active_generation().is_none() {
+            peer.task = PeerTaskSlot::Idle;
+            schedule_retry(peer, Duration::from_nanos(now_ns));
+        }
+    }
+
+    /// One-shot release after the process panic failsafe is observed tripped.
+    /// Later captures keep failing open without repeating the audit entry.
+    fn release_for_panic_failsafe(&mut self, now_ns: u64) {
+        self.selected_capture_available = false;
+        if self.failsafe.panic_released {
+            return;
+        }
+        self.failsafe.panic_released = true;
+        self.failsafe_audit
+            .record(FailsafeEventCause::PanicHookTripped, now_ns);
+        warn!(
+            manager_id = self.manager_id,
+            "process panic failsafe observed; held input released and suppression gated"
+        );
+        self.fail_open_selected_session(now_ns);
+    }
+
+    /// Trips the routing budget watchdog: sets the same capture gate native
+    /// discontinuation uses (plus a marker so later captures fail open as
+    /// `Local` rather than `Rejected` — capture itself is still healthy),
+    /// counts the event, records the audit trail, and releases held input.
+    fn trip_routing_budget_watchdog(&mut self, now_ns: u64) {
+        self.failsafe.budget_exceeded = self.failsafe.budget_exceeded.saturating_add(1);
+        self.failsafe.budget_gated = true;
+        self.failsafe_audit
+            .record(FailsafeEventCause::RoutingBudgetExceeded, now_ns);
+        warn!(
+            manager_id = self.manager_id,
+            budget_ms = self.config.routing_budget.as_millis(),
+            "routing budget exceeded; suppression gated until rearm"
+        );
+        self.fail_open_selected_session(now_ns);
+    }
+
     /// Rearms the manager-side callback gate after a fresh native capture
     /// generation reports [`crate::CaptureLifecycleState::Running`].
     ///
     /// The runtime owns that health check. Existing core failsafe suspension
     /// and workspace readiness still apply after this coarse gate is opened.
+    /// A routing budget watchdog trip is cleared here too: a verified fresh
+    /// native generation is the same operator-owned recovery signal.
     ///
     /// # Errors
     ///
@@ -655,16 +774,34 @@ where
             return Err(PeerManagerError::PeerRejected);
         }
         self.selected_capture_available = true;
+        self.failsafe.budget_gated = false;
         Ok(())
     }
 
-    /// Drives selected failsafe publication and pointer deadlines through the
-    /// same serialized manager authority used by capture.
+    /// Drives selected failsafe publication, pointer deadlines, the panic
+    /// failsafe release, and the pressed-state reconciliation sweep through
+    /// the same serialized manager authority used by capture.
+    ///
+    /// This is the runtime's periodic service tick (~8 ms). It is the wake
+    /// target of the panic failsafe hook: a tripped flag is observed here and
+    /// held input is released even when no further capture events arrive.
     ///
     /// # Errors
     ///
-    /// Returns a coarse error when a pointer expiry cannot be reconciled.
+    /// Returns a coarse error when a pointer expiry or the reconciliation
+    /// sweep cannot be reconciled.
     pub fn selected_lifecycle_tick(&mut self, now_ns: u64) -> Result<bool, PeerManagerError> {
+        if self.failsafe.armed && crate::failsafe_hook::tripped() {
+            self.release_for_panic_failsafe(now_ns);
+        }
+        // Failsafe publication below still runs so the snapshot the runtime
+        // observes reflects the suspended routing state.
+        let changed = self.selected_lifecycle_tick_inner(now_ns)?;
+        self.reconcile_pressed_state(now_ns)?;
+        Ok(changed)
+    }
+
+    fn selected_lifecycle_tick_inner(&mut self, now_ns: u64) -> Result<bool, PeerManagerError> {
         let workspace = self
             .workspace
             .as_mut()
@@ -682,6 +819,68 @@ where
             schedule_retry(peer, Duration::from_nanos(now_ns));
         }
         result.map_err(Into::into)
+    }
+
+    /// Stuck-key sweep for the selected peer session: releases remotely held
+    /// keys and buttons whose press/repeat traffic is older than the
+    /// configured [`PeerManagerConfig::maximum_key_hold`] bound.
+    ///
+    /// Returns the number of entries whose release entered the exact admitted
+    /// FIFO. Absent sessions hold nothing, so this succeeds with zero. The
+    /// supervisor's periodic tick runs the same sweep; this method exists for
+    /// explicit reconciliation and tests.
+    ///
+    /// # Errors
+    ///
+    /// Returns a coarse coordinator error when a swept release cannot be
+    /// delivered; the entries stay owned for retry.
+    pub fn reconcile_pressed_state(&mut self, now_ns: u64) -> Result<usize, PeerManagerError> {
+        if self.shutting_down {
+            return Ok(0);
+        }
+        let Some(workspace) = self.workspace.as_ref() else {
+            return Ok(0);
+        };
+        let selected = workspace.selected_pointer_peer();
+        let Some(peer) = self.peers.get_mut(&selected) else {
+            return Ok(0);
+        };
+        if peer.revoked {
+            return Ok(0);
+        }
+        let max_hold_ns =
+            u64::try_from(self.config.maximum_key_hold.as_nanos()).unwrap_or(u64::MAX);
+        let result = peer.supervisor.reconcile_pressed_state(now_ns, max_hold_ns);
+        if result.is_err() && peer.supervisor.active_generation().is_none() {
+            peer.task = PeerTaskSlot::Idle;
+            schedule_retry(peer, Duration::from_nanos(now_ns));
+        }
+        result.map_err(Into::into)
+    }
+
+    /// Cumulative count of routing budget watchdog trips observed by this
+    /// manager.
+    #[must_use]
+    pub const fn routing_budget_exceeded_count(&self) -> u64 {
+        self.failsafe.budget_exceeded
+    }
+
+    /// Newest-last copy of the retained failsafe audit events. Read-only and
+    /// payload-free: suitable for diagnostics surfaces.
+    #[must_use]
+    pub fn failsafe_events(&self) -> Vec<FailsafeAuditEvent> {
+        self.failsafe_audit.snapshot()
+    }
+
+    /// Appends future failsafe events to a JSONL file capped at
+    /// [`FAILSAFE_AUDIT_FILE_CAP_BYTES`] with rotation-by-truncation.
+    ///
+    /// The path should live in the daemon's data directory — the same
+    /// directory holding the `kvm-config` store file; the conventional name
+    /// is [`FAILSAFE_AUDIT_FILENAME`]. The parent directory must already
+    /// exist. Sink I/O is best-effort and never fails a safety path.
+    pub fn enable_failsafe_audit_file(&mut self, path: impl Into<std::path::PathBuf>) {
+        self.failsafe_audit.set_sink(path.into());
     }
 
     /// Returns the latest immutable authenticated device-inventory view.
@@ -2791,6 +2990,71 @@ fn schedule_retry<I, O>(peer: &mut ManagedPeerState<I, O>, now: Duration) {
     if !peer.revoked {
         let delay = peer.backoff.next_delay();
         peer.retry_not_before = now.checked_add(delay).unwrap_or(Duration::MAX);
+    }
+}
+
+/// Applies the selected-session admission gates (peer present, not revoked,
+/// exact admitted generation) before routing. Returns the rejection outcome
+/// when a gate fails, or `None` when routing may proceed.
+fn gate_selected_session<I, O>(
+    peers: &mut BTreeMap<PeerId, ManagedPeerState<I, O>>,
+    workspace: &mut WorkspaceControlPlane,
+    now_ns: u64,
+) -> Option<SelectedCaptureOutcome>
+where
+    I: OutputInjectionBackend,
+    O: OutboundPeer,
+{
+    let selected = workspace.selected_pointer_peer();
+    let peer = peers.get_mut(&selected)?;
+    if peer.revoked {
+        return Some(SelectedCaptureOutcome::rejected(
+            SelectedCaptureState::Rejected,
+        ));
+    }
+    if let Some(generation) = peer.supervisor.active_generation() {
+        if peer.task != (PeerTaskSlot::Session { generation }) {
+            let _ = peer
+                .supervisor
+                .connection_lost_with_workspace(generation, workspace, now_ns);
+            return Some(SelectedCaptureOutcome::rejected(
+                if peer.supervisor.active_generation().is_some() {
+                    SelectedCaptureState::CleanupPending
+                } else {
+                    SelectedCaptureState::SessionRetired
+                },
+            ));
+        }
+    } else if let PeerTaskSlot::Session { generation } = peer.task {
+        if peer.supervisor.pending_generation() == Some(generation) {
+            return Some(SelectedCaptureOutcome::rejected(
+                SelectedCaptureState::Gated,
+            ));
+        }
+        peer.task = PeerTaskSlot::Idle;
+        schedule_retry(peer, Duration::from_nanos(now_ns));
+        return Some(SelectedCaptureOutcome::rejected(
+            SelectedCaptureState::SessionRetired,
+        ));
+    }
+    None
+}
+
+/// Maps one core capture outcome onto the selected-capture result shape.
+fn selected_outcome_from_capture(outcome: crate::core::CaptureOutcome) -> SelectedCaptureOutcome {
+    SelectedCaptureOutcome {
+        disposition: outcome.disposition(),
+        failsafe_activated: outcome.failsafe_activated(),
+        state: match (outcome.disposition(), outcome.state()) {
+            (CaptureDisposition::SuppressLocal, CaptureRouteState::RemoteQueued) => {
+                SelectedCaptureState::RemoteQueued
+            }
+            (CaptureDisposition::SuppressLocal, _) => SelectedCaptureState::Inert,
+            (CaptureDisposition::AllowLocal, CaptureRouteState::Local) => {
+                SelectedCaptureState::Local
+            }
+            (CaptureDisposition::AllowLocal, _) => SelectedCaptureState::Gated,
+        },
     }
 }
 

@@ -17,6 +17,12 @@ async fn main() -> Result<(), Box<dyn Error>> {
         .with_target(false)
         .init();
 
+    // Any panic anywhere in the process must fail open: the hook preserves the
+    // tracing panic output, then trips the process failsafe flag the manager
+    // observes on its capture/service entry points. Manager composition in the
+    // runtime must additionally call `PeerManager::arm_panic_failsafe`.
+    kvm_daemon::failsafe_hook::install();
+
     // Persistent identity/config loading and native backends are wired in later
     // milestones. Random IDs keep this binary safe and operational as a daemon
     // lifecycle skeleton without claiming stable hardware identity.

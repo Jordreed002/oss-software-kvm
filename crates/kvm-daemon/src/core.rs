@@ -410,6 +410,10 @@ struct CleanupEntry {
 struct RemoteHeldState {
     route: DeviceRoute,
     last_input_sequence: u64,
+    /// Manager clock when this press was confirmed (or last refreshed by a
+    /// repeat). The stuck-key sweep releases entries held longer than the
+    /// configured bound without further proof of intent.
+    held_since_ns: u64,
 }
 
 #[derive(Clone, Copy)]
@@ -1024,6 +1028,7 @@ impl DaemonCore {
                     RemoteHeldState {
                         route,
                         last_input_sequence: accepted_sequence,
+                        held_since_ns: now_ns,
                     },
                 );
                 if let Some(latch) = self
@@ -1050,6 +1055,10 @@ impl DaemonCore {
                     return Err(CoreCaptureError::StaleDecision);
                 };
                 held.last_input_sequence = accepted_sequence;
+                // A repeat proves continued physical intent: it refreshes the
+                // hold origin so the stuck-key sweep never releases a key the
+                // user is demonstrably still holding.
+                held.held_since_ns = now_ns;
             }
             (Some(_) | None, None) | (None, Some(_)) => {}
         }
@@ -1173,7 +1182,7 @@ impl DaemonCore {
             if self.cleanup_pending() {
                 return Err(DaemonError::CleanupPending);
             }
-            self.queue_remote_cleanup(|_, endpoint, _| {
+            self.queue_remote_cleanup(|_, endpoint, _, _| {
                 !config.paired_hosts.iter().any(|peer| {
                     peer.host_id == endpoint.host_id() && peer.peer_id == endpoint.peer_id()
                 })
@@ -1296,7 +1305,7 @@ impl DaemonCore {
         }
         let workspace = self.workspace;
         let endpoint_availability = self.endpoint_availability.clone();
-        self.queue_remote_cleanup(|_, endpoint, device| {
+        self.queue_remote_cleanup(|_, endpoint, device, _| {
             affected_devices.contains(&device)
                 && !route_resolves_to_endpoint(
                     routing.route_for(device),
@@ -1336,7 +1345,7 @@ impl DaemonCore {
         let affected_devices = pending.affected_devices.clone();
         let workspace = self.workspace;
         let endpoint_availability = self.endpoint_availability.clone();
-        self.queue_remote_cleanup(|_, endpoint, device| {
+        self.queue_remote_cleanup(|_, endpoint, device, _| {
             affected_devices.contains(&device)
                 && !route_resolves_to_endpoint(
                     routing.route_for(device),
@@ -1462,7 +1471,7 @@ impl DaemonCore {
         }
         self.gated_local_devices.extend(requested.iter().copied());
         let queued =
-            self.queue_remote_cleanup(|_, _, held_device| requested.contains(&held_device));
+            self.queue_remote_cleanup(|_, _, held_device, _| requested.contains(&held_device));
         self.publish(now_ns);
         queued
     }
@@ -1524,7 +1533,7 @@ impl DaemonCore {
             return Err(DaemonError::InvalidInitialAuthority);
         }
         if workspace.active_host != self.workspace.active_host {
-            self.queue_remote_cleanup(|route, _, _| route == DeviceRoute::FollowActiveHost)
+            self.queue_remote_cleanup(|route, _, _, _| route == DeviceRoute::FollowActiveHost)
                 .map_err(|_| DaemonError::CleanupPending)?;
             if self.cleanup_pending() {
                 self.publish(now_ns);
@@ -1551,7 +1560,7 @@ impl DaemonCore {
         }
         self.handoff_pending = true;
         let queued =
-            self.queue_remote_cleanup(|route, _, _| route == DeviceRoute::FollowActiveHost);
+            self.queue_remote_cleanup(|route, _, _, _| route == DeviceRoute::FollowActiveHost);
         self.publish(now_ns);
         queued
     }
@@ -1682,7 +1691,7 @@ impl DaemonCore {
             }
             self.handoff_pending = false;
             self.workspace_ready = false;
-            self.queue_remote_cleanup(|_, held_endpoint, _| held_endpoint == endpoint)
+            self.queue_remote_cleanup(|_, held_endpoint, _, _| held_endpoint == endpoint)
         };
         self.publish(now_ns);
         queued
@@ -1741,7 +1750,7 @@ impl DaemonCore {
         }
         self.workspace.active_host = self.workspace.local_host;
         self.handoff_pending = false;
-        let queued = self.queue_remote_cleanup(|_, _, _| true);
+        let queued = self.queue_remote_cleanup(|_, _, _, _| true);
         self.publish(now_ns);
         queued?;
         info!(cleanup_count = self.cleanup.len(), "KVM routing disabled");
@@ -1776,7 +1785,7 @@ impl DaemonCore {
         self.lifecycle = LifecycleState::ShuttingDown;
         self.workspace.active_host = self.workspace.local_host;
         self.handoff_pending = false;
-        let queued = self.queue_remote_cleanup(|_, _, _| true);
+        let queued = self.queue_remote_cleanup(|_, _, _, _| true);
         self.publish(now_ns);
         queued?;
         info!(cleanup_count = self.cleanup.len(), "daemon core shut down");
@@ -1789,7 +1798,7 @@ impl DaemonCore {
         );
         self.workspace.active_host = self.workspace.local_host;
         self.handoff_pending = false;
-        let queued = self.queue_remote_cleanup(|_, _, _| true);
+        let queued = self.queue_remote_cleanup(|_, _, _, _| true);
         if queued.is_err() {
             self.workspace_ready = false;
         }
@@ -1830,7 +1839,7 @@ impl DaemonCore {
         self.workspace_ready = false;
         self.workspace.active_host = self.workspace.local_host;
         self.handoff_pending = false;
-        let queued = self.queue_remote_cleanup(|_, _, _| true);
+        let queued = self.queue_remote_cleanup(|_, _, _, _| true);
         self.publish(now_ns);
         queued
     }
@@ -2103,14 +2112,38 @@ impl DaemonCore {
         self.workspace_ready = false;
         self.workspace.active_host = self.workspace.local_host;
         self.handoff_pending = false;
-        let queued = self.queue_remote_cleanup(|_, _, _| true);
+        let queued = self.queue_remote_cleanup(|_, _, _, _| true);
         self.publish(now_ns);
         queued
     }
 
+    /// Queues releases for every remotely held control whose last proof of
+    /// intent (press or repeat) is older than `max_hold_ns`.
+    ///
+    /// This is the stuck-key sweep driven by the supervisor's periodic tick:
+    /// a held entry the session's FIFO traffic can no longer prove alive —
+    /// for example after a lost physical release — is released through the
+    /// ordinary cleanup queue rather than a parallel ledger.
+    ///
+    /// # Errors
+    ///
+    /// Fails with a cleanup-capacity error when the queue cannot accept every
+    /// swept entry; nothing is partially queued in that case.
+    pub(crate) fn queue_stale_remote_held_cleanup(
+        &mut self,
+        now_ns: u64,
+        max_hold_ns: u64,
+    ) -> Result<usize, CoreCaptureError> {
+        let before = self.cleanup.len();
+        self.queue_remote_cleanup(|_, _, _, held| {
+            now_ns.saturating_sub(held.held_since_ns) >= max_hold_ns
+        })?;
+        Ok(self.cleanup.len() - before)
+    }
+
     fn queue_remote_cleanup(
         &mut self,
-        affected: impl Fn(DeviceRoute, SessionEndpoint, DeviceId) -> bool,
+        affected: impl Fn(DeviceRoute, SessionEndpoint, DeviceId, &RemoteHeldState) -> bool,
     ) -> Result<(), CoreCaptureError> {
         let existing: BTreeSet<_> = self
             .cleanup
@@ -2121,7 +2154,7 @@ impl DaemonCore {
             .remote_held
             .iter()
             .filter_map(|(&(endpoint, device, control), held)| {
-                (affected(held.route, endpoint, device)
+                (affected(held.route, endpoint, device, held)
                     && !existing.contains(&(endpoint, device, control)))
                 .then_some((endpoint, device, control, held.last_input_sequence))
             })

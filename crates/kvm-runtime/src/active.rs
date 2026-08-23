@@ -1402,6 +1402,9 @@ impl PreparedTwoHostAlpha {
         };
         let mut manager = PeerManager::new(local_peer, [managed_peer], manager_config)
             .map_err(|_| RuntimeCompositionError::new(RuntimeCompositionErrorKind::Authority))?;
+        // The daemon binary installs the process panic hook; this manager
+        // must observe it so a panic anywhere fails open (release + gate).
+        manager.arm_panic_failsafe();
         let workspace = WorkspaceControlPlane::new(
             remote_peer,
             prepared_workspace.inventory,
