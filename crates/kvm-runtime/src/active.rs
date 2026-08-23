@@ -5,25 +5,35 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use kvm_config::Config;
+use kvm_daemon::control_service::{
+    ControlCommand, ControlService, ControlServiceError, ControlServiceView, ControlViewSource,
+    CONTROL_COMMAND_QUEUE_CAPACITY, CONTROL_EVENT_CHANNEL_CAPACITY,
+};
 use kvm_daemon::{
-    DaemonCore, DisplayInventory, DisplayInventoryConfig, InputCaptureBackend,
-    InstalledPeerSessionParts, ManagedPairedPeer, ManagedSessionOutbound, OutboundDialTask,
-    OutputInjectionBackend, PeerManager, PeerManagerConfig, PeerManagerSnapshot,
-    PeerSessionCoordinator, PeerSessionSupervisor, PointerHandoffConfig, SealedPeerSessionStart,
+    CaptureLifecycleState, DaemonCore, DeviceInventorySnapshot, DisplayInventory,
+    DisplayInventoryConfig, InputCaptureBackend, InstalledPeerSessionParts, ManagedPairedPeer,
+    ManagedSessionOutbound, OutboundDialTask, OutputInjectionBackend, PeerManager,
+    PeerManagerConfig, PeerManagerSnapshot, PeerSessionCoordinator, PeerSessionSupervisor,
+    PeerState, PointerHandoffConfig, RoutingSnapshot, SealedPeerSessionStart,
     SupervisorEventOutcome, WorkspaceControlPlane,
 };
 use kvm_network::{
     empty_capture_cell, spawn_diagnostics_server, AuthenticatedLanConnector, BoundedLanListener,
     CaptureDiagnostics, CaptureDiagnosticsCell, ConnectionGenerationGate, ConnectionRole,
     DiagnosticsPublisher, DiagnosticsReport, LanListenerConfig, LanListenerEvent,
-    LanListenerReport, LanPeerAddress, NetworkDiagnostics, PersistentPeerConfig, RustlsPeerStream,
-    RustlsTcpConnector, SecurePeerStream, SessionTelemetry, DEFAULT_DIAGNOSTICS_PORT,
-    DIAGNOSTICS_SCHEMA_VERSION,
+    LanListenerReport, LanPeerAddress, LocalControlServerConfig, NetworkDiagnostics,
+    PersistentPeerConfig, RustlsPeerStream, RustlsTcpConnector, SecurePeerStream, SessionTelemetry,
+    DEFAULT_DIAGNOSTICS_PORT, DIAGNOSTICS_SCHEMA_VERSION,
 };
-use kvm_protocol::WirePeerId;
+use kvm_protocol::{
+    ControlDeviceKind, ControlDeviceRoute, ControlDeviceSummary, ControlDisplaySummary,
+    ControlEdgeSide, ControlEvent, ControlPeerState, ControlPeerStatus, ControlStatus,
+    ControlTopologyEdge, WireDeviceId, WireDisplayId, WireHostId, WirePeerId,
+    CURRENT_PROTOCOL_VERSION, MAX_CONTROL_SNAPSHOT_ITEMS,
+};
 use kvm_security::PairedPeer;
 use kvm_topology::{WorkspaceLink, WorkspacePlacement};
-use kvm_types::{Display, InputDevice, LogicalPointer, Point, WorkspaceState};
+use kvm_types::{DeviceKind, Display, InputDevice, LogicalPointer, Point, WorkspaceState};
 
 use crate::preparation::{PreparedAcceptor, PreparedAdmissionFactory};
 use crate::runtime_status::{
@@ -288,16 +298,32 @@ where
     pub(crate) admission_factory: PreparedAdmissionFactory,
     pub(crate) listen_addresses: Vec<std::net::SocketAddr>,
     pub(crate) host_identity: LocalHostIdentity,
+    /// Local display inventory seed for the §31 control view, refreshed on
+    /// every hotplug pass (see `update_control_displays`).
+    pub(crate) control_displays: Vec<ControlDisplaySummary>,
+    /// Configured topology edges for the §31 control view. Static in this
+    /// alpha: `SetTopology` has no command ingress yet.
+    pub(crate) control_edges: Vec<ControlTopologyEdge>,
 }
 
 /// The local host's identity, carried from composition into the active runtime
 /// so the separate diagnostics channel (spec §31) can stamp every published
 /// [`DiagnosticsReport`] with the reporting host without re-reading credentials.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub(crate) struct LocalHostIdentity {
     pub host_id: kvm_types::HostId,
     pub peer_id: kvm_types::PeerId,
     pub platform: kvm_types::Platform,
+    /// The sole selected remote peer, for the §31 control view's peer list.
+    pub selected_peer: SelectedPeerIdentity,
+}
+
+/// Remote identity slice retained for read-only §31 status responses.
+#[derive(Clone, Debug)]
+pub(crate) struct SelectedPeerIdentity {
+    pub host_id: kvm_types::HostId,
+    pub peer_id: kvm_types::PeerId,
+    pub display_name: String,
 }
 
 /// The platform this crate was compiled for. The runtime only goes active on
@@ -345,7 +371,7 @@ where
             self.receiver.clone(),
             self.started,
             self.publisher.clone(),
-            self.identity,
+            self.identity.clone(),
             Arc::clone(&self.capture),
         ));
     }
@@ -371,7 +397,374 @@ where
                 .count(),
             )
             .field("listen_address_count", &self.listen_addresses.len())
+            .field("control_display_count", &self.control_displays.len())
+            .field("control_edge_count", &self.control_edges.len())
             .finish_non_exhaustive()
+    }
+}
+
+// --- §31 control plane --------------------------------------------------------
+
+/// Adapter exposing the shared view cell as a [`ControlViewSource`].
+///
+/// Reads are short critical sections on a cell the capture path never
+/// touches; a poisoned cell degrades to an empty (honest "nothing
+/// published") view instead of failing the panel connection.
+struct SharedControlView(Arc<Mutex<ControlServiceView>>);
+
+impl ControlViewSource for SharedControlView {
+    fn control_view(&self) -> ControlServiceView {
+        self.0.lock().map(|cell| cell.clone()).unwrap_or_default()
+    }
+}
+
+/// Best-effort §31 control-plane wiring owned by the transport loop.
+///
+/// Monitoring only, mirroring the diagnostics-thread pattern: a bind failure
+/// logs and disables the plane, and a service-task failure can never gate
+/// input — the runtime loop keeps running exactly as before. The view cell is
+/// refreshed on the existing service tick (under the same manager lock the
+/// diagnostics snapshot already takes), and mutating commands are drained on
+/// that tick so the daemon's serialized authority stays the only executor.
+struct ControlPlane {
+    commands: tokio::sync::mpsc::Receiver<ControlCommand>,
+    events: Option<tokio::sync::broadcast::Sender<ControlEvent>>,
+    view: Arc<Mutex<ControlServiceView>>,
+    identity: LocalHostIdentity,
+    /// Owner-loop KVM gate commanded via §31 EnableKvm/DisableKvm. Closing it
+    /// gates manager routing (input stays local, fail-open).
+    kvm_gate: bool,
+    service: Option<tokio::task::JoinHandle<Result<(), ControlServiceError>>>,
+    /// Owns the service task's shutdown signal so transport cleanup can stop
+    /// it deterministically, independent of the transport's own watch.
+    service_shutdown: Option<tokio::sync::watch::Sender<bool>>,
+    last_peer_state: Option<ControlPeerState>,
+    last_active_host: Option<WireHostId>,
+}
+
+impl ControlPlane {
+    /// Binds and spawns the §31 control service at `endpoint`, seeding the
+    /// view with the runtime-owned display and topology sections. Best-effort:
+    /// a bind failure leaves a functioning plane with no service, and the
+    /// runtime continues.
+    fn start(
+        identity: LocalHostIdentity,
+        displays: Vec<ControlDisplaySummary>,
+        edges: Vec<ControlTopologyEdge>,
+        endpoint: LocalControlServerConfig,
+    ) -> Self {
+        let (command_tx, command_rx) = tokio::sync::mpsc::channel(CONTROL_COMMAND_QUEUE_CAPACITY);
+        let (event_tx, event_rx) = tokio::sync::broadcast::channel(CONTROL_EVENT_CHANNEL_CAPACITY);
+        let (service_shutdown, service_receiver) = tokio::sync::watch::channel(false);
+        let view = Arc::new(Mutex::new(ControlServiceView {
+            displays,
+            edges,
+            ..ControlServiceView::default()
+        }));
+        let mut plane = Self {
+            commands: command_rx,
+            events: None,
+            view: Arc::clone(&view),
+            identity,
+            kvm_gate: true,
+            service: None,
+            service_shutdown: None,
+            last_peer_state: None,
+            last_active_host: None,
+        };
+        match ControlService::bind(
+            endpoint,
+            Arc::new(SharedControlView(Arc::clone(&view))),
+            command_tx,
+            event_rx,
+        ) {
+            Ok(service) => {
+                developer_event("control=service_ready");
+                plane.service = Some(tokio::spawn(service.run(service_receiver)));
+                plane.service_shutdown = Some(service_shutdown);
+                plane.events = Some(event_tx);
+            }
+            Err(error) => {
+                developer_event(&format!("control=service_bind_failed detail:{error:?}"));
+            }
+        }
+        plane
+    }
+
+    /// Signals and settles the §31 service task. Best-effort: a timeout logs
+    /// and abandons the task rather than stalling runtime teardown.
+    async fn shutdown_service(&mut self) {
+        if let Some(shutdown) = self.service_shutdown.take() {
+            let _ = shutdown.send(true);
+        }
+        if let Some(service) = self.service.take() {
+            match tokio::time::timeout(SHUTDOWN_SETTLE_TIMEOUT, service).await {
+                Ok(Ok(Ok(()))) => {}
+                _ => developer_event("control=service_shutdown_failed"),
+            }
+        }
+    }
+
+    /// Shared view cell, for runtime-owned section updates that happen
+    /// outside this struct (hotplug display refreshes).
+    fn cell(&self) -> Arc<Mutex<ControlServiceView>> {
+        Arc::clone(&self.view)
+    }
+
+    /// Drains forwarded §31 commands through the serialized manager
+    /// authority. Each command is rare and operator-initiated.
+    fn drain_commands<I>(
+        &mut self,
+        manager: &Arc<Mutex<PeerManager<I, ManagedSessionOutbound>>>,
+        now_ns: u64,
+    ) where
+        I: OutputInjectionBackend,
+    {
+        while let Ok(command) = self.commands.try_recv() {
+            match command {
+                ControlCommand::TriggerFailsafe => {
+                    developer_event("control=failsafe_requested");
+                    // The documented explicit-trip path: the armed manager
+                    // observes the flag on its next capture or lifecycle tick
+                    // and releases held input (fail-open). Gate immediately so
+                    // no capture in flight is suppressed before then.
+                    kvm_daemon::failsafe_hook::trip();
+                    self.kvm_gate = false;
+                    if let Ok(mut manager) = manager.lock() {
+                        let _ = manager.native_capture_discontinued(now_ns);
+                    }
+                }
+                ControlCommand::DisableKvm => {
+                    developer_event("control=kvm_disabled");
+                    self.kvm_gate = false;
+                    if let Ok(mut manager) = manager.lock() {
+                        if manager.native_capture_discontinued(now_ns).is_err() {
+                            developer_event("control=kvm_disable_rejected");
+                        }
+                    }
+                }
+                ControlCommand::EnableKvm => {
+                    developer_event("control=kvm_enabled");
+                    self.kvm_gate = true;
+                    if let Ok(mut manager) = manager.lock() {
+                        if manager
+                            .rearm_native_capture(CaptureLifecycleState::Running)
+                            .is_err()
+                        {
+                            developer_event("control=kvm_enable_rejected");
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Rebuilds the read-only §31 view from one locked manager pass and
+    /// publishes the §31 change events. The runtime-owned display/topology
+    /// sections are carried across untouched.
+    fn refresh(
+        &mut self,
+        manager_snapshot: PeerManagerSnapshot,
+        routing: &RoutingSnapshot,
+        devices: Option<Arc<DeviceInventorySnapshot>>,
+    ) {
+        self.refresh_parts(
+            routing.workspace.active_host,
+            routing.workspace.active_display,
+            routing.enabled,
+            routing
+                .peers
+                .get(&self.identity.selected_peer.host_id)
+                .copied(),
+            manager_snapshot,
+            devices,
+        );
+    }
+
+    /// View rebuild over extracted routing facts, split from [`Self::refresh`]
+    /// so the mapping is testable without assembling a full routing table.
+    fn refresh_parts(
+        &mut self,
+        active_host: kvm_types::HostId,
+        active_display: kvm_types::DisplayId,
+        routing_enabled: bool,
+        peer_state: Option<PeerState>,
+        manager_snapshot: PeerManagerSnapshot,
+        devices: Option<Arc<DeviceInventorySnapshot>>,
+    ) {
+        let peer_state = peer_state.unwrap_or_else(|| peer_state_from_counts(&manager_snapshot));
+        let mapped_peer_state = control_peer_state(peer_state);
+        let active_host = WireHostId(active_host.into_bytes());
+        let mut next = ControlServiceView {
+            status: ControlStatus {
+                active_host,
+                active_display: WireDisplayId(active_display.into_bytes()),
+                kvm_enabled: routing_enabled && self.kvm_gate,
+                // No clipboard path exists in this daemon yet; false is the
+                // honest value until one does.
+                clipboard_enabled: false,
+                protocol_version: CURRENT_PROTOCOL_VERSION,
+                // Session RTT lives on the separate diagnostics channel; it
+                // is not folded into the manager snapshot yet.
+                round_trip_time_ms: None,
+                peer_state: mapped_peer_state,
+            },
+            peers: vec![ControlPeerStatus {
+                peer_id: WirePeerId(self.identity.selected_peer.peer_id.into_bytes()),
+                host_id: WireHostId(self.identity.selected_peer.host_id.into_bytes()),
+                host_name: self.identity.selected_peer.display_name.clone(),
+                state: mapped_peer_state,
+            }],
+            devices: devices.map_or_else(Vec::new, |inventory| {
+                inventory.devices().map(control_device_summary).collect()
+            }),
+            displays: Vec::new(),
+            edges: Vec::new(),
+        };
+        if let Ok(mut cell) = self.view.lock() {
+            next.displays = std::mem::take(&mut cell.displays);
+            next.edges = std::mem::take(&mut cell.edges);
+            *cell = next;
+        }
+        if let Some(events) = self.events.as_ref() {
+            if self
+                .last_peer_state
+                .is_some_and(|state| state != mapped_peer_state)
+            {
+                let _ = events.send(ControlEvent::PeerChanged);
+            }
+            if self
+                .last_active_host
+                .is_some_and(|host| host != active_host)
+            {
+                let _ = events.send(ControlEvent::ActiveHostChanged { active_host });
+            }
+        }
+        self.last_peer_state = Some(mapped_peer_state);
+        self.last_active_host = Some(active_host);
+    }
+}
+
+/// Derives the selected peer's connection state from count-only manager
+/// snapshot when the routing table has no per-host entry yet.
+fn peer_state_from_counts(snapshot: &PeerManagerSnapshot) -> PeerState {
+    if snapshot.session_tasks > 0 {
+        PeerState::Connected
+    } else if snapshot.connecting_tasks > 0 {
+        PeerState::Connecting
+    } else if snapshot.peers_with_candidates > 0 {
+        PeerState::Discovering
+    } else {
+        PeerState::Disconnected
+    }
+}
+
+/// Maps the daemon's peer connection state onto the §31 control DTO.
+const fn control_peer_state(state: PeerState) -> ControlPeerState {
+    match state {
+        PeerState::Disconnected => ControlPeerState::Disconnected,
+        PeerState::Discovering => ControlPeerState::Discovering,
+        PeerState::Connecting => ControlPeerState::Connecting,
+        PeerState::Authenticating => ControlPeerState::Authenticating,
+        PeerState::Connected => ControlPeerState::Connected,
+        PeerState::Degraded => ControlPeerState::Degraded,
+    }
+}
+
+/// Maps one inventory device onto the §31 control DTO. The inventory snapshot
+/// does not carry per-device overrides, so every device reports the daemon's
+/// default follow-active-host policy.
+fn control_device_summary(device: &kvm_types::InputDevice) -> ControlDeviceSummary {
+    ControlDeviceSummary {
+        device_id: WireDeviceId(device.id.into_bytes()),
+        host_id: WireHostId(device.host_id.into_bytes()),
+        name: device.name.clone(),
+        kind: control_device_kind(device.kind),
+        route: ControlDeviceRoute::FollowActiveHost,
+    }
+}
+
+const fn control_device_kind(kind: DeviceKind) -> ControlDeviceKind {
+    match kind {
+        DeviceKind::Keyboard => ControlDeviceKind::Keyboard,
+        DeviceKind::Mouse => ControlDeviceKind::Mouse,
+        DeviceKind::Trackpad => ControlDeviceKind::Trackpad,
+        // `DeviceKind` is non-exhaustive upstream; unknown local classes
+        // report the protocol's Other bucket.
+        _ => ControlDeviceKind::Other,
+    }
+}
+
+/// Maps one local display onto the §31 control DTO (logical units, scale in
+/// whole percent).
+fn control_display_summary(display: &Display) -> ControlDisplaySummary {
+    ControlDisplaySummary {
+        display_id: WireDisplayId(display.id.into_bytes()),
+        host_id: WireHostId(display.host_id.into_bytes()),
+        name: display.name.clone(),
+        logical_width: logical_dimension(display.logical_size.width),
+        logical_height: logical_dimension(display.logical_size.height),
+        scale_factor_percent: logical_dimension(display.scale_factor * 100.0),
+        primary: display.primary,
+    }
+}
+
+/// Converts a logical display dimension to whole units for the control view.
+/// Non-finite or negative values report zero rather than saturating.
+fn logical_dimension(value: f64) -> u32 {
+    let rounded = value.round();
+    if rounded.is_finite() && rounded >= 0.0 && rounded <= f64::from(u32::MAX) {
+        #[allow(
+            clippy::cast_possible_truncation,
+            clippy::cast_sign_loss,
+            reason = "range-checked immediately above"
+        )]
+        {
+            rounded as u32
+        }
+    } else {
+        0
+    }
+}
+
+const fn control_edge_side(edge: kvm_types::Edge) -> ControlEdgeSide {
+    match edge {
+        kvm_types::Edge::Left => ControlEdgeSide::Left,
+        kvm_types::Edge::Right => ControlEdgeSide::Right,
+        kvm_types::Edge::Top => ControlEdgeSide::Top,
+        kvm_types::Edge::Bottom => ControlEdgeSide::Bottom,
+    }
+}
+
+/// Maps the configured topology links onto §31 edges. Every bidirectional
+/// link yields one edge per side so the panel can walk the map from either
+/// display.
+fn control_edges(config: &Config) -> Vec<ControlTopologyEdge> {
+    let mut edges = Vec::new();
+    for link in &config.topology.links {
+        edges.push(ControlTopologyEdge {
+            from: WireDisplayId(link.from_display.into_bytes()),
+            side: control_edge_side(link.from_edge),
+            to: WireDisplayId(link.to_display.into_bytes()),
+        });
+        edges.push(ControlTopologyEdge {
+            from: WireDisplayId(link.to_display.into_bytes()),
+            side: control_edge_side(link.to_edge),
+            to: WireDisplayId(link.from_display.into_bytes()),
+        });
+    }
+    edges.truncate(MAX_CONTROL_SNAPSHOT_ITEMS);
+    edges
+}
+
+/// Publishes a freshly enumerated local display inventory into the shared
+/// §31 view cell. Best-effort: the control view reports the observed
+/// inventory while routing remains gated by the manager's own revisioned
+/// acceptance of the same snapshot.
+fn update_control_displays(cell: &Arc<Mutex<ControlServiceView>>, displays: &[Display]) {
+    if let Ok(mut view) = cell.lock() {
+        view.displays = displays.iter().map(control_display_summary).collect();
+        view.displays.truncate(MAX_CONTROL_SNAPSHOT_ITEMS);
     }
 }
 
@@ -398,8 +791,22 @@ where
         self,
         shutdown: tokio::sync::watch::Receiver<bool>,
     ) -> Result<(), RuntimeTransportError> {
-        self.run_transport_ready(shutdown, None, Instant::now(), None, empty_capture_cell())
-            .await
+        let identity = self.host_identity.clone();
+        let control = ControlPlane::start(
+            identity,
+            Vec::new(),
+            Vec::new(),
+            LocalControlServerConfig::default(),
+        );
+        self.run_transport_ready(
+            shutdown,
+            None,
+            Instant::now(),
+            None,
+            empty_capture_cell(),
+            control,
+        )
+        .await
     }
 
     /// Runs authenticated transport and one suppressible native capture owner.
@@ -446,7 +853,7 @@ where
         reason = "service select branches are clearer when kept together"
     )]
     pub(crate) async fn run_with_capture_status<B>(
-        self,
+        mut self,
         backend: B,
         mut shutdown: tokio::sync::watch::Receiver<bool>,
         status: Option<RuntimeStatusPublisher>,
@@ -462,12 +869,23 @@ where
         let (transport_shutdown, transport_receiver) = tokio::sync::watch::channel(false);
         let (ready_sender, ready_receiver) = tokio::sync::oneshot::channel();
         let capture_cell = empty_capture_cell();
+        // Best-effort §31 control plane (spec §31): monitoring only, so its
+        // startup cannot gate input. The shared view cell lets the hotplug
+        // path below refresh the display section without touching the plane.
+        let control = ControlPlane::start(
+            self.host_identity.clone(),
+            std::mem::take(&mut self.control_displays),
+            std::mem::take(&mut self.control_edges),
+            LocalControlServerConfig::default(),
+        );
+        let control_view_cell = control.cell();
         let mut transport_task = tokio::spawn(self.run_transport_ready(
             transport_receiver,
             Some(ready_sender),
             started,
             status.clone(),
             Arc::clone(&capture_cell),
+            control,
         ));
         Self::await_transport_ready(&mut transport_task, ready_receiver).await?;
         if *shutdown.borrow() {
@@ -518,13 +936,21 @@ where
                 }, if inventory_refresh.is_some() => {
                     inventory_refresh = None;
                     match result {
-                        Ok(outcome) => apply_local_inventory_refresh(
-                            &manager,
-                            outcome,
-                            &mut next_display_revision,
-                            &mut next_device_revision,
-                            now_ns(started),
-                        ),
+                        Ok(outcome) => {
+                            // The §31 control view reports the observed
+                            // display inventory even when the manager's own
+                            // revisioned acceptance below is rejected.
+                            if let Some(displays) = outcome.displays.as_ref() {
+                                update_control_displays(&control_view_cell, displays);
+                            }
+                            apply_local_inventory_refresh(
+                                &manager,
+                                outcome,
+                                &mut next_display_revision,
+                                &mut next_device_revision,
+                                now_ns(started),
+                            );
+                        }
                         Err(_) => developer_event("hotplug=refresh_task_failed"),
                     }
                 }
@@ -613,10 +1039,11 @@ where
         started: Instant,
         status: Option<RuntimeStatusPublisher>,
         capture_cell: CaptureDiagnosticsCell,
+        mut control: ControlPlane,
     ) -> Result<(), RuntimeTransportError> {
         // Bind diagnostics before the KVM listener consumes `listen_addresses`.
         let diagnostics_publisher =
-            bind_diagnostics_server(&self.listen_addresses, self.host_identity, started);
+            bind_diagnostics_server(&self.listen_addresses, &self.host_identity, started);
         let (listener, mut accepted) = BoundedLanListener::bind(
             self.acceptor,
             self.listen_addresses,
@@ -687,8 +1114,9 @@ where
                     }
                     _ = tick.tick() => {
                         service_manager(&self.manager, started)?;
+                        control.drain_commands(&self.manager, now_ns(started));
                         let previous = &mut last_manager_snapshot;
-                        report_manager_snapshot(&self.manager, previous, status.as_ref());
+                        report_manager_snapshot(&self.manager, previous, status.as_ref(), &mut control);
                         if dial_tasks.is_empty() {
                             if let Some(task) = poll_dial(&self.manager, now_duration(started))? {
                                 developer_event("transport=outbound_dial_started");
@@ -720,6 +1148,9 @@ where
             listener_task,
         )
         .await;
+        // The §31 service owns its shutdown signal; settle it so the
+        // endpoint file is released before the runtime exits.
+        control.shutdown_service().await;
         run_result.and(cleanup_result)
     }
 }
@@ -735,13 +1166,14 @@ fn report_manager_snapshot<I>(
     manager: &Arc<Mutex<PeerManager<I, ManagedSessionOutbound>>>,
     previous: &mut Option<ManagerDiagnosticSnapshot>,
     status: Option<&RuntimeStatusPublisher>,
+    control: &mut ControlPlane,
 ) where
     I: OutputInjectionBackend,
 {
     // R-1: this is a best-effort diagnostic read and status publish. A failure
     // here reads no pressed-key state, so it must never propagate and tear down
     // the transport loop — log and return instead.
-    let (manager_snapshot, routing) = {
+    let (manager_snapshot, routing, devices) = {
         let Ok(manager) = lock_manager(manager) else {
             developer_event("transport=manager_snapshot_failed detail:lock");
             return;
@@ -753,8 +1185,10 @@ fn report_manager_snapshot<I>(
             developer_event("transport=manager_snapshot_failed detail:authority");
             return;
         };
-        (manager_snapshot, routing)
+        let devices = manager.device_inventory_snapshot().ok();
+        (manager_snapshot, routing, devices)
     };
+    control.refresh(manager_snapshot, &routing, devices);
     let routing_state = if routing.enabled {
         RoutingDiagnosticState::Enabled
     } else if routing.workspace_ready {
@@ -1194,7 +1628,7 @@ where
                 // the control panel always has fresh data, independent of dev
                 // logging. The dev log line is an additional, opt-in surface.
                 publisher.publish(build_diagnostics_report(
-                    identity,
+                    &identity,
                     Some(telemetry),
                     read_capture_cell(&capture_cell),
                     started,
@@ -1232,7 +1666,7 @@ where
 /// gates input safety.
 fn bind_diagnostics_server(
     listen_addresses: &[std::net::SocketAddr],
-    identity: LocalHostIdentity,
+    identity: &LocalHostIdentity,
     started: Instant,
 ) -> DiagnosticsPublisher {
     let publisher =
@@ -1260,7 +1694,7 @@ fn bind_diagnostics_server(
 /// live [`SessionTelemetry`]; the capture section is `None` until the capture
 /// supervisor publishes its first counter snapshot.
 fn build_diagnostics_report(
-    identity: LocalHostIdentity,
+    identity: &LocalHostIdentity,
     telemetry: Option<SessionTelemetry>,
     capture: Option<CaptureDiagnostics>,
     started: Instant,
@@ -1553,6 +1987,20 @@ impl PreparedTwoHostAlpha {
         let local_host = parts.local_identity.host_id();
         let local_peer = parts.local_identity.peer_id();
         let remote_peer = parts.remote_identity.peer_id();
+        // Read-only §31 status slice, retained so the control service can
+        // answer GetPeers without re-reading credentials.
+        let selected_peer = SelectedPeerIdentity {
+            host_id: parts.remote_identity.host_id(),
+            peer_id: remote_peer,
+            display_name: parts.remote_identity.display_name().to_owned(),
+        };
+        // §31 view sections owned by composition: the observed local display
+        // inventory and the configured topology edges.
+        let control_displays = local_displays
+            .iter()
+            .map(control_display_summary)
+            .collect::<Vec<_>>();
+        let control_edges = control_edges(&parts.config);
         let prepared_workspace = prepare_workspace(&parts.config, local_host, local_displays)?;
 
         // `LOCAL_PLATFORM` is the binding domain of the compiled-in native
@@ -1637,7 +2085,10 @@ impl PreparedTwoHostAlpha {
                 host_id: local_host,
                 peer_id: local_peer,
                 platform: LOCAL_PLATFORM,
+                selected_peer,
             },
+            control_displays,
+            control_edges,
         })
     }
 }
@@ -1894,5 +2345,197 @@ mod tests {
         assert_eq!(rate_per_second(2_048, Duration::from_secs(2)), 1_024);
         assert_eq!(rate_per_second(7, Duration::from_millis(500)), 14);
         assert_eq!(rate_per_second(u64::MAX, Duration::from_nanos(1)), u64::MAX);
+    }
+
+    #[test]
+    fn control_peer_state_maps_every_daemon_variant() {
+        let pairs = [
+            (PeerState::Disconnected, ControlPeerState::Disconnected),
+            (PeerState::Discovering, ControlPeerState::Discovering),
+            (PeerState::Connecting, ControlPeerState::Connecting),
+            (PeerState::Authenticating, ControlPeerState::Authenticating),
+            (PeerState::Connected, ControlPeerState::Connected),
+            (PeerState::Degraded, ControlPeerState::Degraded),
+        ];
+        for (daemon, control) in pairs {
+            assert_eq!(control_peer_state(daemon), control);
+        }
+    }
+
+    #[test]
+    fn peer_state_from_counts_prefers_sessions_then_dials_then_discovery() {
+        let base = PeerManagerSnapshot {
+            paired_peers: 1,
+            peers_with_candidates: 0,
+            connecting_tasks: 0,
+            session_tasks: 0,
+            revoked_peers: 0,
+        };
+        assert_eq!(peer_state_from_counts(&base), PeerState::Disconnected);
+        assert_eq!(
+            peer_state_from_counts(&PeerManagerSnapshot {
+                peers_with_candidates: 1,
+                ..base
+            }),
+            PeerState::Discovering
+        );
+        assert_eq!(
+            peer_state_from_counts(&PeerManagerSnapshot {
+                peers_with_candidates: 1,
+                connecting_tasks: 1,
+                ..base
+            }),
+            PeerState::Connecting
+        );
+        assert_eq!(
+            peer_state_from_counts(&PeerManagerSnapshot {
+                peers_with_candidates: 1,
+                connecting_tasks: 1,
+                session_tasks: 1,
+                ..base
+            }),
+            PeerState::Connected
+        );
+    }
+
+    #[test]
+    fn control_edges_map_each_configured_link_from_both_sides() {
+        let mut config = config_with_local_placement();
+        config.topology.links.push(TopologyLink {
+            from_display: DISPLAY,
+            from_edge: Edge::Right,
+            to_display: REMOTE_DISPLAY,
+            to_edge: Edge::Left,
+        });
+
+        let edges = control_edges(&config);
+
+        assert_eq!(edges.len(), 2);
+        assert!(edges.contains(&ControlTopologyEdge {
+            from: WireDisplayId(DISPLAY.into_bytes()),
+            side: ControlEdgeSide::Right,
+            to: WireDisplayId(REMOTE_DISPLAY.into_bytes()),
+        }));
+        assert!(edges.contains(&ControlTopologyEdge {
+            from: WireDisplayId(REMOTE_DISPLAY.into_bytes()),
+            side: ControlEdgeSide::Left,
+            to: WireDisplayId(DISPLAY.into_bytes()),
+        }));
+    }
+
+    #[test]
+    fn control_display_summary_uses_logical_units_and_percent_scale() {
+        let summary = control_display_summary(&display(LOCAL_HOST, true));
+
+        assert_eq!(summary.display_id, WireDisplayId(DISPLAY.into_bytes()));
+        assert_eq!(summary.host_id, WireHostId(LOCAL_HOST.into_bytes()));
+        assert_eq!(summary.name, "local");
+        assert_eq!(summary.logical_width, 200);
+        assert_eq!(summary.logical_height, 100);
+        assert_eq!(summary.scale_factor_percent, 200);
+        assert!(summary.primary);
+    }
+
+    #[test]
+    fn logical_dimension_rounds_and_reports_zero_out_of_range() {
+        assert_eq!(logical_dimension(1512.4), 1512);
+        assert_eq!(logical_dimension(0.4), 0);
+        assert_eq!(logical_dimension(-12.0), 0);
+        assert_eq!(logical_dimension(f64::NAN), 0);
+        assert_eq!(logical_dimension(f64::INFINITY), 0);
+        assert_eq!(logical_dimension(f64::from(u32::MAX) + 16.0), 0);
+    }
+
+    #[tokio::test]
+    async fn control_view_refresh_publishes_change_events_and_carries_display_sections() {
+        use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
+
+        fn unique_socket_path() -> std::path::PathBuf {
+            static COUNTER: AtomicU64 = AtomicU64::new(0);
+            let unique = COUNTER.fetch_add(1, AtomicOrdering::SeqCst);
+            std::env::temp_dir().join(format!(
+                "skvm-control-plane-test-{}-{unique}.sock",
+                std::process::id()
+            ))
+        }
+
+        let identity = LocalHostIdentity {
+            host_id: LOCAL_HOST,
+            peer_id: kvm_types::PeerId::from_bytes([0x66; 16]),
+            platform: kvm_types::Platform::MacOS,
+            selected_peer: SelectedPeerIdentity {
+                host_id: OTHER_HOST,
+                peer_id: kvm_types::PeerId::from_bytes([0x77; 16]),
+                display_name: "Office Windows".to_owned(),
+            },
+        };
+        let displays = vec![control_display_summary(&display(LOCAL_HOST, true))];
+        let edges = control_edges(&config_with_local_placement());
+        let mut plane = ControlPlane::start(
+            identity,
+            displays.clone(),
+            edges.clone(),
+            LocalControlServerConfig::new(unique_socket_path()),
+        );
+        assert!(plane.events.is_some(), "the plane must bind in tests");
+
+        let counts = PeerManagerSnapshot {
+            paired_peers: 1,
+            peers_with_candidates: 0,
+            connecting_tasks: 0,
+            session_tasks: 1,
+            revoked_peers: 0,
+        };
+        plane.refresh_parts(
+            LOCAL_HOST,
+            DISPLAY,
+            true,
+            Some(PeerState::Connected),
+            counts,
+            None,
+        );
+
+        let view = SharedControlView(plane.cell()).control_view();
+        assert!(view.status.kvm_enabled);
+        assert_eq!(view.status.peer_state, ControlPeerState::Connected);
+        assert_eq!(view.status.active_host, WireHostId(LOCAL_HOST.into_bytes()));
+        assert!(!view.status.clipboard_enabled);
+        assert_eq!(view.status.protocol_version, CURRENT_PROTOCOL_VERSION);
+        assert_eq!(view.peers.len(), 1);
+        assert_eq!(view.peers[0].host_name, "Office Windows");
+        assert_eq!(view.peers[0].state, ControlPeerState::Connected);
+        assert!(view.devices.is_empty());
+        // Composition-owned sections survive the refresh.
+        assert_eq!(view.displays, displays);
+        assert_eq!(view.edges, edges);
+
+        // A peer-state and authority change publishes §31 events.
+        let mut events = plane.events.as_ref().expect("events present").subscribe();
+        plane.refresh_parts(
+            OTHER_HOST,
+            REMOTE_DISPLAY,
+            true,
+            Some(PeerState::Degraded),
+            counts,
+            None,
+        );
+        let mut seen = Vec::new();
+        while let Ok(event) = events.try_recv() {
+            seen.push(event);
+        }
+        assert!(seen.contains(&ControlEvent::PeerChanged));
+        assert!(seen.contains(&ControlEvent::ActiveHostChanged {
+            active_host: WireHostId(OTHER_HOST.into_bytes()),
+        }));
+
+        // An owner-loop gate close is reflected in the status view.
+        plane.kvm_gate = false;
+        plane.refresh_parts(OTHER_HOST, REMOTE_DISPLAY, true, None, counts, None);
+        let gated = SharedControlView(plane.cell()).control_view();
+        assert!(!gated.status.kvm_enabled);
+        // With no routing-table entry the count-derived state applies.
+        assert_eq!(gated.status.peer_state, ControlPeerState::Connected);
+
+        plane.shutdown_service().await;
     }
 }
