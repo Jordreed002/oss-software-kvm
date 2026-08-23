@@ -9,7 +9,7 @@ use crate::ConfigError;
 
 pub use kvm_router::MAX_DEVICE_ROUTES;
 
-pub const CURRENT_CONFIG_VERSION: u16 = 2;
+pub const CURRENT_CONFIG_VERSION: u16 = 3;
 pub const DEFAULT_KVM_PORT: u16 = 24_800;
 pub const MAX_CONFIG_FILE_BYTES: usize = 1024 * 1024;
 pub const MAX_PAIRED_HOSTS: usize = 256;
@@ -315,10 +315,37 @@ impl From<DeviceRoute> for ConfiguredDeviceRoute {
 /// schema as before. The serde representation is unchanged (`snake_case`).
 pub use kvm_types::KeyboardMode;
 
+/// Modifier-role translation applied to keys injected into a peer whose
+/// platform assigns the shortcut modifier to a different physical key.
+///
+/// The serde representation is a lowercase TOML string (`"functional"`,
+/// `"positional"`, or `"identity"`); any other value fails decoding, which is
+/// how invalid settings are rejected before the daemon sees them.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ModifierRoleMapping {
+    /// Injects every key unchanged, including modifiers.
+    Identity,
+    /// Swaps modifier roles by physical position: macOS Command and Option
+    /// exchange places with Windows Alt and the Windows key. This was the
+    /// original cross-platform behavior and is retained for compatibility.
+    Positional,
+    /// Swaps modifier roles by shortcut function: macOS Command exchanges
+    /// places with Windows Control, while Option/Alt stay put (Option already
+    /// occupies the correct `AltGr` position). This is the default because a
+    /// Mac user's shortcut muscle memory is role-based (Command+C must copy).
+    #[default]
+    Functional,
+}
+
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub struct KeyboardSettings {
     #[serde(default)]
     pub mode: KeyboardMode,
+    /// Modifier-role policy for cross-platform injection. Older files decode
+    /// with the [`ModifierRoleMapping::default`] (`functional`) value.
+    #[serde(default)]
+    pub modifier_role_mapping: ModifierRoleMapping,
 }
 
 #[derive(Clone, Copy, Eq, Hash, PartialEq, Serialize, Deserialize)]

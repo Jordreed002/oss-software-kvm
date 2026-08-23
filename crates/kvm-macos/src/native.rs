@@ -21,18 +21,21 @@ use kvm_types::{
 use crate::{
     capture::{
         classify_iohid_observation, classify_quartz_capture, device_accepts_hid_value,
-        mach_timestamp_ns, overflow_may_drop, physical_device_evidence, quartz_key_is_down,
-        quartz_modifier_flag, quartz_modifier_pressed, translate_hid_value,
-        translate_quartz_keyboard, translate_quartz_pointer, translate_quartz_scroll,
-        CG_EVENT_FLAGS_CHANGED, CG_EVENT_KEY_DOWN, CG_EVENT_KEY_UP, CG_EVENT_SCROLL_WHEEL,
+        mach_timestamp_ns, overflow_may_drop, physical_device_evidence, quartz_modifier_flag,
+        quartz_modifier_pressed, translate_hid_value, translate_quartz_keyboard,
+        translate_quartz_pointer, translate_quartz_scroll, CG_EVENT_FLAGS_CHANGED,
+        CG_EVENT_KEY_DOWN, CG_EVENT_KEY_UP, CG_EVENT_SCROLL_WHEEL,
         CG_EVENT_TAP_DISABLED_BY_TIMEOUT, CG_EVENT_TAP_DISABLED_BY_USER_INPUT,
     },
     derive_device_id,
     identity::{derive_whole_host_device_id, WholeHostDeviceKind},
-    keymap::macos_key_for_windows_source,
-    mac_virtual_key, CaptureHealth, CaptureStatistics, DeviceIdentityMaterial, MacBackendError,
-    MacCaptureMode, PermissionStatus, SuppressionScope, KVM_EVENT_TAG,
+    CaptureHealth, CaptureStatistics, DeviceIdentityMaterial, MacBackendError, MacCaptureMode,
+    PermissionStatus, SuppressionScope, KVM_EVENT_TAG,
 };
+
+mod mapping;
+
+use mapping::{key_record_for_windows_source, ModifierRoleMapping};
 
 type CFIndex = isize;
 type CFTypeId = usize;
@@ -1011,7 +1014,7 @@ impl InputCaptureBackend for MacInputBackend {
 #[derive(Default)]
 pub struct MacOutputBackend {
     pressed_buttons: BTreeSet<PointerButton>,
-    windows_modifier_roles: bool,
+    modifier_roles: ModifierRoleMapping,
     /// Cumulative `CGEventFlags` device mask for currently-held modifiers.
     /// Updated as modifier key-down/up events are injected so that every
     /// subsequent modifier event (and, by Quartz's design, the flags word it
@@ -1030,7 +1033,7 @@ impl std::fmt::Debug for MacOutputBackend {
         formatter
             .debug_struct("MacOutputBackend")
             .field("pressed_button_count", &self.pressed_buttons.len())
-            .field("windows_modifier_roles", &self.windows_modifier_roles)
+            .field("modifier_roles", &self.modifier_roles)
             .field("has_pointer_target", &self.pointer_target.is_some())
             .finish_non_exhaustive()
     }
@@ -1041,7 +1044,7 @@ impl MacOutputBackend {
     pub const fn new() -> Self {
         Self {
             pressed_buttons: BTreeSet::new(),
-            windows_modifier_roles: false,
+            modifier_roles: ModifierRoleMapping::Identity,
             modifier_flags: 0,
             pointer_target: None,
             last_pointer_injection: None,
@@ -1053,11 +1056,34 @@ impl MacOutputBackend {
 
     /// Creates an injector that maps Windows Alt to macOS Command and the
     /// Windows key to macOS Option.
+    ///
+    /// This legacy positional swap is superseded as the cross-platform default
+    /// by [`Self::new_from_windows_functional`]; it is retained for the
+    /// `positional` configuration value and existing callers.
     #[must_use]
     pub const fn new_from_windows() -> Self {
         Self {
             pressed_buttons: BTreeSet::new(),
-            windows_modifier_roles: true,
+            modifier_roles: ModifierRoleMapping::Positional,
+            modifier_flags: 0,
+            pointer_target: None,
+            last_pointer_injection: None,
+            last_pointer_resync: None,
+            horizontal_scroll_remainder: 0.0,
+            vertical_scroll_remainder: 0.0,
+        }
+    }
+
+    /// Creates an injector that maps Windows Control to macOS Command and the
+    /// Windows key to macOS Control, leaving Alt on Option. This is the
+    /// default role mapping for a Windows source keyboard because it is the
+    /// exact inverse of the macOS Command→Windows Control mapping, so a Mac
+    /// user's shortcuts round-trip between the paired hosts.
+    #[must_use]
+    pub const fn new_from_windows_functional() -> Self {
+        Self {
+            pressed_buttons: BTreeSet::new(),
+            modifier_roles: ModifierRoleMapping::Functional,
             modifier_flags: 0,
             pointer_target: None,
             last_pointer_injection: None,
@@ -1107,18 +1133,14 @@ impl MacOutputBackend {
 
         match payload {
             InputPayload::Key { code, state } => {
-                let code = if self.windows_modifier_roles {
-                    macos_key_for_windows_source(code)
-                } else {
-                    code
-                };
-                let key = mac_virtual_key(code).ok_or(MacBackendError::UnsupportedInput(
-                    "key has no Quartz virtual-key mapping",
-                ))?;
+                let record = key_record_for_windows_source(self.modifier_roles, code, state)
+                    .ok_or(MacBackendError::UnsupportedInput(
+                        "key has no Quartz virtual-key mapping",
+                    ))?;
                 // SAFETY: Null selects the default event source; the returned
                 // owned event is checked before any Quartz operation.
                 let event = unsafe {
-                    CGEventCreateKeyboardEvent(ptr::null(), key, quartz_key_is_down(state))
+                    CGEventCreateKeyboardEvent(ptr::null(), record.virtual_key, !record.key_up)
                 };
                 // Modifier keys (Shift, Control, Option, Command, Fn) must be
                 // delivered as `kCGEventFlagsChanged` (type 12) events whose
@@ -1127,11 +1149,11 @@ impl MacOutputBackend {
                 // word is what makes WindowServer mis-route a Shift transition
                 // into a spurious Caps Lock toggle. Caps Lock (0x39) returns
                 // `None` here and correctly falls through to the normal path.
-                if let Some(mask) = quartz_modifier_flag(key) {
-                    if quartz_key_is_down(state) {
-                        self.modifier_flags |= mask;
-                    } else {
+                if let Some(mask) = quartz_modifier_flag(record.virtual_key) {
+                    if record.key_up {
                         self.modifier_flags &= !mask;
+                    } else {
+                        self.modifier_flags |= mask;
                     }
                     // SAFETY: `event` is a freshly-created, live CGEvent.
                     unsafe {

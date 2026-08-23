@@ -115,6 +115,15 @@ impl PreparedTwoHostAlpha {
             .map(|peer| peer.platform)
     }
 
+    /// Modifier-role mapping configured for injection into the selected peer.
+    ///
+    /// Backend selection reads this before composition (which consumes the
+    /// prepared value), so it is exposed as a copy of the persisted setting.
+    #[cfg(any(target_os = "macos", windows))]
+    pub(crate) const fn selected_modifier_role_mapping(&self) -> kvm_config::ModifierRoleMapping {
+        self.parts.config.keyboard.modifier_role_mapping
+    }
+
     /// Transfers all validated components to the later runtime composer.
     #[must_use]
     pub fn into_parts(self) -> PreparedTwoHostAlphaParts {

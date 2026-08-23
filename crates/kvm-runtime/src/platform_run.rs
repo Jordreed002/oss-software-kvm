@@ -107,13 +107,18 @@ async fn run_windows(
     profile_path: &Path,
     shutdown: tokio::sync::watch::Receiver<bool>,
 ) -> Result<(), NativeRuntimeError> {
+    use kvm_config::ModifierRoleMapping;
     use kvm_windows::{WindowsDisplayBackend, WindowsInputBackend, WindowsOutputBackend};
 
     let prepared = prepare(profile_path)
         .map_err(|_| NativeRuntimeError::new(NativeRuntimeErrorKind::Preparation))?;
     let local_host = prepared.local_host_id();
     let output = if prepared.selected_peer_platform() == Some(kvm_types::Platform::MacOS) {
-        WindowsOutputBackend::new_from_macos()
+        match prepared.selected_modifier_role_mapping() {
+            ModifierRoleMapping::Functional => WindowsOutputBackend::new_from_macos_functional(),
+            ModifierRoleMapping::Positional => WindowsOutputBackend::new_from_macos(),
+            ModifierRoleMapping::Identity => WindowsOutputBackend::new(),
+        }
     } else {
         WindowsOutputBackend::new()
     };
@@ -144,13 +149,18 @@ async fn run_macos(
     profile_path: &Path,
     shutdown: tokio::sync::watch::Receiver<bool>,
 ) -> Result<(), NativeRuntimeError> {
+    use kvm_config::ModifierRoleMapping;
     use kvm_macos::{MacDisplayBackend, MacInputBackend, MacOutputBackend};
 
     let prepared = prepare(profile_path)
         .map_err(|_| NativeRuntimeError::new(NativeRuntimeErrorKind::Preparation))?;
     let local_host = prepared.local_host_id();
     let output = if prepared.selected_peer_platform() == Some(kvm_types::Platform::Windows) {
-        MacOutputBackend::new_from_windows()
+        match prepared.selected_modifier_role_mapping() {
+            ModifierRoleMapping::Functional => MacOutputBackend::new_from_windows_functional(),
+            ModifierRoleMapping::Positional => MacOutputBackend::new_from_windows(),
+            ModifierRoleMapping::Identity => MacOutputBackend::new(),
+        }
     } else {
         MacOutputBackend::new()
     };

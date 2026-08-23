@@ -3,8 +3,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     Config, ConfigError, DeviceRouteConfig, DisplayPlacement, FailsafeSettings, KeyboardMode,
-    KeyboardSettings, NetworkSettings, PairedHostConfig, ShortcutKey, StartupSettings,
-    TopologyConfig, CURRENT_CONFIG_VERSION, MAX_CONFIG_FILE_BYTES,
+    KeyboardSettings, ModifierRoleMapping, NetworkSettings, PairedHostConfig, ShortcutKey,
+    StartupSettings, TopologyConfig, CURRENT_CONFIG_VERSION, MAX_CONFIG_FILE_BYTES,
 };
 
 #[derive(Deserialize)]
@@ -25,6 +25,7 @@ pub fn decode_config(source: &str) -> Result<Config, ConfigError> {
     let probe: VersionProbe = toml::from_str(source)?;
     let config = match probe.version {
         1 => ConfigV1::migrate(toml::from_str(source)?),
+        2 => ConfigV2::migrate(toml::from_str(source)?),
         CURRENT_CONFIG_VERSION => toml::from_str(source)?,
         found if found > CURRENT_CONFIG_VERSION => {
             return Err(ConfigError::FutureVersion {
@@ -95,6 +96,7 @@ impl ConfigV1 {
             device_route_revision: 0,
             keyboard: KeyboardSettings {
                 mode: old.keyboard_mode,
+                modifier_role_mapping: ModifierRoleMapping::default(),
             },
             failsafe: FailsafeSettings {
                 shortcut: old.failsafe_shortcut,
@@ -110,6 +112,59 @@ impl ConfigV1 {
             network,
         }
     }
+}
+
+/// Nested-settings schema before the modifier-role mapping field. Kept private
+/// so all consumers immediately receive the current, validated representation.
+#[derive(Deserialize, Serialize)]
+struct ConfigV2 {
+    version: u16,
+    #[serde(default)]
+    paired_hosts: Vec<PairedHostConfig>,
+    #[serde(default)]
+    topology: TopologyConfig,
+    #[serde(default)]
+    device_routes: Vec<DeviceRouteConfig>,
+    #[serde(default)]
+    device_route_revision: u64,
+    #[serde(default)]
+    keyboard: KeyboardSettingsV2,
+    #[serde(default)]
+    failsafe: FailsafeSettings,
+    #[serde(default)]
+    clipboard: crate::ClipboardSettings,
+    #[serde(default)]
+    startup: StartupSettings,
+    #[serde(default)]
+    network: NetworkSettings,
+}
+
+impl ConfigV2 {
+    fn migrate(old: Self) -> Config {
+        Config {
+            version: CURRENT_CONFIG_VERSION,
+            paired_hosts: old.paired_hosts,
+            topology: old.topology,
+            device_routes: old.device_routes,
+            device_route_revision: old.device_route_revision,
+            keyboard: KeyboardSettings {
+                mode: old.keyboard.mode,
+                // v2 had no modifier-role policy; the role-based functional
+                // mapping is the default upgrade path for cross-platform pairs.
+                modifier_role_mapping: ModifierRoleMapping::default(),
+            },
+            failsafe: old.failsafe,
+            clipboard: old.clipboard,
+            startup: old.startup,
+            network: old.network,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+struct KeyboardSettingsV2 {
+    #[serde(default)]
+    mode: KeyboardMode,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -210,7 +265,7 @@ mod tests {
             ..Config::default()
         };
         let encoded = encode_config(&config).unwrap();
-        assert!(encoded.contains("version = 2"));
+        assert!(encoded.contains("version = 3"));
         assert!(encoded.contains("device_route_revision = 7"));
         assert_eq!(decode_config(&encoded).unwrap(), config);
     }
@@ -219,6 +274,53 @@ mod tests {
     fn older_v2_without_route_revision_decodes_at_zero() {
         let decoded = decode_config("version = 2").unwrap();
         assert_eq!(decoded.device_route_revision, 0);
+        assert_eq!(decoded.version, CURRENT_CONFIG_VERSION);
+    }
+
+    #[test]
+    fn older_v2_without_modifier_mapping_migrates_to_the_functional_default() {
+        let migrated = decode_config("version = 2").unwrap();
+        assert_eq!(
+            migrated.keyboard.modifier_role_mapping,
+            ModifierRoleMapping::Functional
+        );
+
+        // An explicit v3 file without the field decodes the same way.
+        let defaulted = decode_config("version = 3").unwrap();
+        assert_eq!(
+            defaulted.keyboard.modifier_role_mapping,
+            ModifierRoleMapping::Functional
+        );
+        assert_eq!(
+            Config::default().keyboard.modifier_role_mapping,
+            ModifierRoleMapping::Functional
+        );
+    }
+
+    #[test]
+    fn modifier_role_mapping_round_trips_each_lowercase_value() {
+        for (value, expected) in [
+            ("functional", ModifierRoleMapping::Functional),
+            ("positional", ModifierRoleMapping::Positional),
+            ("identity", ModifierRoleMapping::Identity),
+        ] {
+            let source = format!("version = 3\n[keyboard]\nmodifier_role_mapping = \"{value}\"\n");
+            let decoded = decode_config(&source).unwrap();
+            assert_eq!(decoded.keyboard.modifier_role_mapping, expected);
+            let encoded = encode_config(&decoded).unwrap();
+            assert!(encoded.contains(&format!("modifier_role_mapping = \"{value}\"")));
+            assert_eq!(decode_config(&encoded).unwrap(), decoded);
+        }
+    }
+
+    #[test]
+    fn unknown_modifier_role_mapping_values_are_rejected() {
+        for source in [
+            "version = 3\n[keyboard]\nmodifier_role_mapping = \"role_swap\"\n",
+            "version = 3\n[keyboard]\nmodifier_role_mapping = \"Functional\"\n",
+        ] {
+            assert!(decode_config(source).is_err());
+        }
     }
 
     #[test]

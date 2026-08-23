@@ -1,6 +1,10 @@
 use kvm_input::KeyCode;
 
-/// Translates a Windows keyboard's shortcut modifiers to macOS roles.
+/// Translates a Windows keyboard's shortcut modifiers to macOS roles for the
+/// legacy **positional** mode (Win and Alt swap to where they physically sit).
+/// The default **functional** mode (Ctrl↔Cmd so Windows shortcuts keep their
+/// meaning) lives in `native/mapping.rs`; the runtime selects between them via
+/// the persisted `keyboard.modifier_role_mapping` config.
 ///
 /// Only the macOS native backend consumes this, so gate the definition to
 /// macOS to avoid a `dead_code` violation on the other platforms.

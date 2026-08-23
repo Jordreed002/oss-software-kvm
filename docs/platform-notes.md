@@ -27,3 +27,24 @@ silently.
 
 macOS requires clear Input Monitoring and Accessibility onboarding. Windows injection into a
 higher-integrity process may fail under UIPI. Login-screen control is outside version-one scope.
+
+## Cross-platform modifier roles
+
+Shortcut modifiers are remapped on the destination so shortcuts keep their meaning across a
+macOS↔Windows pair. The persisted `keyboard.modifier_role_mapping` selects the mode;
+`functional` is the default:
+
+| Source → Destination | `functional` (default) | `positional` (legacy) | `identity` |
+|---|---|---|---|
+| Mac Cmd → Windows | Ctrl | Alt | Windows key unchanged |
+| Mac Option → Windows | Alt | Windows key | Alt |
+| Mac Ctrl → Windows | Windows key | Ctrl | Ctrl |
+| Windows Ctrl → Mac | Cmd | Ctrl | Ctrl |
+| Windows Alt → Mac | Option | Option | Cmd |
+| Windows Win → Mac | Ctrl | Cmd | Win |
+
+Both directions are bijective per mode (proven by test), so simultaneous holds — e.g. Mac
+Cmd+Ctrl held together — always map to two distinct destination keys and releases can never
+collide. Shift is never remapped. Physical-mode text entry remains layout-dependent: HID usage
+IDs are transported verbatim, so a non-QWERTY source layout onto a QWERTY destination types
+destination-layout glyphs; the semantic layer (protocol v4) covers shortcut intents only.

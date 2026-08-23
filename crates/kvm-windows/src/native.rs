@@ -71,10 +71,7 @@ use crate::capture::{
     LOW_LEVEL_KEY_UP, LOW_LEVEL_MOUSE_INJECTED,
 };
 use crate::identity::{container_scoped_raw_input_identity, usb_ids_from_device_path};
-use crate::mapping::{
-    key_is_released, mouse_action, scan_code, windows_key_for_macos_source, MouseAction,
-    WHEEL_DELTA,
-};
+use crate::mapping::{key_record_for_macos_source, mouse_action, ModifierRoleMapping, WHEEL_DELTA};
 use crate::ownership::{ClaimError, RegistrationState};
 use crate::{
     derive_device_id, CapabilityState, CaptureStatistics, SuppressionScope, WindowsBackendError,
@@ -1135,7 +1132,7 @@ pub struct WindowsOutputBackend {
     pointer_remainder_y: f64,
     horizontal_wheel_remainder: f64,
     vertical_wheel_remainder: f64,
-    macos_modifier_roles: bool,
+    modifier_roles: ModifierRoleMapping,
 }
 
 impl WindowsOutputBackend {
@@ -1146,12 +1143,16 @@ impl WindowsOutputBackend {
             pointer_remainder_y: 0.0,
             horizontal_wheel_remainder: 0.0,
             vertical_wheel_remainder: 0.0,
-            macos_modifier_roles: false,
+            modifier_roles: ModifierRoleMapping::Identity,
         }
     }
 
     /// Creates an injector that maps macOS Command to Windows Alt and macOS
     /// Option to the Windows key.
+    ///
+    /// This legacy positional swap is superseded as the cross-platform default
+    /// by [`Self::new_from_macos_functional`]; it is retained for the
+    /// `positional` configuration value and existing callers.
     #[must_use]
     pub const fn new_from_macos() -> Self {
         Self {
@@ -1159,7 +1160,22 @@ impl WindowsOutputBackend {
             pointer_remainder_y: 0.0,
             horizontal_wheel_remainder: 0.0,
             vertical_wheel_remainder: 0.0,
-            macos_modifier_roles: true,
+            modifier_roles: ModifierRoleMapping::Positional,
+        }
+    }
+
+    /// Creates an injector that maps macOS Command to Windows Control and
+    /// macOS Control to the Windows key, leaving Option on Alt. This is the
+    /// default role mapping for a macOS source keyboard because a Mac user's
+    /// shortcut muscle memory is role-based (Command+C must arrive as Ctrl+C).
+    #[must_use]
+    pub const fn new_from_macos_functional() -> Self {
+        Self {
+            pointer_remainder_x: 0.0,
+            pointer_remainder_y: 0.0,
+            horizontal_wheel_remainder: 0.0,
+            vertical_wheel_remainder: 0.0,
+            modifier_roles: ModifierRoleMapping::Functional,
         }
     }
 
@@ -1173,21 +1189,17 @@ impl WindowsOutputBackend {
 
         match payload {
             InputPayload::Key { code, state } => {
-                let code = if self.macos_modifier_roles {
-                    windows_key_for_macos_source(code)
-                } else {
-                    code
-                };
-                let mapping = scan_code(code).ok_or_else(|| {
-                    WindowsBackendError::UnsupportedInput(format!(
-                        "key {code:?} has no reliable SendInput scan-code mapping"
-                    ))
-                })?;
+                let record = key_record_for_macos_source(self.modifier_roles, code, state)
+                    .ok_or_else(|| {
+                        WindowsBackendError::UnsupportedInput(format!(
+                            "key {code:?} has no reliable SendInput scan-code mapping"
+                        ))
+                    })?;
                 let mut flags = KEYEVENTF_SCANCODE;
-                if mapping.extended {
+                if record.mapping.extended {
                     flags |= KEYEVENTF_EXTENDEDKEY;
                 }
-                if key_is_released(state) {
+                if record.key_up {
                     flags |= KEYEVENTF_KEYUP;
                 }
                 send_inputs(&[INPUT {
@@ -1195,7 +1207,7 @@ impl WindowsOutputBackend {
                     Anonymous: INPUT_0 {
                         ki: KEYBDINPUT {
                             wVk: VIRTUAL_KEY(0),
-                            wScan: mapping.code,
+                            wScan: record.mapping.code,
                             dwFlags: flags,
                             time: 0,
                             dwExtraInfo: KVM_INJECTION_TAG as usize,
