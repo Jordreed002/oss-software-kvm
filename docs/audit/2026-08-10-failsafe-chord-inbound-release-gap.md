@@ -119,3 +119,42 @@ fires the chord, and asserts `inbound_pressed` is emptied.
 
 Did not modify code this cycle (AUDIT). The fix lands in cycle 38. Did not change
 the disconnect / route-change / shutdown paths (verified conformant).
+
+## Closure (2026-08-23)
+
+**RESOLVED** — commit `d8c6c2a` "fix(failsafe): release peer-injected inbound
+keys on emergency chord (§25/F-02)" (cycle 38) landed the recommendation
+verbatim. Current code, `route_captured`'s `Local`/`Inert` branch
+(`crates/kvm-daemon/src/session.rs:815-833`):
+
+```rust
+CaptureDecision::Local(outcome) | CaptureDecision::Inert(outcome) => {
+    // §25 / F-02: the emergency chord failsafe must release
+    // peer-injected inbound modifiers too, not just drain outbound —
+    // otherwise the user regains control of the machine with the
+    // peer's modifiers still physically held. Mirrors
+    // trigger_capture_emergency (the capture-discontinuation path),
+    // which exists for exactly this reason.
+    let inbound_result = if outcome.failsafe_activated() {
+        self.release_all_inbound(now_ns)
+    } else {
+        Ok(())
+    };
+    let outbound_result = self.drain_remote_cleanup(now_ns);
+    combine_cleanup_results(inbound_result, outbound_result)
+```
+
+— the exact mirror of `trigger_capture_emergency` (`session.rs:919-928`) the
+audit recommended. Beyond the recommendation, the `Fault` arm
+(`session.rs:790-813`, commit `69bda72`) now also calls `release_all_inbound`
+when `failsafe_activated()`, so a chord whose `activate_failsafe` fails cleanup
+bookkeeping cannot reintroduce the gap on the error path.
+
+Requested test present: `failsafe_chord_releases_peer_injected_inbound_modifiers`
+(`session.rs:2072-2111`) and `failsafe_chord_releases_peer_injected_inbound_pointer_button`
+(`session.rs:2160-2192`) hold a peer-injected modifier/button via
+`test_hold_inbound`, drive the default chord through `route_captured`
+(`drive_failsafe_chord`, `session.rs:2116-2157`), and assert
+`failsafe_activated()` plus `inbound_pressed.is_empty()`.
+
+Both failsafe entry points now release both directions. Finding closed.

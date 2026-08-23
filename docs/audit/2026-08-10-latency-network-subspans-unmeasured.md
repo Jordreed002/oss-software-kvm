@@ -118,3 +118,22 @@ metric remains the headline.
 
 Did not modify code this cycle (AUDIT). The improvement lands in cycle 36.
 Did not re-audit the already-stamped stages (cycles 20/26 confirmed correct).
+
+## Status (2026-08-23)
+
+Re-verified against current code. The cycle-36 recommendation landed as written;
+`NetworkReceive` remains deferred exactly as this audit proposed.
+
+| Original claim | Verdict | Evidence (code path + commit) |
+|---|---|---|
+| `NetworkSend` never stamped on the live hot path | RESOLVED | `session.rs:845-856` — in the `CaptureDecision::Remote` arm, after `dispatch_remote_effect` succeeds, `.with_network_send(now_ns)` builds `Capture→NetworkSend` and pushes the span into `network_send_latency` (`session.rs:346`, `:854`); read via `network_send_latency_stats()` (`session.rs:611-612`) and folded into `DiagnosticsSnapshot.network_send_latency` (`core.rs:716`, `:725`). Commits f0f5e57 (stamp), 276b9f5 (snapshot wiring). Pinned by `diagnostics_capture_to_network_send_latency_is_recorded` (`session.rs:1976`) and the production-path test (`session.rs:2023`). |
+| `with_network_send` 0 call sites outside kvm-input tests | RESOLVED | sole call site is `session.rs:849`. |
+| `with_network_receive` 0 call sites outside kvm-input tests | STILL OPEN (deliberately deferred) | grep confirms only the kvm-input definitions/tests; the destination-side handler stamps only Capture+InjectionRequest (`session.rs:1431-1436`) with the deferral documented in-code: "The intermediate routing / network sub-spans are source-side and not measurable at this host" (`session.rs:1429-1430`). |
+| capture→injection is a black box (40 ms headline indecomposable) | PARTIALLY RESOLVED | source-side decomposition is live: capture→routing (`core.rs:795-803`) and capture→send (`session.rs:847-855`) isolate `routing→send` by subtraction (documented on `DiagnosticsSnapshot.network_send_latency`, `diagnostics_snapshot.rs:37-41`). The cross-host transit span is still not measured per event — but aggregate receive-side network timing now exists: inter-datagram gaps/jitter percentiles/max-silence are recorded on the receive path (`kvm-network/src/queue.rs:355-375`; callers `peer.rs:1797`, `:1806`) and served as `pointer_jitter_p50/p95/p99_us` (`kvm-network/src/diagnostics.rs:84-87`). |
+
+**Net:** 4 of 5 §36 stages are stamped where the audit said they belong
+(Capture, RoutingDecision, NetworkSend source-side; InjectionRequest
+destination-side). `NetworkReceive` stays open by the audit's own design —
+it needs the source stamps to cross the wire plus clock sync (§17/§26/§31
+transport territory), and the datagram-jitter telemetry now covers the network
+leg in aggregate meanwhile.

@@ -111,3 +111,35 @@ map; the wiring is deferred to improvement cycles. (Confirmed along the way that
 `failsafe routing_suspend_seconds` is fully enforced — config ≥1s gate,
 `activate_failsafe` consumption, routing `suspended_until_ns` check — and that
 RTT/uptime/reconnect are collected at the heartbeat layer.)
+
+## Status (2026-08-23)
+
+Re-verified each original claim against current code. The collectors are no
+longer orphaned; the unified surface is half-built.
+
+| Original claim | Verdict | Evidence (code path + commit) |
+|---|---|---|
+| `EventRateMeter` 0 instantiations | RESOLVED | `core.rs:788` records every captured event in `prepare_captured` (field `core.rs:580`); enabled via `kvm-daemon/Cargo.toml:31` (`diagnostics = ["kvm-input/event-rate", ...]`), exercised in CI (`.github/workflows/ci.yml:35-37`). Commit 9105584. |
+| `LatencyStamps`/`LatencyHistory` 0 stamp call sites | RESOLVED | three stamps on the hot path: capture→routing `core.rs:795-803` (e59db0a), capture→network-send `session.rs:847-855` (f0f5e57), capture→injection `session.rs:1431-1436` (85b394d), all behind `diagnostics`. |
+| dropped packets absent | RESOLVED | `queue.rs:576-582` bumps `DropCounters` at the exact `try_push`→`EnqueueError` boundary; read via `queue.rs:672`; served in `NetworkDiagnostics.dropped`/`channel_rejections` (`kvm-network/src/diagnostics.rs:74-76`); rendered in the panel dashboard (`DiagnosticsDashboard.tsx:410-411`). Commits b463859, 017c438. |
+| audio buffer health | N/A (unchanged) | no audio crate in the workspace |
+| no unified §35 surface | PARTIALLY RESOLVED | see below |
+
+On the partial: a unified `DiagnosticsSnapshot` now exists
+(`crates/kvm-daemon/src/diagnostics_snapshot.rs:27`, composed by
+`core.rs:712-730`) carrying event rate, both source-side latency distributions,
+injection latency, drops, and coalescing — but it has **no production caller**
+(only tests); its module doc still names the §31 control IPC as its future
+carrier. What *is* live is a different, working surface: the separate-channel
+`DiagnosticsReport` (`kvm-network/src/diagnostics.rs:192-215`, TCP 24801,
+commit 017c438), published from kvm-runtime on the telemetry tick
+(`active.rs:1057-1067`, bind at `:1099-1121`, commits a0d6c74/1219f8f), pulled
+by the panel's `fetch_diagnostics` (`setup.rs:1109-1131`, commit 75fb399) and
+rendered by the live dashboard (0f43f55, 08d82c0). That report serves RTT,
+uptime, identity, capture counters, drops, and datagram telemetry — but not the
+§35 event-rate or §36 latency distributions, which are explicitly deferred
+("layered onto this envelope in later revisions", `diagnostics.rs:187-189`).
+
+**Net:** the two headline gaps (event rate, capture→injection latency) are
+collected on the hot path and CI-tested; the remaining work is carrying the
+daemon `DiagnosticsSnapshot` over the wire to the panel.
