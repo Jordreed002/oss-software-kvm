@@ -18,24 +18,36 @@ pub const DEFAULT_MAX_TEXT_BYTES: usize = 256 * 1024;
 /// Default number of update IDs and expected local echoes retained in memory.
 pub const DEFAULT_RECENT_UPDATE_CAPACITY: usize = 256;
 
+/// Default number of remote updates accepted per origin per sliding second.
+pub const DEFAULT_MAX_UPDATES_PER_SECOND: usize = 16;
+
+/// Width of the sliding window used for per-origin rate enforcement.
+const RATE_WINDOW_NS: u64 = 1_000_000_000;
+
 /// Runtime policy and memory bounds for clipboard synchronization.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ClipboardPolicy {
     enabled: bool,
     max_text_bytes: usize,
     recent_update_capacity: usize,
+    max_updates_per_second: usize,
 }
 
 impl ClipboardPolicy {
     /// Creates a validated clipboard policy.
     ///
+    /// `max_updates_per_second` bounds accepted remote updates per origin
+    /// within a sliding one-second window; it does not constrain locally
+    /// authored updates, which come from the trusted platform watcher.
+    ///
     /// # Errors
     ///
-    /// Returns [`PolicyError`] when either bound is zero.
+    /// Returns [`PolicyError`] when any bound is zero.
     pub fn new(
         enabled: bool,
         max_text_bytes: usize,
         recent_update_capacity: usize,
+        max_updates_per_second: usize,
     ) -> Result<Self, PolicyError> {
         if max_text_bytes == 0 {
             return Err(PolicyError::ZeroMaximumTextBytes);
@@ -43,11 +55,15 @@ impl ClipboardPolicy {
         if recent_update_capacity == 0 {
             return Err(PolicyError::ZeroRecentUpdateCapacity);
         }
+        if max_updates_per_second == 0 {
+            return Err(PolicyError::ZeroUpdatesPerSecond);
+        }
 
         Ok(Self {
             enabled,
             max_text_bytes,
             recent_update_capacity,
+            max_updates_per_second,
         })
     }
 
@@ -65,6 +81,12 @@ impl ClipboardPolicy {
     pub const fn recent_update_capacity(self) -> usize {
         self.recent_update_capacity
     }
+
+    /// Remote updates accepted per origin within one sliding second.
+    #[must_use]
+    pub const fn max_updates_per_second(self) -> usize {
+        self.max_updates_per_second
+    }
 }
 
 impl Default for ClipboardPolicy {
@@ -73,15 +95,19 @@ impl Default for ClipboardPolicy {
             enabled: true,
             max_text_bytes: DEFAULT_MAX_TEXT_BYTES,
             recent_update_capacity: DEFAULT_RECENT_UPDATE_CAPACITY,
+            max_updates_per_second: DEFAULT_MAX_UPDATES_PER_SECOND,
         }
     }
 }
 
 /// Invalid memory or payload bounds in a [`ClipboardPolicy`].
+// The shared `Zero` prefix states the invariant each variant guards.
+#[allow(clippy::enum_variant_names)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PolicyError {
     ZeroMaximumTextBytes,
     ZeroRecentUpdateCapacity,
+    ZeroUpdatesPerSecond,
 }
 
 impl fmt::Display for PolicyError {
@@ -92,6 +118,9 @@ impl fmt::Display for PolicyError {
             }
             Self::ZeroRecentUpdateCapacity => {
                 formatter.write_str("recent update capacity must be non-zero")
+            }
+            Self::ZeroUpdatesPerSecond => {
+                formatter.write_str("maximum updates per second must be non-zero")
             }
         }
     }
@@ -288,6 +317,11 @@ pub enum RejectReason {
         declared: ContentHash,
         calculated: ContentHash,
     },
+    /// More updates arrived from one origin within the sliding second than
+    /// the policy allows. The excess update is dropped without side effects.
+    RateExceeded {
+        per_origin_limit: usize,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -350,6 +384,61 @@ impl RecentUpdateIds {
     }
 }
 
+/// Bounded per-origin sliding-window rate state for remote updates.
+///
+/// At most `max_origins` distinct origins are tracked (oldest evicted
+/// first), and each origin retains at most `limit` timestamps, so a peer
+/// spraying random origin IDs cannot grow memory. Time is injected by the
+/// caller and must be monotonic.
+#[derive(Debug)]
+struct OriginRateWindows {
+    limit: usize,
+    max_origins: usize,
+    windows: VecDeque<(HostId, VecDeque<u64>)>,
+}
+
+impl OriginRateWindows {
+    fn new(limit: usize, max_origins: usize) -> Self {
+        Self {
+            limit,
+            max_origins,
+            windows: VecDeque::new(),
+        }
+    }
+
+    fn clear(&mut self) {
+        self.windows.clear();
+    }
+
+    /// Records one update attempt from `origin` and returns whether it fits
+    /// within the per-second bound. Rejected attempts still consume a slot
+    /// so a sustained flood keeps the window saturated instead of slipping
+    /// one update through per arrival.
+    fn observe(&mut self, origin: HostId, now_ns: u64) -> bool {
+        let window_start = now_ns.saturating_sub(RATE_WINDOW_NS);
+        let Some(index) = self
+            .windows
+            .iter()
+            .position(|(tracked, _)| *tracked == origin)
+        else {
+            self.windows.push_back((origin, VecDeque::from([now_ns])));
+            if self.windows.len() > self.max_origins {
+                self.windows.pop_front();
+            }
+            return true;
+        };
+
+        let (_, timestamps) = &mut self.windows[index];
+        timestamps.retain(|stamp| *stamp > window_start);
+        let allowed = timestamps.len() < self.limit;
+        timestamps.push_back(now_ns);
+        while timestamps.len() > self.limit {
+            timestamps.pop_front();
+        }
+        allowed
+    }
+}
+
 /// Synchronous, bounded clipboard synchronization state.
 ///
 /// Receiving an `Apply` decision also registers the expected OS clipboard
@@ -362,6 +451,7 @@ pub struct ClipboardSynchronizer {
     policy: ClipboardPolicy,
     recent_updates: RecentUpdateIds,
     expected_echoes: VecDeque<ExpectedEcho>,
+    rate_windows: OriginRateWindows,
     current_hash: Option<ContentHash>,
 }
 
@@ -370,10 +460,14 @@ impl ClipboardSynchronizer {
     pub fn new(local_host: HostId, policy: ClipboardPolicy) -> Self {
         Self {
             local_host,
-            policy,
+            rate_windows: OriginRateWindows::new(
+                policy.max_updates_per_second,
+                policy.recent_update_capacity,
+            ),
             recent_updates: RecentUpdateIds::new(policy.recent_update_capacity),
             expected_echoes: VecDeque::with_capacity(policy.recent_update_capacity),
             current_hash: None,
+            policy,
         }
     }
 
@@ -389,14 +483,16 @@ impl ClipboardSynchronizer {
 
     /// Enables or disables synchronization, returning the previous value.
     ///
-    /// Changing the mode clears content and echo state so clipboard changes
-    /// made while disabled cannot be mistaken for remote echoes after re-enable.
+    /// Changing the mode clears content, echo, and rate state so clipboard
+    /// changes made while disabled cannot be mistaken for remote echoes after
+    /// re-enable.
     pub fn set_enabled(&mut self, enabled: bool) -> bool {
         let previous = self.policy.enabled;
         if previous != enabled {
             self.policy.enabled = enabled;
             self.current_hash = None;
             self.expected_echoes.clear();
+            self.rate_windows.clear();
         }
         previous
     }
@@ -442,13 +538,24 @@ impl ClipboardSynchronizer {
 
     /// Processes one peer-authored update received from the clipboard channel.
     ///
-    /// An accepted update is remembered before `Apply` is returned, preventing
-    /// concurrent duplicate delivery and preparing deterministic echo
-    /// suppression. Call [`Self::cancel_expected_echo`] if applying it fails.
+    /// `now_ns` is nanoseconds on the caller's monotonic clock; it feeds only
+    /// the per-origin rate bound. An accepted update is remembered before
+    /// `Apply` is returned, preventing concurrent duplicate delivery and
+    /// preparing deterministic echo suppression. Call
+    /// [`Self::cancel_expected_echo`] if applying it fails.
+    ///
+    /// Duplicates and malformed updates also consume the origin's rate budget
+    /// so a flooded or misbehaving origin stays throttled.
     #[must_use]
-    pub fn receive_remote(&mut self, update: ClipboardUpdate) -> ClipboardDecision {
+    pub fn receive_remote(&mut self, update: ClipboardUpdate, now_ns: u64) -> ClipboardDecision {
         if !self.policy.enabled {
             return ClipboardDecision::Ignore(IgnoreReason::Disabled);
+        }
+
+        if !self.rate_windows.observe(update.origin, now_ns) {
+            return ClipboardDecision::Reject(RejectReason::RateExceeded {
+                per_origin_limit: self.policy.max_updates_per_second,
+            });
         }
 
         if let Some(rejection) = self.size_rejection(update.content.utf8_len()) {
@@ -540,9 +647,11 @@ mod tests {
 
     const HOST_A: HostId = HostId::from_bytes([0x0a; 16]);
     const HOST_B: HostId = HostId::from_bytes([0x0b; 16]);
+    const HOST_C: HostId = HostId::from_bytes([0x0c; 16]);
+    const NOW_NS: u64 = 1_000_000_000_000;
 
     fn policy(enabled: bool, maximum: usize, capacity: usize) -> ClipboardPolicy {
-        ClipboardPolicy::new(enabled, maximum, capacity).unwrap()
+        ClipboardPolicy::new(enabled, maximum, capacity, DEFAULT_MAX_UPDATES_PER_SECOND).unwrap()
     }
 
     fn fixed_update(number: u8, origin: HostId, text: &str) -> ClipboardUpdate {
@@ -586,7 +695,7 @@ mod tests {
 
         let a_update = published(a.observe_local_text("from a"));
         assert_eq!(
-            b.receive_remote(a_update.clone()),
+            b.receive_remote(a_update.clone(), NOW_NS),
             ClipboardDecision::Apply(a_update.clone())
         );
         assert_eq!(
@@ -598,7 +707,7 @@ mod tests {
 
         let b_update = published(b.observe_local_text("from b"));
         assert_eq!(
-            a.receive_remote(b_update.clone()),
+            a.receive_remote(b_update.clone(), NOW_NS),
             ClipboardDecision::Apply(b_update)
         );
     }
@@ -624,11 +733,11 @@ mod tests {
         let second = fixed_update(2, HOST_B, "same");
 
         assert!(matches!(
-            state.receive_remote(first),
+            state.receive_remote(first, NOW_NS),
             ClipboardDecision::Apply(_)
         ));
         assert_eq!(
-            state.receive_remote(second),
+            state.receive_remote(second, NOW_NS),
             ClipboardDecision::Ignore(IgnoreReason::UnchangedContent)
         );
         assert_eq!(state.recent_update_count(), 2);
@@ -641,7 +750,7 @@ mod tests {
         let id = update.id();
 
         assert!(matches!(
-            state.receive_remote(update),
+            state.receive_remote(update, NOW_NS),
             ClipboardDecision::Apply(_)
         ));
         assert_eq!(state.expected_echo_count(), 1);
@@ -660,10 +769,10 @@ mod tests {
     fn own_update_returning_from_a_peer_is_ignored_even_after_history_eviction() {
         let mut state = ClipboardSynchronizer::new(HOST_A, policy(true, 100, 1));
         let own = fixed_update(4, HOST_A, "loop");
-        let _ = state.receive_remote(fixed_update(5, HOST_B, "other"));
+        let _ = state.receive_remote(fixed_update(5, HOST_B, "other"), NOW_NS);
 
         assert_eq!(
-            state.receive_remote(own.clone()),
+            state.receive_remote(own.clone(), NOW_NS),
             ClipboardDecision::Ignore(IgnoreReason::LocallyOriginated {
                 update_id: own.id()
             })
@@ -679,7 +788,7 @@ mod tests {
             ClipboardDecision::Ignore(IgnoreReason::Disabled)
         );
         assert_eq!(
-            state.receive_remote(fixed_update(6, HOST_B, "far too long")),
+            state.receive_remote(fixed_update(6, HOST_B, "far too long"), NOW_NS),
             ClipboardDecision::Ignore(IgnoreReason::Disabled)
         );
         assert_eq!(state.recent_update_count(), 0);
@@ -688,7 +797,7 @@ mod tests {
     #[test]
     fn disabling_clears_echo_state_before_reenable() {
         let mut state = ClipboardSynchronizer::new(HOST_A, ClipboardPolicy::default());
-        let _ = state.receive_remote(fixed_update(7, HOST_B, "remote"));
+        let _ = state.receive_remote(fixed_update(7, HOST_B, "remote"), NOW_NS);
         assert_eq!(state.expected_echo_count(), 1);
 
         assert!(state.set_enabled(false));
@@ -718,7 +827,7 @@ mod tests {
 
         let oversized = fixed_update(8, HOST_B, "12345");
         assert_eq!(
-            state.receive_remote(oversized),
+            state.receive_remote(oversized, NOW_NS),
             ClipboardDecision::Reject(RejectReason::PayloadTooLarge {
                 actual: 5,
                 maximum: 4
@@ -738,7 +847,7 @@ mod tests {
         );
 
         assert_eq!(
-            state.receive_remote(malformed),
+            state.receive_remote(malformed, NOW_NS),
             ClipboardDecision::Reject(RejectReason::HashMismatch {
                 declared,
                 calculated: ContentHash::for_text("actual")
@@ -751,9 +860,9 @@ mod tests {
         let mut state = ClipboardSynchronizer::new(HOST_A, ClipboardPolicy::default());
         let update = fixed_update(10, HOST_B, "once");
 
-        let _ = state.receive_remote(update.clone());
+        let _ = state.receive_remote(update.clone(), NOW_NS);
         assert_eq!(
-            state.receive_remote(update.clone()),
+            state.receive_remote(update.clone(), NOW_NS),
             ClipboardDecision::Ignore(IgnoreReason::DuplicateUpdate {
                 update_id: update.id()
             })
@@ -767,19 +876,19 @@ mod tests {
         let second = fixed_update(12, HOST_B, "second");
         let third = fixed_update(13, HOST_B, "third");
 
-        let _ = state.receive_remote(first.clone());
-        let _ = state.receive_remote(second);
+        let _ = state.receive_remote(first.clone(), NOW_NS);
+        let _ = state.receive_remote(second, NOW_NS);
         assert_eq!(
-            state.receive_remote(first.clone()),
+            state.receive_remote(first.clone(), NOW_NS),
             ClipboardDecision::Ignore(IgnoreReason::DuplicateUpdate {
                 update_id: first.id()
             })
         );
-        let _ = state.receive_remote(third);
+        let _ = state.receive_remote(third, NOW_NS);
 
         assert_eq!(state.recent_update_count(), 2);
         assert_eq!(
-            state.receive_remote(first.clone()),
+            state.receive_remote(first.clone(), NOW_NS),
             ClipboardDecision::Apply(first)
         );
         assert_eq!(state.recent_update_count(), 2);
@@ -793,7 +902,7 @@ mod tests {
         let update = fixed_update(14, HOST_B, "failed");
         let id = update.id();
         assert_eq!(
-            state.receive_remote(update.clone()),
+            state.receive_remote(update.clone(), NOW_NS),
             ClipboardDecision::Apply(update.clone())
         );
 
@@ -805,7 +914,7 @@ mod tests {
             ClipboardDecision::Ignore(IgnoreReason::UnchangedContent)
         );
         assert_eq!(
-            state.receive_remote(update.clone()),
+            state.receive_remote(update.clone(), NOW_NS),
             ClipboardDecision::Apply(update)
         );
         assert_eq!(state.recent_update_count(), 2);
@@ -815,12 +924,73 @@ mod tests {
     #[test]
     fn policy_rejects_unbounded_zero_values() {
         assert_eq!(
-            ClipboardPolicy::new(true, 0, 1),
+            ClipboardPolicy::new(true, 0, 1, 1),
             Err(PolicyError::ZeroMaximumTextBytes)
         );
         assert_eq!(
-            ClipboardPolicy::new(true, 1, 0),
+            ClipboardPolicy::new(true, 1, 0, 1),
             Err(PolicyError::ZeroRecentUpdateCapacity)
+        );
+        assert_eq!(
+            ClipboardPolicy::new(true, 1, 1, 0),
+            Err(PolicyError::ZeroUpdatesPerSecond)
+        );
+    }
+
+    #[test]
+    fn rate_exceeded_rejects_excess_and_recovers_after_window() {
+        let policy = ClipboardPolicy::new(true, 100, 10, 2).unwrap();
+        let mut state = ClipboardSynchronizer::new(HOST_A, policy);
+        let t0 = NOW_NS;
+
+        assert_eq!(
+            state.receive_remote(fixed_update(20, HOST_B, "one"), t0),
+            ClipboardDecision::Apply(fixed_update(20, HOST_B, "one"))
+        );
+        assert_eq!(
+            state.receive_remote(fixed_update(21, HOST_B, "two"), t0),
+            ClipboardDecision::Apply(fixed_update(21, HOST_B, "two"))
+        );
+        // Rejected attempts still consume the origin's budget, so a flood
+        // cannot slip one update through per arrival.
+        assert_eq!(
+            state.receive_remote(fixed_update(22, HOST_B, "three"), t0),
+            ClipboardDecision::Reject(RejectReason::RateExceeded {
+                per_origin_limit: 2
+            })
+        );
+        assert_eq!(
+            state.receive_remote(fixed_update(23, HOST_B, "four"), t0),
+            ClipboardDecision::Reject(RejectReason::RateExceeded {
+                per_origin_limit: 2
+            })
+        );
+
+        let after_window = t0 + RATE_WINDOW_NS + 1;
+        assert_eq!(
+            state.receive_remote(fixed_update(24, HOST_B, "five"), after_window),
+            ClipboardDecision::Apply(fixed_update(24, HOST_B, "five"))
+        );
+    }
+
+    #[test]
+    fn rate_windows_are_per_origin() {
+        let policy = ClipboardPolicy::new(true, 100, 10, 2).unwrap();
+        let mut state = ClipboardSynchronizer::new(HOST_A, policy);
+
+        let _ = state.receive_remote(fixed_update(30, HOST_B, "one"), NOW_NS);
+        let _ = state.receive_remote(fixed_update(31, HOST_B, "two"), NOW_NS);
+        assert_eq!(
+            state.receive_remote(fixed_update(32, HOST_B, "three"), NOW_NS),
+            ClipboardDecision::Reject(RejectReason::RateExceeded {
+                per_origin_limit: 2
+            })
+        );
+
+        // A second origin keeps its own budget.
+        assert_eq!(
+            state.receive_remote(fixed_update(33, HOST_C, "other"), NOW_NS),
+            ClipboardDecision::Apply(fixed_update(33, HOST_C, "other"))
         );
     }
 }
