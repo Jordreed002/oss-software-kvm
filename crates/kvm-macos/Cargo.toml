@@ -8,9 +8,14 @@ description = "macOS native input, output, display, and permission backend for S
 [dependencies]
 kvm-daemon = { path = "../kvm-daemon" }
 kvm-input = { path = "../kvm-input" }
+kvm-security = { path = "../kvm-security" }
 kvm-types = { path = "../kvm-types" }
 sha2 = "0.11"
 thiserror = "2"
+
+[dev-dependencies]
+# Unique per-run Keychain test service names; never used outside cfg(test).
+uuid = { version = "1", features = ["v4"] }
 
 # This crate is the narrow native boundary. The workspace denies unsafe code by
 # default; macOS framework calls are reviewed here and each unsafe block carries

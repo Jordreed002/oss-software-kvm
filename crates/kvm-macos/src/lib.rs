@@ -13,6 +13,8 @@
 mod capture;
 mod hotplug;
 mod identity;
+#[cfg(target_os = "macos")]
+mod keychain;
 mod keymap;
 
 #[cfg(target_os = "macos")]
@@ -28,6 +30,8 @@ pub use hotplug::{
 pub use identity::{derive_device_id, DeviceIdentityMaterial, IdentityStability};
 pub use keymap::mac_virtual_key;
 
+#[cfg(target_os = "macos")]
+pub use keychain::KeychainCredentialStore;
 #[cfg(target_os = "macos")]
 pub use native::{probe_permissions, MacDisplayBackend, MacInputBackend, MacOutputBackend};
 #[cfg(not(target_os = "macos"))]
