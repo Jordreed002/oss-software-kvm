@@ -596,10 +596,13 @@ mod tests {
     #[tokio::test]
     async fn snapshot_channel_replaces_stale_pending_views_with_latest() {
         let peer = PeerId::from_bytes([1; 16]);
-        let populated = DiscoverySnapshot::from_candidates(vec![DiscoveryCandidate::new(
-            peer,
-            "10.0.0.1:4242".parse().unwrap(),
-        )]);
+        let populated = DiscoverySnapshot::from_parts(
+            vec![DiscoveryCandidate::new(
+                peer,
+                "10.0.0.1:4242".parse().unwrap(),
+            )],
+            Vec::new(),
+        );
         let (sender, mut receiver) = watch::channel(DiscoverySnapshot::default());
         sender.send_replace(populated);
         sender.send_replace(DiscoverySnapshot::default());

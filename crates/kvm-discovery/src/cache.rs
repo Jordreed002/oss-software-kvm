@@ -181,9 +181,11 @@ impl DiscoveryCache {
 
     #[must_use]
     pub fn snapshot(&self) -> DiscoverySnapshot {
+        let conflicted = self.conflicted_peer_hints();
         let candidates = self
             .services
             .values()
+            .filter(|service| !conflicted.contains(&service.peer_id_hint))
             .flat_map(|service| {
                 service
                     .addresses
@@ -192,7 +194,7 @@ impl DiscoveryCache {
                     .map(|address| DiscoveryCandidate::new(service.peer_id_hint, address))
             })
             .collect();
-        DiscoverySnapshot::from_candidates(candidates)
+        DiscoverySnapshot::from_parts(candidates, conflicted.into_iter().collect())
     }
 
     #[must_use]
@@ -203,6 +205,32 @@ impl DiscoveryCache {
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.services.is_empty()
+    }
+
+    /// Peer-ID hints whose live records disagree. A spoofed or flapping peer
+    /// can advertise the same peer-ID hint under several service instances;
+    /// when those records carry different address sets (addresses include the
+    /// port), every record for that hint is treated as conflicted and offered
+    /// to nobody. The conflict is derived from current cache state, so it
+    /// clears as soon as the records stabilize, one side disappears (goodbye),
+    /// or its record expires.
+    fn conflicted_peer_hints(&self) -> BTreeSet<PeerId> {
+        let mut representative: BTreeMap<PeerId, &[SocketAddr]> = BTreeMap::new();
+        let mut conflicted = BTreeSet::new();
+        for service in self.services.values() {
+            match representative.get(&service.peer_id_hint) {
+                Some(seen) if *seen != service.addresses.as_slice() => {
+                    // Address sets are public network metadata; short-circuit
+                    // comparison is safe here.
+                    conflicted.insert(service.peer_id_hint);
+                }
+                Some(_) => {}
+                None => {
+                    representative.insert(service.peer_id_hint, &service.addresses);
+                }
+            }
+        }
+        conflicted
     }
 }
 
@@ -573,7 +601,7 @@ mod tests {
     }
 
     #[test]
-    fn duplicate_claims_remain_independently_owned_by_fullname() {
+    fn same_peer_hint_with_conflicting_addresses_is_not_offered() {
         let mut cache = cache();
         cache
             .apply_resolved(
@@ -595,15 +623,215 @@ mod tests {
                 Duration::ZERO,
             )
             .unwrap();
+
         let peer = PeerId::parse(PEER).unwrap();
-        assert_eq!(cache.snapshot().candidates_for(peer).count(), 2);
+        // Conflicted records stay cached (for expiry/diagnostics) but are
+        // never offered as candidates.
+        assert_eq!(cache.len(), 2);
+        assert_eq!(cache.snapshot().candidates_for(peer).count(), 0);
+        assert_eq!(cache.snapshot().conflicted(), &[peer]);
 
         cache
             .remove_fullname(b"one._software-kvm._tcp.local.")
             .unwrap();
+        assert!(cache.snapshot().conflicted().is_empty());
         assert_eq!(
             cache.snapshot().candidates_for(peer).collect::<Vec<_>>(),
             vec!["10.0.0.3:4242".parse().unwrap()]
+        );
+    }
+
+    #[test]
+    fn same_peer_hint_with_conflicting_port_is_not_offered() {
+        let mut cache = cache();
+        cache
+            .apply_resolved(
+                record(
+                    "one._software-kvm._tcp.local.",
+                    PEER,
+                    "10.0.0.2".parse().unwrap(),
+                ),
+                Duration::ZERO,
+            )
+            .unwrap();
+        let mut other_port = record(
+            "two._software-kvm._tcp.local.",
+            PEER,
+            "10.0.0.2".parse().unwrap(),
+        );
+        other_port.port = 5353;
+        cache.apply_resolved(other_port, Duration::ZERO).unwrap();
+
+        let peer = PeerId::parse(PEER).unwrap();
+        assert_eq!(cache.snapshot().candidates_for(peer).count(), 0);
+        assert_eq!(cache.snapshot().conflicted(), &[peer]);
+    }
+
+    #[test]
+    fn consistent_records_for_one_peer_hint_do_not_conflict() {
+        let mut cache = cache();
+        cache
+            .apply_resolved(
+                record(
+                    "one._software-kvm._tcp.local.",
+                    PEER,
+                    "10.0.0.2".parse().unwrap(),
+                ),
+                Duration::ZERO,
+            )
+            .unwrap();
+        // Re-advertising the exact same record is not a conflict.
+        assert_eq!(
+            cache.apply_resolved(
+                record(
+                    "one._software-kvm._tcp.local.",
+                    PEER,
+                    "10.0.0.2".parse().unwrap(),
+                ),
+                Duration::ZERO,
+            ),
+            Ok(DiscoveryCacheChange::Unchanged)
+        );
+        // A second instance advertising the identical address set agrees.
+        cache
+            .apply_resolved(
+                record(
+                    "two._software-kvm._tcp.local.",
+                    PEER,
+                    "10.0.0.2".parse().unwrap(),
+                ),
+                Duration::ZERO,
+            )
+            .unwrap();
+
+        let peer = PeerId::parse(PEER).unwrap();
+        assert!(cache.snapshot().conflicted().is_empty());
+        assert_eq!(
+            cache.snapshot().candidates_for(peer).collect::<Vec<_>>(),
+            vec!["10.0.0.2:4242".parse().unwrap()]
+        );
+    }
+
+    #[test]
+    fn conflict_clears_when_records_stabilize() {
+        let mut cache = cache();
+        cache
+            .apply_resolved(
+                record(
+                    "one._software-kvm._tcp.local.",
+                    PEER,
+                    "10.0.0.2".parse().unwrap(),
+                ),
+                Duration::ZERO,
+            )
+            .unwrap();
+        cache
+            .apply_resolved(
+                record(
+                    "two._software-kvm._tcp.local.",
+                    PEER,
+                    "10.0.0.3".parse().unwrap(),
+                ),
+                Duration::ZERO,
+            )
+            .unwrap();
+        assert_eq!(cache.snapshot().conflicted().len(), 1);
+
+        cache
+            .apply_resolved(
+                record(
+                    "one._software-kvm._tcp.local.",
+                    PEER,
+                    "10.0.0.3".parse().unwrap(),
+                ),
+                Duration::ZERO,
+            )
+            .unwrap();
+        let peer = PeerId::parse(PEER).unwrap();
+        assert!(cache.snapshot().conflicted().is_empty());
+        assert_eq!(
+            cache.snapshot().candidates_for(peer).collect::<Vec<_>>(),
+            vec!["10.0.0.3:4242".parse().unwrap()]
+        );
+    }
+
+    #[test]
+    fn conflict_clears_when_one_side_expires() {
+        let mut cache = cache();
+        let mut short = record(
+            "one._software-kvm._tcp.local.",
+            PEER,
+            "10.0.0.2".parse().unwrap(),
+        );
+        short.ttl = Duration::from_millis(1);
+        cache
+            .apply_resolved(short, Duration::from_secs(10))
+            .unwrap();
+        cache
+            .apply_resolved(
+                record(
+                    "two._software-kvm._tcp.local.",
+                    PEER,
+                    "10.0.0.3".parse().unwrap(),
+                ),
+                Duration::from_secs(10),
+            )
+            .unwrap();
+        let peer = PeerId::parse(PEER).unwrap();
+        assert_eq!(cache.snapshot().conflicted(), &[peer]);
+
+        assert_eq!(
+            cache.expire(Duration::from_secs(11)),
+            DiscoveryCacheChange::Changed
+        );
+        assert!(cache.snapshot().conflicted().is_empty());
+        assert_eq!(
+            cache.snapshot().candidates_for(peer).collect::<Vec<_>>(),
+            vec!["10.0.0.3:4242".parse().unwrap()]
+        );
+    }
+
+    #[test]
+    fn conflicting_hint_does_not_conflict_unrelated_peers() {
+        let mut cache = cache();
+        cache
+            .apply_resolved(
+                record(
+                    "one._software-kvm._tcp.local.",
+                    PEER,
+                    "10.0.0.2".parse().unwrap(),
+                ),
+                Duration::ZERO,
+            )
+            .unwrap();
+        cache
+            .apply_resolved(
+                record(
+                    "two._software-kvm._tcp.local.",
+                    PEER,
+                    "10.0.0.3".parse().unwrap(),
+                ),
+                Duration::ZERO,
+            )
+            .unwrap();
+        cache
+            .apply_resolved(
+                record(
+                    "three._software-kvm._tcp.local.",
+                    "22222222-2222-2222-2222-222222222222",
+                    "10.0.0.4".parse().unwrap(),
+                ),
+                Duration::ZERO,
+            )
+            .unwrap();
+
+        let snapshot = cache.snapshot();
+        let conflicted = snapshot.conflicted();
+        assert_eq!(conflicted, &[PeerId::parse(PEER).unwrap()]);
+        let other = PeerId::parse("22222222-2222-2222-2222-222222222222").unwrap();
+        assert_eq!(
+            snapshot.candidates_for(other).collect::<Vec<_>>(),
+            vec!["10.0.0.4:4242".parse().unwrap()]
         );
     }
 

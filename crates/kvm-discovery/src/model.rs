@@ -112,17 +112,30 @@ impl PartialOrd for DiscoveryCandidate {
 }
 
 /// Immutable, sorted, deduplicated discovery view for scheduler consumption.
+///
+/// Candidates whose live records conflicted (the same peer-ID hint advertised
+/// with differing addresses or port) are excluded and surfaced through
+/// [`DiscoverySnapshot::conflicted`] for diagnostics instead.
 #[derive(Clone, Default, Eq, PartialEq)]
 pub struct DiscoverySnapshot {
     candidates: Vec<DiscoveryCandidate>,
+    conflicted_peer_hints: Vec<PeerId>,
 }
 
 impl DiscoverySnapshot {
-    pub(crate) fn from_candidates(mut candidates: Vec<DiscoveryCandidate>) -> Self {
+    pub(crate) fn from_parts(
+        mut candidates: Vec<DiscoveryCandidate>,
+        mut conflicted_peer_hints: Vec<PeerId>,
+    ) -> Self {
         candidates.sort_unstable();
         candidates.dedup();
         candidates.truncate(MAX_DISCOVERY_CANDIDATES);
-        Self { candidates }
+        conflicted_peer_hints.sort_unstable();
+        conflicted_peer_hints.dedup();
+        Self {
+            candidates,
+            conflicted_peer_hints,
+        }
     }
 
     #[must_use]
@@ -133,6 +146,13 @@ impl DiscoverySnapshot {
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.candidates.is_empty()
+    }
+
+    /// Untrusted peer-ID hints whose live records disagreed and were excluded
+    /// from the candidate list. Sorted and deduplicated; never raw records.
+    #[must_use]
+    pub fn conflicted(&self) -> &[PeerId] {
+        &self.conflicted_peer_hints
     }
 
     /// Deterministic addresses for one untrusted peer-ID hint.
@@ -161,6 +181,7 @@ impl fmt::Debug for DiscoverySnapshot {
             .debug_struct("DiscoverySnapshot")
             .field("peer_hint_count", &unique_peers)
             .field("candidate_count", &self.candidates.len())
+            .field("conflicted_peer_count", &self.conflicted_peer_hints.len())
             .finish_non_exhaustive()
     }
 }
