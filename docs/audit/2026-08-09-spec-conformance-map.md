@@ -1,6 +1,25 @@
 # Audit: Spec conformance map (cycle-5 consolidated review)
 
 **Date:** 2026-08-09
+
+> **Update 2026-08-23 (branch `code-review-remediation`):** statuses below
+> predate a remediation branch that changed several verdicts. Sections whose
+> status moved since 2026-08-10: §17/§26 semantic keyboard translation is now
+> wired end-to-end (protocol v4 `SemanticInput`, destination chord replay —
+> see `2026-08-10-semantic-translation-still-unwired.md` closure); §24/§25
+> failsafe chord inbound release closed (`2026-08-10-failsafe-chord-inbound-release-gap.md`);
+> §31 daemon↔panel IPC has a live OS transport (UDS/named pipe), daemon
+> control service, and panel client — runtime pages remain partial
+> (`2026-08-10-daemon-control-ipc-orphaned.md` closure); §35/§36 diagnostics
+> metrics are live end-to-end except the unified snapshot surface
+> (`2026-08-10-diagnostics-metrics-orphaned.md` status table); local display
+> and device hotplug watchers landed pending hardware validation
+> (`2026-08-09-local-display-hotplug-undetected.md`,
+> `2026-08-09-local-device-hotplug-not-propagated.md`); native credential-store
+> adapters (Keychain / Credential Manager / file fallback) landed, daemon
+> identity persistence integration remains (docs/security.md). The per-section
+> entries below were not individually re-audited; treat this addendum as the
+> delta and re-verify any section before relying on its original verdict.
 **Cycle:** /loop audit cycle 5
 **Spec refs:** `.spec/implementation.md` (39-task Codex sequence, §1–§40), `.spec/spec.md`
 **Purpose:** Map the spec's phased task sequence to verified implementation status and prioritise remaining gaps. Distilled from direct code review in cycles 1–5.

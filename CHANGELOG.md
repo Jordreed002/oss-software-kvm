@@ -46,9 +46,32 @@ era — the full earlier history remains in the git log.
   `DiscoverySnapshot::conflicted()`.
 - Per-origin clipboard rate limiting (default 16 updates/s, memory-capped across
   origins).
+- Daemon↔panel local IPC, end to end: a UDS/named-pipe transport
+  (`kvm-network::local_ipc`), a daemon control service serving the §31 commands
+  (status, peers, devices, displays, topology, failsafe trigger, KVM gate) with
+  push events, runtime wiring, and a live daemon-status card in the panel.
+- Semantic keyboard translation, end to end: protocol v4 `SemanticInput` wire
+  variant carrying the resolved command plus the originating physical press,
+  daemon dispatch on v4 sessions (fail-open to physical on mixed builds), and
+  destination native-chord replay with exact teardown; `KeyboardMode::Semantic`
+  is no longer inert.
+- Native credential stores: a `ServiceCredentialStore` abstraction with an
+  atomic file backend, a macOS Keychain adapter (raw SecItem FFI, real-keychain
+  round-trip tests), and a Windows Credential Manager adapter. Daemon identity
+  persistence integration remains.
+- Display and device hotplug watchers on both platforms (CGDisplay/IOHID on
+  macOS, WM_DISPLAYCHANGE/WM_DEVICECHANGE-HID on Windows) with 200 ms
+  coalescing and runtime re-enumeration; hardware validation entries pending.
+- A mid-session bidirectional-blackhole session test pinning heartbeat
+  failover, criterion benches for the datagram and frame codecs, cargo-fuzz
+  targets for the frame decoder and datagram parser, a configurable
+  pointer-datagram port, and adaptive pacing/redundancy with hysteresis.
+- Panel: vitest suite (55 tests) and behavior-preserving component splits of
+  the diagnostics dashboard and display-layout editor.
 - Repository infrastructure: `CHANGELOG.md`, `SECURITY.md`, ADRs, performance-budget
   and validation-matrix docs, a `justfile`, dependabot, and CI jobs for the control
-  panel, cargo-deny, MSRV (1.91), coverage, cargo-machete, and `cargo doc`.
+  panel (now running vitest), cargo-deny, MSRV (1.91), coverage, cargo-machete,
+  and `cargo doc`.
 
 ### Fixed
 
