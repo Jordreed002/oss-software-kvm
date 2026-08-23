@@ -21,6 +21,7 @@ use kvm_protocol::{
 use kvm_security::{IdentityFingerprint, PeerIdentity};
 use kvm_types::{DeviceId, HostId, PeerId, WorkspaceState};
 use thiserror::Error;
+use tracing::debug;
 
 use crate::core::{
     CaptureDecision, CaptureOutcome, CoreCaptureError, RemoteInputEffect, RoutePolicyUpdateError,
@@ -1670,6 +1671,23 @@ where
         {
             return Err(CoordinatorError::WrongActionTarget);
         }
+        // §17/§26 semantic-mode enqueue boundary. When the source resolved
+        // this press into a semantic intent, the intent itself cannot be
+        // dispatched: the wire input vocabulary (`WireInputPayloadV1`) carries
+        // only Key/PointerMove/PointerButton/Scroll and has no semantic
+        // payload variant, and kvm-protocol is deliberately not extended by
+        // the daemon. The exact physical event is therefore enqueued
+        // unchanged (fail-open) so `Semantic` mode is strictly additive — it
+        // can never drop, reorder, or rewrite user input. Making the intent
+        // observable on the wire (a semantic `Input` payload variant or a v3
+        // input message) is the remaining protocol work; the resolved
+        // translation is carried on the effect for tests and diagnostics.
+        if effect.semantic_translation().is_some() {
+            debug!(
+                "semantic translation resolved but not dispatchable on this wire; \
+                 enqueueing the exact physical event"
+            );
+        }
         let mut input = input_to_wire(&effect.event())?;
         let accepted_sequence = self.next_outbound_sequence()?;
         input.sequence = accepted_sequence;
@@ -1813,7 +1831,7 @@ fn combine_cleanup_results(
 mod tests {
     use std::io;
 
-    use kvm_config::{Config, PairedHostConfig};
+    use kvm_config::{Config, KeyboardMode, PairedHostConfig};
     use kvm_input::{KeyCode, PointerButton};
     use kvm_network::ConnectionGenerationGate;
     use kvm_protocol::{
@@ -1891,7 +1909,16 @@ mod tests {
         local: HostId,
         remote: HostId,
     ) -> PeerSessionCoordinator<RecordingInjection, RecordingOutbound> {
+        coordinator_with_mode(local, remote, KeyboardMode::default())
+    }
+
+    fn coordinator_with_mode(
+        local: HostId,
+        remote: HostId,
+        mode: KeyboardMode,
+    ) -> PeerSessionCoordinator<RecordingInjection, RecordingOutbound> {
         let mut config = Config::default();
+        config.keyboard.mode = mode;
         config.paired_hosts.push(PairedHostConfig {
             host_id: remote,
             peer_id: PEER,
@@ -1902,7 +1929,7 @@ mod tests {
         });
         let workspace = WorkspaceState::new(local, local, LogicalPointer::new(DISPLAY, 0.0, 0.0));
         PeerSessionCoordinator::new(
-            DaemonCore::new(config, workspace).unwrap(),
+            DaemonCore::new(config, workspace, Platform::Windows).unwrap(),
             expected_for(remote),
             RecordingInjection::default(),
             RecordingOutbound::default(),
@@ -2066,6 +2093,71 @@ mod tests {
             .expect("production path must stamp capture→routing latency");
         assert!(latency.count >= 1, "at least one span: {latency:?}");
         assert_eq!(latency.max_ns, 4_000, "capture→routing span: {latency:?}");
+    }
+
+    #[test]
+    fn semantic_mode_enqueues_exact_physical_events_at_the_wire_boundary() {
+        // §17/§26 wire boundary: the resolved semantic intent cannot be
+        // dispatched because `WireInputPayloadV1` has no semantic payload
+        // variant, so Semantic mode must fail open — enqueue the exact
+        // physical chord, byte-identical to Physical mode, in capture order.
+        // (The translation itself is asserted on the prepared effect in the
+        // core tests; this pins the enqueue boundary.)
+        let mut coord = coordinator_with_mode(LOCAL, REMOTE, KeyboardMode::Semantic);
+        admit(&mut coord);
+        coord.core.mark_workspace_routing_ready(0).unwrap();
+        coord
+            .core
+            .update_workspace(
+                WorkspaceState::new(LOCAL, REMOTE, LogicalPointer::new(DISPLAY, 1.0, 1.0)),
+                1,
+            )
+            .unwrap();
+
+        let presses = [
+            (KeyCode::ControlLeft, KeyState::Pressed),
+            (KeyCode::KeyC, KeyState::Pressed),
+            (KeyCode::KeyC, KeyState::Released),
+            (KeyCode::ControlLeft, KeyState::Released),
+        ];
+        for (index, &(code, state)) in presses.iter().enumerate() {
+            let sequence = u64::try_from(index + 1).unwrap();
+            coord
+                .route_captured(
+                    CapturedInput::new(
+                        InputEvent::new(
+                            sequence,
+                            1_000 + sequence,
+                            LOCAL,
+                            DEVICE,
+                            InputPayload::Key { code, state },
+                        ),
+                        crate::EventClassification::Physical,
+                    ),
+                    5_000,
+                )
+                .unwrap();
+        }
+
+        let frames = &coord.outbound.messages;
+        assert_eq!(frames.len(), presses.len(), "one Input frame per event");
+        let mut previous_sequence = 0_u64;
+        for (frame, &(code, state)) in frames.iter().zip(presses.iter()) {
+            let WireMessage::Input(input) = frame else {
+                panic!("expected an Input frame")
+            };
+            assert!(input.sequence > previous_sequence, "frames stay in order");
+            previous_sequence = input.sequence;
+            let expected = input_to_wire(&InputEvent::new(
+                0,
+                0,
+                LOCAL,
+                DEVICE,
+                InputPayload::Key { code, state },
+            ))
+            .unwrap();
+            assert_eq!(input.payload, expected.payload);
+        }
     }
 
     #[test]
@@ -3127,6 +3219,7 @@ mod tests {
         let core = DaemonCore::new(
             Config::default(),
             WorkspaceState::new(LOCAL, LOCAL, LogicalPointer::new(DISPLAY, 0.0, 0.0)),
+            Platform::Windows,
         )
         .unwrap();
         assert!(matches!(
@@ -3154,6 +3247,7 @@ mod tests {
         let core = DaemonCore::new(
             config,
             WorkspaceState::new(LOCAL, LOCAL, LogicalPointer::new(DISPLAY, 0.0, 0.0)),
+            Platform::Windows,
         )
         .unwrap();
         assert!(matches!(

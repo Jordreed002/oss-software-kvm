@@ -6,11 +6,12 @@ use arc_swap::ArcSwap;
 use kvm_config::{Config, ConfigError, ShortcutKey};
 use kvm_input::{ButtonState, InputEvent, InputPayload, KeyCode, KeyState, PointerButton};
 use kvm_router::{Destination, InputRouter, RoutingTable, MAX_DEVICE_ROUTES};
-use kvm_types::{DeviceId, DeviceRoute, HostId, WorkspaceState};
+use kvm_types::{DeviceId, DeviceRoute, HostId, Platform, WorkspaceState};
 use thiserror::Error;
 use tracing::{info, warn};
 
 use crate::platform::{CaptureDisposition, CapturedInput, EventClassification};
+use crate::semantic_capture::{SemanticCaptureStage, SemanticTranslation};
 use crate::session_endpoint::SessionEndpoint;
 
 /// Maximum physical devices which may retain state at one time.
@@ -224,6 +225,13 @@ pub(crate) struct RemoteInputEffect {
     decision_id: u64,
     endpoint: SessionEndpoint,
     event: InputEvent,
+    /// Present when `keyboard.mode = Semantic` resolved this press into a
+    /// semantic intent against the local platform and translated it to the
+    /// destination platform's native binding. The wire input vocabulary has
+    /// no variant which can carry it, so the enqueue boundary sends the exact
+    /// physical `event` unchanged (fail-open); the translation is carried for
+    /// tests and diagnostics until the protocol gains a semantic payload.
+    semantic: Option<SemanticTranslation>,
     affine: AffineSeal,
 }
 
@@ -242,6 +250,14 @@ impl RemoteInputEffect {
     #[must_use]
     pub(crate) const fn event(&self) -> InputEvent {
         self.event
+    }
+
+    /// The semantic translation resolved for this effect, if any. This is the
+    /// source-side translation result: the command the user's physical chord
+    /// expressed and the destination platform's native binding for it.
+    #[must_use]
+    pub(crate) const fn semantic_translation(&self) -> Option<SemanticTranslation> {
+        self.semantic
     }
 }
 
@@ -575,6 +591,13 @@ pub struct DaemonCore {
     workspace_ready: bool,
     handoff_pending: bool,
     snapshots: Arc<ArcSwap<RoutingSnapshot>>,
+    /// Platform of the local host: the binding domain against which captured
+    /// chords are semantically resolved in `KeyboardMode::Semantic`.
+    local_platform: Platform,
+    /// Source-side semantic translation stage (§17/§26). Tracks held logical
+    /// modifiers per captured device and resolves ordinary-key presses into
+    /// semantic commands; see `semantic_capture` for the exactness contract.
+    semantic: SemanticCaptureStage,
     /// §35 input-event-rate meter; present only with the `diagnostics` feature.
     #[cfg(feature = "diagnostics")]
     event_rate: kvm_input::EventRateMeter,
@@ -601,6 +624,7 @@ impl fmt::Debug for DaemonCore {
                 &self.pending_route_policy.is_some(),
             )
             .field("gated_local_device_count", &self.gated_local_devices.len())
+            .field("semantic_tracked_devices", &self.semantic.tracked_devices())
             .field("workspace_ready", &self.workspace_ready)
             .field("handoff_pending", &self.handoff_pending)
             .field("workspace", &"[REDACTED]")
@@ -612,10 +636,20 @@ impl fmt::Debug for DaemonCore {
 impl DaemonCore {
     /// Creates a running core after validating all durable configuration.
     ///
+    /// `local_platform` is the binding domain of this host's keyboard: in
+    /// `KeyboardMode::Semantic` a captured chord is resolved against the local
+    /// platform's native bindings and translated to the destination's (from
+    /// `paired_hosts`), so muscle memory survives the host switch. Callers
+    /// derive it from the compiled-in native backend, not from configuration.
+    ///
     /// # Errors
     ///
     /// Returns [`DaemonError::Config`] when configuration validation fails.
-    pub fn new(config: Config, workspace: WorkspaceState) -> Result<Self, DaemonError> {
+    pub fn new(
+        config: Config,
+        workspace: WorkspaceState,
+        local_platform: Platform,
+    ) -> Result<Self, DaemonError> {
         config.validate()?;
         if workspace.local_host.into_bytes() == [0; 16]
             || workspace.active_host != workspace.local_host
@@ -663,6 +697,8 @@ impl DaemonCore {
             workspace_ready: false,
             handoff_pending: false,
             snapshots: Arc::new(ArcSwap::from_pointee(initial)),
+            local_platform,
+            semantic: SemanticCaptureStage::default(),
             #[cfg(feature = "diagnostics")]
             event_rate: kvm_input::EventRateMeter::default(),
             #[cfg(feature = "diagnostics")]
@@ -817,6 +853,22 @@ impl DaemonCore {
         }
 
         let device = captured.event.source_device;
+        // §17/§26 semantic wiring: fold every *trusted physical* key transition
+        // into the per-device modifier tracker before any disposition is
+        // decided, so the snapshot mirrors physical reality rather than
+        // routing outcomes (a failsafe-drain or locally delivered release must
+        // clear held modifiers exactly as a remotely forwarded one would).
+        // Failures of the stage are fail-open to physical passthrough — they
+        // never gate or rewrite input.
+        if let Err(error) =
+            self.semantic
+                .observe(self.config.keyboard.mode, device, &captured.event.payload)
+        {
+            warn!(
+                ?error,
+                "semantic modifier tracking degraded; failing open to physical"
+            );
+        }
         let stateful = PhysicalControl::from_payload(captured.event.payload);
         let (control, transition, previous_latch) = match stateful {
             Some((control, PhysicalTransition::Press)) => {
@@ -1001,6 +1053,7 @@ impl DaemonCore {
             decision_id,
             endpoint: _,
             event: _,
+            semantic: _,
             affine,
         } = effect;
         let AffineSeal = affine;
@@ -1081,6 +1134,7 @@ impl DaemonCore {
             decision_id,
             endpoint: _,
             event: _,
+            semantic: _,
             affine,
         } = effect;
         let AffineSeal = affine;
@@ -1188,6 +1242,16 @@ impl DaemonCore {
                 })
             })
             .map_err(|_| DaemonError::CleanupPending)?;
+            // A keyboard-mode switch changes the translation policy of the
+            // capture path. A chord must never straddle two policies: drain
+            // every remote hold through the same retryable route-change
+            // cleanup as any other authority/config transition, and publish
+            // the new mode only after the release barrier succeeds.
+            let keyboard_mode_changed = config.keyboard.mode != self.config.keyboard.mode;
+            if keyboard_mode_changed {
+                self.queue_remote_cleanup(|_, _, _, _| true)
+                    .map_err(|_| DaemonError::CleanupPending)?;
+            }
             if self.cleanup_pending() {
                 self.publish(now_ns);
                 return Err(DaemonError::CleanupPending);
@@ -1208,6 +1272,13 @@ impl DaemonCore {
             }
             self.config = config;
             self.routing = routing;
+            if keyboard_mode_changed {
+                // The new mode begins from an exact empty modifier snapshot:
+                // a modifier physically held across the switch is untracked
+                // afterwards, which can only under-count (fail open to
+                // physical), never invent a held modifier.
+                self.semantic.reset();
+            }
             self.publish(now_ns);
             info!("daemon configuration changed without a route policy change");
             return Ok(());
@@ -2040,12 +2111,53 @@ impl DaemonCore {
             previous_latch,
             endpoint,
         });
+        // §17/§26 semantic wiring: this is the single choke point where a
+        // captured physical key press becomes a prepared remote enqueue, so
+        // it is where the semantic layer is consulted. `semantic_resolution`
+        // only ever *annotates* the effect — the enqueued event stays the
+        // exact physical capture because the wire has no semantic payload
+        // variant (see `semantic_capture` and `dispatch_remote_effect`).
+        let semantic = self.semantic_resolution(&event, endpoint);
         Ok(CaptureDecision::Remote(RemoteInputEffect {
             decision_id: id,
             endpoint,
             event,
+            semantic,
             affine: AffineSeal,
         }))
+    }
+
+    /// Resolves one prepared remote key press through the semantic layer.
+    ///
+    /// Reads the destination platform from the paired-host configuration for
+    /// the endpoint's host (endpoints are admitted only for configured hosts,
+    /// so the lookup failing is an untranslatable — fail-open — case rather
+    /// than an error: the event is enqueued physically exactly as captured).
+    fn semantic_resolution(
+        &self,
+        event: &InputEvent,
+        endpoint: SessionEndpoint,
+    ) -> Option<SemanticTranslation> {
+        let InputPayload::Key {
+            code,
+            state: KeyState::Pressed,
+        } = event.payload
+        else {
+            return None;
+        };
+        let destination = self
+            .config
+            .paired_hosts
+            .iter()
+            .find(|peer| peer.host_id == endpoint.host_id())
+            .map(|peer| peer.platform)?;
+        self.semantic.resolve_press(
+            self.config.keyboard.mode,
+            event.source_device,
+            code,
+            self.local_platform,
+            destination,
+        )
     }
 
     fn take_matching_remote(
@@ -2356,7 +2468,7 @@ const fn shortcut_matches_key(shortcut: ShortcutKey, key: KeyCode) -> bool {
 #[cfg(test)]
 mod tests {
     use kvm_config::{ConfiguredDeviceRoute, DeviceRouteConfig, KeyboardMode, PairedHostConfig};
-    use kvm_input::PointerButton;
+    use kvm_input::{Modifiers, PointerButton, SemanticCommand};
     use kvm_network::{ConnectionGenerationGate, ConnectionRole};
     use kvm_protocol::{WirePeerId, PROTOCOL_VERSION_V2};
     use kvm_types::{DisplayId, LogicalPointer, PeerId, Platform};
@@ -2416,7 +2528,8 @@ mod tests {
     fn core_with_routes(
         routes: impl IntoIterator<Item = (DeviceId, ConfiguredDeviceRoute)>,
     ) -> DaemonCore {
-        let mut core = DaemonCore::new(config(routes), workspace(LOCAL)).unwrap();
+        let mut core =
+            DaemonCore::new(config(routes), workspace(LOCAL), Platform::Windows).unwrap();
         core.install_session_endpoint(endpoint(), 0).unwrap();
         core.mark_workspace_routing_ready(0).unwrap();
         core
@@ -2424,6 +2537,25 @@ mod tests {
 
     fn core() -> DaemonCore {
         core_with_routes([])
+    }
+
+    /// Like [`core_with_routes`] but with `keyboard.mode = Semantic`. The
+    /// local platform is Windows (test convention) and the paired destination
+    /// is macOS (see `config`), so a Windows `Ctrl+C` must resolve `Copy` and
+    /// translate to the macOS `Cmd+C` binding.
+    fn semantic_core_with_routes(
+        routes: impl IntoIterator<Item = (DeviceId, ConfiguredDeviceRoute)>,
+    ) -> DaemonCore {
+        let mut semantic = config(routes);
+        semantic.keyboard.mode = KeyboardMode::Semantic;
+        let mut core = DaemonCore::new(semantic, workspace(LOCAL), Platform::Windows).unwrap();
+        core.install_session_endpoint(endpoint(), 0).unwrap();
+        core.mark_workspace_routing_ready(0).unwrap();
+        core
+    }
+
+    fn semantic_core() -> DaemonCore {
+        semantic_core_with_routes([])
     }
 
     #[cfg(feature = "diagnostics")]
@@ -2537,20 +2669,20 @@ mod tests {
 
     #[test]
     fn initial_authority_is_local_not_ready_and_remote_initial_state_is_rejected() {
-        let core = DaemonCore::new(config([]), workspace(LOCAL)).unwrap();
+        let core = DaemonCore::new(config([]), workspace(LOCAL), Platform::Windows).unwrap();
         assert!(!core.workspace_routing_ready());
         assert!(!core.is_routing_active());
         assert!(!core.routing_handle().load().workspace_ready);
 
         assert!(matches!(
-            DaemonCore::new(config([]), workspace(REMOTE)),
+            DaemonCore::new(config([]), workspace(REMOTE), Platform::Windows),
             Err(DaemonError::InvalidInitialAuthority)
         ));
     }
 
     #[test]
     fn readiness_requires_health_and_cleanup_barrier() {
-        let mut core = DaemonCore::new(config([]), workspace(LOCAL)).unwrap();
+        let mut core = DaemonCore::new(config([]), workspace(LOCAL), Platform::Windows).unwrap();
         assert_eq!(
             core.mark_workspace_routing_ready(0),
             Err(CoreCaptureError::Unavailable)
@@ -2806,6 +2938,231 @@ mod tests {
             DeviceRoute::FollowActiveHost
         );
         assert!(core.staged_route_policy().is_none());
+    }
+
+    #[test]
+    fn semantic_mode_translates_a_mapped_shortcut_on_the_remote_effect() {
+        // §17/§26 wiring: in Semantic mode a captured chord must resolve
+        // through the semantic layer before remote enqueue. A Windows
+        // Ctrl+C (local platform Windows) resolves Copy and carries the
+        // macOS destination's native Cmd+C binding on the prepared effect.
+        let mut core = semantic_core();
+        core.update_workspace(workspace(REMOTE), 1).unwrap();
+
+        // The modifier press itself routes physically and resolves nothing.
+        let ctrl = prepare_remote(
+            &mut core,
+            key(DEVICE, KeyCode::ControlLeft, KeyState::Pressed),
+        );
+        assert_eq!(ctrl.semantic_translation(), None);
+        core.confirm_remote_input(ctrl, 1, 1).unwrap();
+
+        let effect = prepare_remote(&mut core, key(DEVICE, KeyCode::KeyC, KeyState::Pressed));
+        let translation = effect
+            .semantic_translation()
+            .expect("ctrl+c must resolve to copy in semantic mode");
+        assert_eq!(translation.command, SemanticCommand::Copy);
+        assert_eq!(translation.destination_binding.modifiers, Modifiers::meta());
+        assert_eq!(translation.destination_binding.key, KeyCode::KeyC);
+
+        // Wire boundary (fail-open): the enqueued event is the exact physical
+        // capture, unchanged by the translation.
+        assert_eq!(
+            effect.event().payload,
+            InputPayload::Key {
+                code: KeyCode::KeyC,
+                state: KeyState::Pressed,
+            }
+        );
+        core.confirm_remote_input(effect, 2, 2).unwrap();
+        assert_eq!(core.remote_held.len(), 2);
+    }
+
+    #[test]
+    fn semantic_mode_passes_unmapped_keys_through_physically() {
+        let mut semantic = semantic_core();
+        semantic.update_workspace(workspace(REMOTE), 1).unwrap();
+
+        // No modifiers held: an unmapped key resolves nothing.
+        let effect = prepare_remote(&mut semantic, key(DEVICE, KeyCode::KeyK, KeyState::Pressed));
+        assert_eq!(effect.semantic_translation(), None);
+        assert_eq!(
+            effect.event().payload,
+            InputPayload::Key {
+                code: KeyCode::KeyK,
+                state: KeyState::Pressed,
+            }
+        );
+        semantic.confirm_remote_input(effect, 1, 1).unwrap();
+
+        // Ctrl+Shift+C is not Copy (exact matching): no resolution either.
+        for code in [KeyCode::ControlLeft, KeyCode::ShiftLeft] {
+            queue(&mut semantic, key(DEVICE, code, KeyState::Pressed));
+        }
+        let effect = prepare_remote(&mut semantic, key(DEVICE, KeyCode::KeyC, KeyState::Pressed));
+        assert_eq!(effect.semantic_translation(), None);
+
+        // Physical mode is byte-identical: even a mapped chord resolves
+        // nothing when the mode is not Semantic.
+        let mut physical_daemon = core();
+        physical_daemon
+            .update_workspace(workspace(REMOTE), 1)
+            .unwrap();
+        queue(
+            &mut physical_daemon,
+            key(DEVICE, KeyCode::ControlLeft, KeyState::Pressed),
+        );
+        let effect = prepare_remote(
+            &mut physical_daemon,
+            key(DEVICE, KeyCode::KeyC, KeyState::Pressed),
+        );
+        assert_eq!(effect.semantic_translation(), None);
+    }
+
+    #[test]
+    fn semantic_modifier_release_never_wedges_under_translation() {
+        // A semantic translation can never leave a modifier logically held:
+        // physical releases must clear translator state exactly, and the
+        // ledgers must drain exactly as in physical mode.
+        let mut core = semantic_core();
+        core.update_workspace(workspace(REMOTE), 1).unwrap();
+
+        // Full chord lifecycle, releasing the modifier before the key.
+        queue(
+            &mut core,
+            key(DEVICE, KeyCode::ControlLeft, KeyState::Pressed),
+        );
+        queue(&mut core, key(DEVICE, KeyCode::KeyC, KeyState::Pressed));
+        queue(&mut core, key(DEVICE, KeyCode::KeyC, KeyState::Repeated));
+        assert_eq!(core.remote_held.len(), 2);
+        queue(
+            &mut core,
+            key(DEVICE, KeyCode::ControlLeft, KeyState::Released),
+        );
+        queue(&mut core, key(DEVICE, KeyCode::KeyC, KeyState::Released));
+
+        assert!(core.remote_held.is_empty());
+        assert_eq!(core.physical_control_count, 0);
+        assert_eq!(core.semantic.tracked_devices(), 0);
+
+        // The cleared tracker no longer resolves a following bare press.
+        let effect = prepare_remote(&mut core, key(DEVICE, KeyCode::KeyC, KeyState::Pressed));
+        assert_eq!(effect.semantic_translation(), None);
+        core.confirm_remote_input(effect, 9, 9).unwrap();
+    }
+
+    #[test]
+    fn keyboard_mode_switch_drains_remote_holds_and_resets_the_translator() {
+        let mut core = semantic_core();
+        core.update_workspace(workspace(REMOTE), 1).unwrap();
+        queue(
+            &mut core,
+            key(DEVICE, KeyCode::ControlLeft, KeyState::Pressed),
+        );
+        queue(&mut core, key(DEVICE, KeyCode::KeyC, KeyState::Pressed));
+        assert_eq!(core.remote_held.len(), 2);
+
+        // The mode switch must drain every remote hold through the ordinary
+        // route-change cleanup before the new policy publishes: the first
+        // attempt is blocked by the release barrier.
+        let mut physical = core.config().clone();
+        physical.keyboard.mode = KeyboardMode::Physical;
+        assert!(matches!(
+            core.update_config(physical, 2),
+            Err(DaemonError::CleanupPending)
+        ));
+        assert!(core.cleanup_pending());
+        while let Some(effect) = core.take_next_cleanup_release() {
+            core.confirm_cleanup_release(effect, 3).unwrap();
+        }
+        assert!(core.remote_held.is_empty());
+
+        // With the barrier settled the new mode commits. The drained keys are
+        // quarantined until their physical releases, which arrive now.
+        let mut physical = core.config().clone();
+        physical.keyboard.mode = KeyboardMode::Physical;
+        core.update_config(physical, 4).unwrap();
+        assert_eq!(core.config().keyboard.mode, KeyboardMode::Physical);
+        for code in [KeyCode::ControlLeft, KeyCode::KeyC] {
+            let decision = core
+                .prepare_captured(key(DEVICE, code, KeyState::Released), 4)
+                .unwrap();
+            assert!(
+                matches!(decision, CaptureDecision::Inert(_)),
+                "quarantined lifecycle release must stay suppressed"
+            );
+        }
+        assert!(core.physical_controls.is_empty());
+
+        // Switching back re-arms Semantic mode from an exact empty snapshot:
+        // the Ctrl held before either switch must not resolve a later press.
+        let mut semantic = core.config().clone();
+        semantic.keyboard.mode = KeyboardMode::Semantic;
+        core.update_config(semantic, 5).unwrap();
+        core.update_workspace(workspace(REMOTE), 6).unwrap();
+        let effect = prepare_remote(&mut core, key(DEVICE, KeyCode::KeyC, KeyState::Pressed));
+        assert_eq!(effect.semantic_translation(), None);
+        core.confirm_remote_input(effect, 3, 7).unwrap();
+    }
+
+    #[test]
+    fn failsafe_chord_still_escapes_locally_in_semantic_mode() {
+        // The emergency chord is evaluated before any remote preparation, so
+        // semantic translation can never capture or delay the escape. Its
+        // drain window also observes the chord releases, proving the
+        // translator clears exactly during failsafe drain.
+        let mut core = semantic_core();
+        core.update_workspace(workspace(REMOTE), 1).unwrap();
+        for code in [KeyCode::ControlLeft, KeyCode::AltLeft, KeyCode::ShiftLeft] {
+            queue(&mut core, key(DEVICE, code, KeyState::Pressed));
+        }
+
+        let decision = core
+            .prepare_captured(key(DEVICE, KeyCode::Backspace, KeyState::Pressed), 2)
+            .unwrap();
+        let CaptureDecision::Local(outcome) = decision else {
+            panic!("the failsafe chord must escape locally in semantic mode")
+        };
+        assert!(outcome.failsafe_activated());
+
+        // Drain-window releases stay local and clear the held modifiers.
+        for code in [
+            KeyCode::Backspace,
+            KeyCode::ShiftLeft,
+            KeyCode::AltLeft,
+            KeyCode::ControlLeft,
+        ] {
+            let decision = core
+                .prepare_captured(key(DEVICE, code, KeyState::Released), 3)
+                .unwrap();
+            assert!(
+                matches!(decision, CaptureDecision::Local(_)),
+                "drain-window release must stay local"
+            );
+        }
+        assert_eq!(core.semantic.tracked_devices(), 0);
+
+        // Settle the failsafe cleanup and expiry, restore remote authority,
+        // then prove the drained tracker does not resolve a bare press.
+        while let Some(effect) = core.take_next_cleanup_release() {
+            core.confirm_cleanup_release(effect, 4).unwrap();
+        }
+        let after_suspension =
+            5 + u64::from(core.config().failsafe.routing_suspend_seconds) * 1_000_000_000;
+        core.update_workspace(workspace(REMOTE), after_suspension)
+            .unwrap();
+        let CaptureDecision::Remote(effect) = core
+            .prepare_captured(
+                key(DEVICE, KeyCode::KeyC, KeyState::Pressed),
+                after_suspension,
+            )
+            .unwrap()
+        else {
+            panic!("routing must resume after the failsafe suspension")
+        };
+        assert_eq!(effect.semantic_translation(), None);
+        core.confirm_remote_input(effect, 4, after_suspension)
+            .unwrap();
     }
 
     #[test]

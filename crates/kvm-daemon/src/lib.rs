@@ -14,6 +14,7 @@ pub mod failsafe_hook;
 mod peer_manager;
 mod platform;
 mod pointer_handoff;
+mod semantic_capture;
 mod session;
 mod session_endpoint;
 mod supervisor;

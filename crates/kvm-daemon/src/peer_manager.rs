@@ -3286,7 +3286,7 @@ mod tests {
             LogicalPointer::new(DISPLAY, 0.0, 0.0),
         );
         let coordinator = PeerSessionCoordinator::new(
-            DaemonCore::new(config, workspace).unwrap(),
+            DaemonCore::new(config, workspace, Platform::Windows).unwrap(),
             identity.clone(),
             TestInjection::default(),
             outbound,
@@ -3448,7 +3448,7 @@ mod tests {
             LogicalPointer::new(DISPLAY, 0.0, 0.0),
         );
         let coordinator = PeerSessionCoordinator::new(
-            DaemonCore::new(config, initial).unwrap(),
+            DaemonCore::new(config, initial, Platform::Windows).unwrap(),
             selected_identity.clone(),
             TestInjection::default(),
             outbound.clone(),
@@ -5159,7 +5159,7 @@ mod tests {
             LogicalPointer::new(DISPLAY, 0.0, 0.0),
         );
         let coordinator = PeerSessionCoordinator::new(
-            DaemonCore::new(config, initial).unwrap(),
+            DaemonCore::new(config, initial, Platform::Windows).unwrap(),
             selected_identity.clone(),
             TestInjection::default(),
             TestOutbound::default(),
