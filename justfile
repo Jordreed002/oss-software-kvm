@@ -50,22 +50,28 @@ deny:
 doc:
     RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --document-private-items
 
-# Sign the kvm-runtime dev binary with a stable local identity so macOS TCC
+# Sign the kvm-runtime dev binaries with a stable local identity so macOS TCC
 # grants (Accessibility, Input Monitoring) survive rebuilds. Unsigned dev
 # binaries are ad-hoc signed; every rebuild changes the signature and macOS
 # silently drops the permission, which surfaces as "native capture lifecycle
-# failed" / diagnose-native reporting accessibility=false. Re-run after any
-# rebuild, then grant Accessibility once; the grant persists across future
-# rebuild+sign cycles. No-op with a helpful message when no identity exists.
+# failed" / diagnose-native reporting accessibility=false. Covers both spawn
+# paths the panel may resolve: the root target builds and the Tauri
+# workspace's own debug copy. Re-run after any rebuild, then grant
+# Accessibility once; the grant persists across future rebuild+sign cycles.
 dev-sign:
     #!/bin/sh
     set -e
-    binary=target/debug/kvm-runtime
     identity=$(security find-identity -v -p codesigning | sed -n 's/^.*[0-9A-F]\{40\} "\(.*\)"$/\1/p' | head -1)
-    if [ -z "$identity" ] || [ ! -x "$binary" ]; then
-        echo "no codesigning identity found (create one in Xcode → Settings → Accounts)" \
-        "or kvm-runtime is not built yet" >&2
+    if [ -z "$identity" ]; then
+        echo "no codesigning identity found (create one in Xcode → Settings → Accounts)" >&2
         exit 0
     fi
-    codesign --force --sign "$identity" "$binary"
-    echo "signed $binary with: $identity"
+    for binary in \
+        target/debug/kvm-runtime \
+        target/release/kvm-runtime \
+        apps/control-panel/src-tauri/target/debug/kvm-runtime; do
+        if [ -x "$binary" ]; then
+            codesign --force --sign "$identity" "$binary"
+            echo "signed $binary with: $identity"
+        fi
+    done
