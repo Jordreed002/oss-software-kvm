@@ -60,6 +60,29 @@ pub const CONTROL_CLIENT_CONNECT_TIMEOUT: Duration = Duration::from_millis(250);
 /// Recommended panel-side response budget: covers the daemon's ~8 ms service
 /// tick with generous margin.
 pub const CONTROL_CLIENT_RESPONSE_TIMEOUT: Duration = Duration::from_millis(750);
+/// Backoff after a transient accept failure before the listener retries.
+const ACCEPT_BACKOFF: Duration = Duration::from_millis(50);
+/// Consecutive transient accept failures tolerated before the listener is
+/// declared dead and `run` propagates the failure.
+const ACCEPT_FAILURE_LIMIT: u32 = 32;
+
+/// Accept failures the listener can survive: fd pressure (`Interrupted` /
+/// `WouldBlock`), aborted in-flight connections, and Windows pipe-instance
+/// pressure (`ConnectionRefused` from a busy pipe) all leave the listener
+/// healthy. Everything else (a closed/removed socket, permissions) is fatal.
+fn transient_accept_error(error: &kvm_network::LocalIpcError) -> bool {
+    matches!(
+        error,
+        kvm_network::LocalIpcError::Io(source)
+            if matches!(
+                source.kind(),
+                std::io::ErrorKind::Interrupted
+                    | std::io::ErrorKind::WouldBlock
+                    | std::io::ErrorKind::ConnectionAborted
+                    | std::io::ErrorKind::ConnectionRefused
+            )
+    )
+}
 
 // --- Mutating commands --------------------------------------------------------
 
@@ -207,16 +230,20 @@ impl ControlService {
 
     /// Serves panel connections until `shutdown` is signalled (or its sender
     /// is dropped). Connection-level failures close only that connection;
-    /// only a listener failure propagates.
+    /// transient accept failures (fd exhaustion, aborted connections, pipe
+    /// instance pressure) back off briefly and keep the listener alive —
+    /// a single such error must not silently kill the daemon's only §31
+    /// surface until restart. Only a persistent listener failure propagates.
     ///
     /// # Errors
     ///
     /// Returns [`ControlServiceError::Accept`] when the listener itself
-    /// fails.
+    /// keeps failing.
     pub async fn run(
         mut self,
         mut shutdown: watch::Receiver<bool>,
     ) -> Result<(), ControlServiceError> {
+        let mut consecutive_failures = 0_u32;
         loop {
             let connection = tokio::select! {
                 biased;
@@ -226,7 +253,36 @@ impl ControlService {
                     }
                     continue;
                 }
-                accepted = self.server.accept() => accepted.map_err(ControlServiceError::Accept)?,
+                accepted = self.server.accept() => match accepted {
+                    Ok(connection) => {
+                        consecutive_failures = 0;
+                        connection
+                    }
+                    Err(error) => {
+                        if !transient_accept_error(&error) {
+                            return Err(ControlServiceError::Accept(error));
+                        }
+                        consecutive_failures = consecutive_failures.saturating_add(1);
+                        if consecutive_failures >= ACCEPT_FAILURE_LIMIT {
+                            return Err(ControlServiceError::Accept(error));
+                        }
+                        tracing::warn!(
+                            ?error,
+                            consecutive_failures,
+                            "transient control accept failure; backing off"
+                        );
+                        if tokio::time::timeout(
+                            ACCEPT_BACKOFF,
+                            shutdown.changed(),
+                        )
+                        .await
+                        .is_ok_and(|changed| changed.is_err() || *shutdown.borrow())
+                        {
+                            return Ok(());
+                        }
+                        continue;
+                    }
+                },
             };
             tokio::spawn(serve_connection(
                 connection,

@@ -384,7 +384,13 @@ impl LocalControlClient {
         path: &Path,
         timeout: Duration,
     ) -> Result<LocalControlConnection, LocalIpcError> {
-        let deadline = tokio::time::Instant::now() + timeout;
+        let now = tokio::time::Instant::now();
+        // `checked_add` keeps an absurd timeout from panicking on clock
+        // overflow; saturation simply retries until the caller-visible
+        // error path or a successful connect.
+        let deadline = now
+            .checked_add(timeout)
+            .unwrap_or_else(|| now + CONNECT_RETRY_CADENCE);
         loop {
             // Unix sockets connect asynchronously; named-pipe clients connect
             // synchronously. Each platform calls its real signature rather
@@ -401,10 +407,13 @@ impl LocalControlClient {
                     });
                 }
                 Err(error) => {
-                    if tokio::time::Instant::now() >= deadline {
+                    let now = tokio::time::Instant::now();
+                    if now >= deadline {
                         return Err(error);
                     }
-                    tokio::time::sleep(CONNECT_RETRY_CADENCE).await;
+                    // Never sleep past the documented budget.
+                    let remaining = deadline - now;
+                    tokio::time::sleep(CONNECT_RETRY_CADENCE.min(remaining)).await;
                 }
             }
         }

@@ -53,9 +53,9 @@ const MAX_TRACKED_DEVICES: usize = 64;
 /// adaptive controller engages, the interval moves within
 /// [`PACING_INTERVAL_MIN`]..=[`PACING_INTERVAL_MAX`].
 const POINTER_PACING_INTERVAL: Duration = Duration::from_millis(4);
-/// Fastest pacing the adaptive controller may select. Only reachable after a
-/// sustained feedback-free window, so a healthy link runs faster than the
-/// 4 ms baseline.
+/// Fastest pacing the adaptive controller may select. Reachable only after
+/// at least one feedback episode followed by a sustained feedback-free
+/// window; a link that never reported a gap stays at the 4 ms baseline.
 const PACING_INTERVAL_MIN: Duration = Duration::from_millis(2);
 /// Slowest pacing the adaptive controller may select under worst-case loss.
 const PACING_INTERVAL_MAX: Duration = Duration::from_millis(16);
@@ -471,6 +471,17 @@ impl PointerDatagramPath {
         if !self.ready || self.pending.is_empty() {
             return Ok(0);
         }
+        // The escalated pacing interval must govern the wire, not just the
+        // event-driven path in `try_send_pointer`: without this gate the
+        // 4 ms flush tick drains `pending` regardless of the controller's
+        // decision and the 8/16 ms degraded states never materialize.
+        // Pending stays queued for the next eligible tick.
+        if self
+            .last_pointer_send
+            .is_some_and(|last| last.elapsed() < self.pacing.pacing_interval())
+        {
+            return Ok(0);
+        }
         let pending = std::mem::take(&mut self.pending);
         let mut sent = 0;
         for (device, pointer) in pending {
@@ -526,18 +537,21 @@ impl PointerDatagramPath {
         payload.extend_from_slice(&sequence.to_be_bytes());
         payload.extend_from_slice(&frame);
         let length = self.encode_payload(&payload)?;
-        match self.socket.try_send(&self.encode_scratch[..length]) {
-            Ok(written) if written == length => {}
+        let sent = match self.socket.try_send(&self.encode_scratch[..length]) {
+            Ok(written) if written == length => true,
             Ok(_) => return Err(io::Error::new(io::ErrorKind::WriteZero, "partial datagram")),
-            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
+            // Nothing went out, so this must not consume a retry attempt or
+            // wait out a retry interval: `maintain_reliable` treats a
+            // zero-attempt entry as immediately due.
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => false,
             Err(error) => return Err(error),
-        }
+        };
         self.reliable_pending.insert(
             sequence,
             PendingReliable {
                 payload,
                 last_sent: Instant::now(),
-                attempts: 1,
+                attempts: u8::from(sent),
             },
         );
         Ok(true)
@@ -548,7 +562,8 @@ impl PointerDatagramPath {
             .reliable_pending
             .iter()
             .filter_map(|(sequence, pending)| {
-                (pending.last_sent.elapsed() >= RELIABLE_RETRY_INTERVAL).then_some(*sequence)
+                (pending.attempts == 0 || pending.last_sent.elapsed() >= RELIABLE_RETRY_INTERVAL)
+                    .then_some(*sequence)
             })
             .collect();
         let mut retransmitted = 0;
@@ -862,7 +877,11 @@ impl ReliableReorderBuffer {
     ///
     /// Sequences parked so far ahead that the buffer could never drain past
     /// them are ignored (`None`): nothing before them would arrive to
-    /// advance the window and the buffer would pin at capacity.
+    /// advance the window and the buffer would pin at capacity. Sequences
+    /// below `next_sequence` were already delivered — a retransmission
+    /// landing there is acknowledged again without insertion, because no
+    /// drain path can ever remove a below-window entry and 128 of them
+    /// would wedge the buffer at capacity for the session's lifetime.
     ///
     /// Returns the drained messages plus the highest contiguous sequence
     /// received so far (the cumulative acknowledgement value), or `None`
@@ -874,6 +893,9 @@ impl ReliableReorderBuffer {
     ) -> Option<(Vec<WireMessage>, Option<u64>)> {
         if sequence.saturating_sub(self.next_sequence) >= MAX_RELIABLE_PENDING as u64 {
             return None;
+        }
+        if sequence < self.next_sequence {
+            return Some((Vec::new(), self.next_sequence.checked_sub(1)));
         }
         if self.buffered.len() < MAX_RELIABLE_PENDING {
             self.buffered.entry(sequence).or_insert(message);
@@ -1186,6 +1208,7 @@ mod tests {
         let mut discarded = [0_u8; MAX_DATAGRAM];
         recv_raw(&mut b, &mut discarded).await;
         assert!(a.try_send_pointer(&movement).unwrap());
+        a.last_pointer_send = None;
         a.flush_pending().unwrap();
 
         let recovered = recv(&mut b).await.input.unwrap();
@@ -1293,7 +1316,9 @@ mod tests {
 
         let tracked = pointer_move(host_a, WireDeviceId([0; 16]), 4.0, 2.0);
         assert!(a.try_send_pointer(&tracked).unwrap());
-        // The pacing window queues rather than sends; flush explicitly.
+        // The pacing window queues rather than sends; simulate an elapsed
+        // window, then flush explicitly.
+        a.last_pointer_send = None;
         a.flush_pending().unwrap();
         let received = recv(&mut b).await.input.unwrap();
         assert_eq!(received.source_device, WireDeviceId([0; 16]));
@@ -1381,6 +1406,7 @@ mod tests {
 
         let followup = pointer_move(host_a, device, 1.0, -0.5);
         assert!(a.try_send_pointer(&followup).unwrap());
+        a.last_pointer_send = None;
         a.flush_pending().unwrap();
         let received = recv(&mut b).await.input.unwrap();
         assert!(matches!(
@@ -1737,9 +1763,11 @@ mod tests {
         let mut discarded = [0_u8; MAX_DATAGRAM];
         for _ in 0..2 {
             assert!(a.try_send_pointer(&movement).unwrap());
+            a.last_pointer_send = None;
             a.flush_pending().unwrap();
             recv_raw(&mut b, &mut discarded).await;
             assert!(a.try_send_pointer(&movement).unwrap());
+            a.last_pointer_send = None;
             a.flush_pending().unwrap();
             assert!(recv(&mut b).await.gaps > 0);
         }
@@ -1749,8 +1777,16 @@ mod tests {
         assert_eq!(a.pacing.redundancy_budget, REDUNDANCY_BUDGET_MIN);
         assert_eq!(a.pacing.pacing_interval(), Duration::from_millis(8));
 
-        // The escalation's redundant copies are actually spent on the wire.
+        // The escalation's redundant copies are actually spent on the wire,
+        // and the escalated interval genuinely gates the flush: only an
+        // elapsed window (or its absence) may transmit.
         assert!(a.try_send_pointer(&movement).unwrap());
+        assert_eq!(
+            a.flush_pending().unwrap(),
+            0,
+            "escalated pacing gates the flush"
+        );
+        a.last_pointer_send = None;
         let redundant = a.flush_pending().unwrap();
         assert!(redundant >= 1);
     }
@@ -1781,6 +1817,27 @@ mod tests {
         let (drained, acknowledged) = buffer.insert(0, scroll(WireHostId([1; 16]), 6)).unwrap();
         assert_eq!(drained.len(), 1);
         assert_eq!(acknowledged, Some(0));
+    }
+
+    // A retransmission of an already-delivered sequence (the exact
+    // ACK-loss condition retransmission exists for) must not park an entry
+    // no drain can remove: 128 of those would wedge the buffer at capacity
+    // for the session's lifetime.
+    #[test]
+    fn reorder_buffer_re_acknowledges_delivered_retransmissions_without_parking() {
+        let host = WireHostId([1; 16]);
+        let mut buffer = ReliableReorderBuffer::new();
+        let (drained, _) = buffer.insert(0, scroll(host, 1)).unwrap();
+        assert_eq!(drained.len(), 1);
+        for _ in 0..MAX_RELIABLE_PENDING {
+            let (drained, acknowledged) = buffer.insert(0, scroll(host, 2)).unwrap();
+            assert!(drained.is_empty());
+            assert_eq!(acknowledged, Some(0));
+        }
+        // The window is not consumed: in-order delivery still works.
+        let (drained, acknowledged) = buffer.insert(1, scroll(host, 3)).unwrap();
+        assert_eq!(drained.len(), 1);
+        assert_eq!(acknowledged, Some(1));
     }
 
     #[test]
