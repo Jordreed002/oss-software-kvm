@@ -20,6 +20,7 @@ use std::fmt;
 use std::fs;
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use zeroize::Zeroize;
 
@@ -244,7 +245,10 @@ fn credential_io_error(context: &'static str, error: &io::Error) -> CredentialSt
 }
 
 /// Creates a directory for secret material, restricting it to the owner on
-/// Unix. Existing directories are accepted unchanged.
+/// Unix. A pre-existing directory is accepted only when it is a real
+/// directory (not a symlink) with owner-only group/other permission bits on
+/// Unix; anything looser is rejected rather than silently tightened, because
+/// an administrator may have set the looser mode deliberately.
 fn create_secret_dir(path: &Path) -> Result<(), CredentialStoreError> {
     let build = || -> io::Result<()> {
         #[cfg(unix)]
@@ -265,23 +269,58 @@ fn create_secret_dir(path: &Path) -> Result<(), CredentialStoreError> {
                 Err(error)
             }
         })
-        .map_err(|error| credential_io_error("creating credential directory", &error))
+        .map_err(|error| credential_io_error("creating credential directory", &error))?;
+    #[cfg(unix)]
+    verify_secret_dir(path)?;
+    Ok(())
+}
+
+/// Rejects a secret directory whose type or permissions would expose secret
+/// material beyond its owner: symlinks and any group/other access bits are
+/// refused.
+#[cfg(unix)]
+fn verify_secret_dir(path: &Path) -> Result<(), CredentialStoreError> {
+    use std::os::unix::fs::PermissionsExt;
+
+    // lstat: a symlink must be judged as a symlink, not by the permissions
+    // of whatever directory it points at.
+    let metadata = fs::symlink_metadata(path)
+        .map_err(|error| credential_io_error("inspecting credential directory", &error))?;
+    if metadata.file_type().is_symlink() {
+        return Err(CredentialStoreError::Insecure);
+    }
+    if metadata.permissions().mode() & 0o077 != 0 {
+        return Err(CredentialStoreError::Insecure);
+    }
+    Ok(())
 }
 
 /// Plain-file reference credential store for tests and non-native hosts.
 ///
 /// Each credential is one file at
-/// `<root>/<hex(service)>/<hex(account)>.secret`, written through a temporary
-/// file that is atomically renamed into place so a crash never leaves a
-/// truncated secret. On Unix the root, per-service directories, and secret
-/// files are created with owner-only permissions (0700/0600); non-Unix hosts
-/// get the platform's default file security, which is why production hosts
-/// must use the native platform adapter instead. File contents are the raw
-/// secret bytes with no framing or encryption.
+/// `<root>/<hex(service)>/<hex(account)>.secret`, written through a fresh
+/// uniquely named temporary file (process id plus counter, always created
+/// new so a stale temporary can never leak its permissions into the
+/// published secret) that is atomically renamed into place so a crash never
+/// leaves a truncated secret. On Unix the root, per-service directories,
+/// and secret files are created with owner-only permissions (0700/0600),
+/// and a pre-existing root or service directory is accepted only when it
+/// is a real directory with owner-only group/other permission bits;
+/// non-Unix hosts get the platform's default file security, which is why
+/// production hosts must use the native platform adapter instead. File
+/// contents are the raw secret bytes with no framing or encryption.
 #[derive(Debug)]
 pub struct FileCredentialStore {
     root: PathBuf,
 }
+
+/// Unique temporary-name counter for [`write_secret_file`]. Combined with
+/// the process id it makes every temporary name fresh across restarts and
+/// across concurrent writes within one process.
+static NEXT_TEMP_SUFFIX: AtomicU64 = AtomicU64::new(0);
+
+/// Upper bound on `create_new` collisions before a write gives up.
+const MAX_TEMP_ATTEMPTS: u64 = 64;
 
 impl FileCredentialStore {
     /// Opens (and creates if needed) a store rooted at `root`.
@@ -289,7 +328,8 @@ impl FileCredentialStore {
     /// # Errors
     ///
     /// Returns [`CredentialStoreError::Backend`] when the root directory
-    /// cannot be created.
+    /// cannot be created, and [`CredentialStoreError::Insecure`] on Unix
+    /// when a pre-existing root is a symlink or allows group/other access.
     pub fn new(root: impl Into<PathBuf>) -> Result<Self, CredentialStoreError> {
         let root = root.into();
         create_secret_dir(&root)?;
@@ -304,12 +344,14 @@ impl FileCredentialStore {
                 hex_encode(account.as_str().as_bytes())
             ))
     }
+}
 
-    fn temp_path_for(path: &Path) -> PathBuf {
-        let mut name = path.as_os_str().to_owned();
-        name.push(format!(".{}.tmp", std::process::id()));
-        path.with_file_name(name)
-    }
+/// Returns the `<name>.<pid>.<suffix>.tmp` sibling of `path` used for one
+/// temporary write attempt.
+fn temp_path_for(path: &Path, suffix: u64) -> PathBuf {
+    let mut name = path.as_os_str().to_owned();
+    name.push(format!(".{}.{}.tmp", std::process::id(), suffix));
+    path.with_file_name(name)
 }
 
 impl ServiceCredentialStore for FileCredentialStore {
@@ -331,7 +373,10 @@ impl ServiceCredentialStore for FileCredentialStore {
         if length > MAX_SECRET_BYTES as u64 {
             return Err(CredentialStoreError::Corrupt);
         }
-        let mut bytes = Vec::new();
+        // Pre-allocate exactly the (already bounded) length so the read
+        // never reallocates and leaves stale plaintext copies behind.
+        let capacity = usize::try_from(length).map_err(|_| CredentialStoreError::Corrupt)?;
+        let mut bytes = Vec::with_capacity(capacity);
         if let Err(error) = file.read_to_end(&mut bytes) {
             bytes.zeroize();
             return Err(credential_io_error("reading credential file", &error));
@@ -359,12 +404,8 @@ impl ServiceCredentialStore for FileCredentialStore {
             ));
         };
         create_secret_dir(parent)?;
-        let temp_path = Self::temp_path_for(&path);
-        let result = write_secret_file(&temp_path, &path, secret.expose_secret());
-        if result.is_err() {
-            let _ = fs::remove_file(&temp_path);
-        }
-        result
+        let temp_suffix = NEXT_TEMP_SUFFIX.fetch_add(1, Ordering::Relaxed);
+        write_secret_file(&path, temp_suffix, secret.expose_secret())
     }
 
     fn delete(
@@ -381,8 +422,18 @@ impl ServiceCredentialStore for FileCredentialStore {
     }
 }
 
-/// Writes `bytes` to `temp`, syncs, then atomically renames it over `path`.
-fn write_secret_file(temp: &Path, path: &Path, bytes: &[u8]) -> Result<(), CredentialStoreError> {
+/// Writes `bytes` to a fresh temporary sibling of `path`, syncs it, then
+/// atomically renames it over `path`.
+///
+/// The temporary file is always created new (`create_new`) under a
+/// process-id plus `temp_suffix` name (bumped on collision), so a temporary
+/// file left behind by an earlier crash can never be written through and its
+/// permissions can never become the published secret's permissions.
+fn write_secret_file(
+    path: &Path,
+    temp_suffix: u64,
+    bytes: &[u8],
+) -> Result<(), CredentialStoreError> {
     #[cfg(unix)]
     let open_with_owner_permissions = |options: &mut fs::OpenOptions| {
         use std::os::unix::fs::OpenOptionsExt;
@@ -392,19 +443,41 @@ fn write_secret_file(temp: &Path, path: &Path, bytes: &[u8]) -> Result<(), Crede
     let open_with_owner_permissions = |_options: &mut fs::OpenOptions| {};
 
     let mut options = fs::OpenOptions::new();
-    options.write(true).create(true).truncate(true);
+    options.write(true).create_new(true);
     open_with_owner_permissions(&mut options);
-    let mut file = options
-        .open(temp)
-        .map_err(|error| credential_io_error("creating credential file", &error))?;
-    let write_result = file
-        .write_all(bytes)
-        .and_then(|()| file.sync_all())
-        .map_err(|error| credential_io_error("writing credential file", &error));
-    drop(file);
-    write_result?;
-    fs::rename(temp, path)
-        .map_err(|error| credential_io_error("publishing credential file", &error))
+
+    for attempt in 0..MAX_TEMP_ATTEMPTS {
+        let temp_path = temp_path_for(path, temp_suffix.wrapping_add(attempt));
+        let mut file = match options.open(&temp_path) {
+            Ok(file) => file,
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                // A leftover temporary file owns this name; never write
+                // through it — try the next unique name.
+                continue;
+            }
+            Err(error) => {
+                return Err(credential_io_error("creating credential file", &error));
+            }
+        };
+        let write_result = file
+            .write_all(bytes)
+            .and_then(|()| file.sync_all())
+            .map_err(|error| credential_io_error("writing credential file", &error));
+        drop(file);
+        if let Err(error) = write_result {
+            let _ = fs::remove_file(&temp_path);
+            return Err(error);
+        }
+        let published = fs::rename(&temp_path, path)
+            .map_err(|error| credential_io_error("publishing credential file", &error));
+        if published.is_err() {
+            let _ = fs::remove_file(&temp_path);
+        }
+        return published;
+    }
+    Err(CredentialStoreError::Backend(format!(
+        "credential temp file name collided {MAX_TEMP_ATTEMPTS} times"
+    )))
 }
 
 const IDENTITY_SERVICE: &str = "software-kvm.identity";
@@ -648,6 +721,101 @@ mod tests {
             hex_encode(account.as_str().as_bytes())
         ));
         assert_eq!(mode(&secret_file), 0o600);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn file_store_rejects_a_world_accessible_preexisting_service_dir() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let (mut store, root) = scratch_store("loose-service-dir");
+        let (service, account) = labels("software-kvm-test.service", "loose-dir");
+        let service_dir = root.join(hex_encode(service.as_str().as_bytes()));
+        fs::create_dir(&service_dir).unwrap();
+        fs::set_permissions(&service_dir, fs::Permissions::from_mode(0o707)).unwrap();
+
+        let error = store
+            .put(&service, &account, SecretBytes::new(vec![1, 2, 3]).unwrap())
+            .unwrap_err();
+        assert_eq!(error, CredentialStoreError::Insecure);
+        // Nothing was published next to the rejected directory.
+        assert!(store.get(&service, &account).unwrap().is_none());
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn file_store_rejects_world_accessible_and_symlinked_roots() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+
+        // A pre-made world-writable root is rejected, not silently tightened.
+        let loose_root = std::env::temp_dir().join(format!(
+            "kvm-security-credential-store-loose-root-{}-{}",
+            std::process::id(),
+            SCRATCH_COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir(&loose_root).unwrap();
+        fs::set_permissions(&loose_root, fs::Permissions::from_mode(0o777)).unwrap();
+        assert_eq!(
+            FileCredentialStore::new(&loose_root).unwrap_err(),
+            CredentialStoreError::Insecure
+        );
+
+        // A symlink is rejected even when it points at a well-protected
+        // directory.
+        let (_, protected_root) = scratch_store("link-target");
+        let link = std::env::temp_dir().join(format!(
+            "kvm-security-credential-store-link-{}-{}",
+            std::process::id(),
+            SCRATCH_COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        symlink(&protected_root, &link).unwrap();
+        assert_eq!(
+            FileCredentialStore::new(&link).unwrap_err(),
+            CredentialStoreError::Insecure
+        );
+
+        fs::set_permissions(&loose_root, fs::Permissions::from_mode(0o700)).unwrap();
+        let _ = fs::remove_dir_all(loose_root);
+        let _ = fs::remove_dir_all(protected_root);
+        let _ = fs::remove_file(link);
+    }
+
+    #[test]
+    fn write_secret_file_never_writes_through_a_leftover_temp_file() {
+        let root = std::env::temp_dir().join(format!(
+            "kvm-security-credential-store-leftover-{}-{}",
+            std::process::id(),
+            SCRATCH_COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir(&root).unwrap();
+        let path = root.join("account.secret");
+
+        // A temporary file left behind by an earlier crashed write of this
+        // process, occupying the exact suffix the next write would use.
+        let stale_temp = temp_path_for(&path, 24);
+        fs::write(&stale_temp, b"stale-plaintext").unwrap();
+
+        write_secret_file(&path, 24, b"fresh-secret").unwrap();
+
+        assert_eq!(fs::read(&path).unwrap(), b"fresh-secret");
+        assert_eq!(
+            fs::read(&stale_temp).unwrap(),
+            b"stale-plaintext",
+            "the leftover temp file must not be written through"
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                0o600,
+                "the published secret keeps the fresh temp file's permissions"
+            );
+        }
 
         let _ = fs::remove_dir_all(root);
     }

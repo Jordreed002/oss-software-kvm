@@ -59,8 +59,12 @@ impl SecretBytes {
     ///
     /// Returns [`SecretError::Empty`] because an empty credential is never valid.
     pub fn new(bytes: impl Into<Vec<u8>>) -> Result<Self, SecretError> {
-        let bytes = bytes.into();
+        let mut bytes = bytes.into();
         if bytes.is_empty() {
+            // Route the error path through zeroize as well so the wrapper
+            // keeps its no-plaintext-left-behind discipline even when the
+            // input is rejected.
+            bytes.zeroize();
             return Err(SecretError::Empty);
         }
         Ok(Self(bytes))
@@ -172,6 +176,12 @@ pub enum CredentialStoreError {
     /// Stored credential bytes failed integrity or format validation.
     #[error("stored credential is corrupt")]
     Corrupt,
+    /// The store's backing location is unsafe (for example a
+    /// group/world-accessible directory or a symlink where an owner-only
+    /// real directory is required). Reported instead of silently tightening
+    /// permissions an administrator may have set deliberately.
+    #[error("credential store location has unsafe permissions")]
+    Insecure,
     /// Backend-specific error description that contains no credential material.
     #[error("credential store backend failed")]
     Backend(String),
@@ -183,6 +193,7 @@ impl fmt::Debug for CredentialStoreError {
             Self::Unavailable => "Unavailable",
             Self::AccessDenied => "AccessDenied",
             Self::Corrupt => "Corrupt",
+            Self::Insecure => "Insecure",
             Self::Backend(_) => "Backend",
         };
         formatter

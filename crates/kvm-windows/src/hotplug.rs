@@ -63,8 +63,17 @@ const DBT_DEVICEREMOVECOMPLETE_VALUE: u32 = 0x8004;
 #[cfg(any(windows, test))]
 const DBT_DEVTYP_DEVICEINTERFACE_VALUE: u32 = 0x0005;
 
+/// Size of the fixed Win32 `DEV_BROADCAST_HDR` header, in bytes
+/// (`dbch_size` + `dbch_devicetype` + `dbch_reserved`, three `u32`s).
+///
+/// Declared locally for the same reason as the message constants below: the
+/// validation logic stays compilable and unit-testable on every host.
+#[cfg(any(windows, test))]
+const DEV_BROADCAST_HDR_BYTES: usize = 12;
+
 #[cfg(windows)]
 const _: () = {
+    use core::mem::size_of;
     use windows::Win32::UI::WindowsAndMessaging as wam;
     assert!(WM_DISPLAYCHANGE_VALUE == wam::WM_DISPLAYCHANGE);
     assert!(WM_DEVICECHANGE_VALUE == wam::WM_DEVICECHANGE);
@@ -72,6 +81,7 @@ const _: () = {
     assert!(DBT_DEVICEARRIVAL_VALUE == wam::DBT_DEVICEARRIVAL);
     assert!(DBT_DEVICEREMOVECOMPLETE_VALUE == wam::DBT_DEVICEREMOVECOMPLETE);
     assert!(DBT_DEVTYP_DEVICEINTERFACE_VALUE == wam::DBT_DEVTYP_DEVICEINTERFACE.0);
+    assert!(size_of::<wam::DEV_BROADCAST_HDR>() == DEV_BROADCAST_HDR_BYTES);
 };
 
 /// Coalesced inventory-change hint.
@@ -170,6 +180,54 @@ const fn classify_hotplug_message(message: u32, event: Option<u32>) -> Option<In
         },
         _ => None,
     }
+}
+
+/// Returns whether a message was delivered to the watcher's own window and
+/// may therefore be classified and have its `lParam` interpreted.
+///
+/// Thread messages arrive with a `NULL` hwnd (`0`) — including a
+/// `WM_DEVICECHANGE` or `WM_DISPLAYCHANGE` that any same-session process
+/// forges through `PostThreadMessageW` with an arbitrary `lParam` — so only
+/// a hwnd that exactly matches the watcher window (which is always
+/// non-`NULL`) is trusted.
+#[cfg(any(windows, test))]
+#[must_use]
+const fn trusted_window_delivery(message_hwnd: usize, watch_window: usize) -> bool {
+    message_hwnd != 0 && message_hwnd == watch_window
+}
+
+/// Returns whether a device-change broadcast header advertises at least the
+/// fixed [`DEV_BROADCAST_HDR`] size.
+///
+/// A `WM_DEVICECHANGE` posted directly to the watcher window with a forged
+/// header is delivered with a matching hwnd, so the header itself is the
+/// last line of defense: real Win32 broadcasts always report at least the
+/// fixed header size.
+#[cfg(any(windows, test))]
+#[must_use]
+const fn trusted_broadcast_header(dbch_size: u32) -> bool {
+    dbch_size as usize >= DEV_BROADCAST_HDR_BYTES
+}
+
+/// Returns whether a detached startup generation's process-global watcher
+/// claim may be reclaimed by a later `start()`.
+///
+/// A reclaim is honored only while the wedged generation still owns the
+/// claim and the grace deadline published when `start()` detached from it
+/// has passed. A healthy running watcher has no published reclaim, so it
+/// stays exclusive forever.
+#[cfg(any(windows, test))]
+#[must_use]
+const fn hotplug_reclaim_expired(
+    owner_generation: u32,
+    reclaim_generation: u32,
+    reclaim_after_ms: u64,
+    now_ms: u64,
+) -> bool {
+    reclaim_after_ms != 0
+        && reclaim_generation != 0
+        && owner_generation == reclaim_generation
+        && now_ms >= reclaim_after_ms
 }
 
 #[cfg(any(windows, test))]
@@ -302,11 +360,11 @@ mod watch {
 
     use std::ffi::c_void;
     use std::mem::size_of;
-    use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+    use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
     use std::sync::mpsc::{sync_channel, Receiver, RecvTimeoutError, SyncSender};
     use std::sync::Arc;
     use std::thread::{self, JoinHandle};
-    use std::time::{Duration, Instant};
+    use std::time::{Duration, Instant, SystemTime};
 
     use windows::core::{w, GUID};
     use windows::Win32::Foundation::{HANDLE, HWND, LPARAM, WPARAM};
@@ -319,8 +377,9 @@ mod watch {
     };
 
     use super::{
-        classify_hotplug_message, note_observation, offer_coalesced, ChangeCoalescer,
-        HotplugCounters, HotplugStatistics, InventoryChange, DBT_DEVICEARRIVAL_VALUE,
+        classify_hotplug_message, hotplug_reclaim_expired, note_observation, offer_coalesced,
+        trusted_broadcast_header, trusted_window_delivery, ChangeCoalescer, HotplugCounters,
+        HotplugStatistics, InventoryChange, DBT_DEVICEARRIVAL_VALUE,
         DBT_DEVICEREMOVECOMPLETE_VALUE, DBT_DEVTYP_DEVICEINTERFACE_VALUE, HOTPLUG_COALESCE_WINDOW,
         HOTPLUG_EVENT_CAPACITY, WM_DEVICECHANGE_VALUE, WM_TIMER_VALUE,
     };
@@ -329,6 +388,9 @@ mod watch {
 
     const HOTPLUG_STARTUP_TIMEOUT: Duration = Duration::from_secs(5);
     const HOTPLUG_STOP_TIMEOUT: Duration = Duration::from_secs(2);
+    /// Grace after a startup was detached on timeout before its
+    /// process-global claim may be reclaimed by a later `start()`.
+    const HOTPLUG_OWNERSHIP_RECLAIM_GRACE: Duration = Duration::from_secs(5);
     /// Private, generation-checked stop message for the watcher thread.
     const HOTPLUG_STOP_MESSAGE: u32 = WM_APP + 0x4f;
     const HOTPLUG_TIMER_ID: usize = 1;
@@ -344,27 +406,112 @@ mod watch {
         [0x88, 0xCB, 0x00, 0x11, 0x11, 0x00, 0x00, 0x30],
     );
 
-    static HOTPLUG_WATCH_OWNED: AtomicBool = AtomicBool::new(false);
+    /// Process-global owner generation of the single-watcher claim; `0`
+    /// means unowned. Encoding ownership in one atomic makes every claim
+    /// and release a single generation compare-and-swap, so a wedged
+    /// startup's late release can never free a replacement watcher's claim.
+    static HOTPLUG_WATCH_OWNER_GENERATION: AtomicU32 = AtomicU32::new(0);
+    /// Generation a detached (timed-out) startup published as reclaimable.
+    static HOTPLUG_WATCH_RECLAIM_GENERATION: AtomicU32 = AtomicU32::new(0);
+    /// Epoch milliseconds after which that generation's claim may be
+    /// reclaimed; `0` means no reclaim is pending.
+    static HOTPLUG_WATCH_RECLAIM_AFTER_MS: AtomicU64 = AtomicU64::new(0);
     static NEXT_HOTPLUG_GENERATION: AtomicU32 = AtomicU32::new(1);
 
     /// Process-global single-watcher claim so two watchers cannot double-report
     /// the same native burst.
+    ///
+    /// Invariant: the claim never wedges. `start()` publishes a reclaim
+    /// entry for a startup generation it detached from after the bounded
+    /// ready timeout, so if that thread stays blocked inside a native call
+    /// (and therefore never drops its token), a later `start()` reclaims
+    /// the claim once the grace deadline passes. The wedged thread's stale
+    /// token then no-ops on release instead of releasing the replacement
+    /// watcher's claim, and because the ready receiver was dropped it tears
+    /// down and exits rather than entering its message loop when it
+    /// eventually unblocks.
     #[derive(Debug)]
-    struct HotplugWatchOwnership;
+    struct HotplugWatchOwnership {
+        generation: u32,
+    }
 
     impl HotplugWatchOwnership {
-        fn acquire() -> Result<Self, WindowsBackendError> {
-            HOTPLUG_WATCH_OWNED
-                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-                .map(|_| Self)
-                .map_err(|_| WindowsBackendError::HotplugAlreadyRunning)
+        fn acquire(generation: u32) -> Result<Self, WindowsBackendError> {
+            loop {
+                let owner = HOTPLUG_WATCH_OWNER_GENERATION.load(Ordering::Acquire);
+                if owner == 0 {
+                    if HOTPLUG_WATCH_OWNER_GENERATION
+                        .compare_exchange(0, generation, Ordering::AcqRel, Ordering::Acquire)
+                        .is_ok()
+                    {
+                        return Ok(Self { generation });
+                    }
+                    // Raced with another starter; re-read the owner.
+                    continue;
+                }
+                let reclaim_generation = HOTPLUG_WATCH_RECLAIM_GENERATION.load(Ordering::Acquire);
+                let reclaim_after_ms = HOTPLUG_WATCH_RECLAIM_AFTER_MS.load(Ordering::Acquire);
+                if !hotplug_reclaim_expired(
+                    owner,
+                    reclaim_generation,
+                    reclaim_after_ms,
+                    epoch_millis(),
+                ) {
+                    return Err(WindowsBackendError::HotplugAlreadyRunning);
+                }
+                // One-shot deadline consumption keeps concurrent starters
+                // from double-reclaiming.
+                if HOTPLUG_WATCH_RECLAIM_AFTER_MS
+                    .compare_exchange(reclaim_after_ms, 0, Ordering::AcqRel, Ordering::Acquire)
+                    .is_err()
+                {
+                    continue;
+                }
+                if HOTPLUG_WATCH_OWNER_GENERATION
+                    .compare_exchange(owner, generation, Ordering::AcqRel, Ordering::Acquire)
+                    .is_ok()
+                {
+                    return Ok(Self { generation });
+                }
+                // The wedged thread released concurrently; retry normally.
+            }
         }
     }
 
     impl Drop for HotplugWatchOwnership {
         fn drop(&mut self) {
-            HOTPLUG_WATCH_OWNED.store(false, Ordering::Release);
+            // Generation-checked release: if this token's generation still
+            // owns the claim, free it and drop any reclaim published for it.
+            // A token whose claim was reclaimed is stale and must not
+            // release the replacement watcher's claim.
+            if HOTPLUG_WATCH_OWNER_GENERATION
+                .compare_exchange(self.generation, 0, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+                && HOTPLUG_WATCH_RECLAIM_GENERATION.load(Ordering::Acquire) == self.generation
+            {
+                HOTPLUG_WATCH_RECLAIM_GENERATION.store(0, Ordering::Release);
+                HOTPLUG_WATCH_RECLAIM_AFTER_MS.store(0, Ordering::Release);
+            }
         }
+    }
+
+    fn epoch_millis() -> u64 {
+        SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .map_or(0, |duration| {
+                u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
+            })
+    }
+
+    /// Publishes a bounded reclaim entry so a later `start()` can take the
+    /// process-global claim back from a startup thread that stayed blocked
+    /// inside a native call past the ready timeout.
+    fn publish_reclaim_deadline(generation: u32) {
+        let grace_ms =
+            u64::try_from(HOTPLUG_OWNERSHIP_RECLAIM_GRACE.as_millis()).unwrap_or(u64::MAX);
+        HOTPLUG_WATCH_RECLAIM_GENERATION.store(generation, Ordering::Release);
+        HOTPLUG_WATCH_RECLAIM_AFTER_MS
+            .store(epoch_millis().saturating_add(grace_ms), Ordering::Release);
     }
 
     fn next_generation() -> Result<u32, WindowsBackendError> {
@@ -406,9 +553,18 @@ mod watch {
                     });
                 }
             }
-            // SAFETY: the window was created and is owned by this thread.
-            if let Err(error) = unsafe { DestroyWindow(self.window) } {
-                first_error.get_or_insert(binding_error("DestroyWindow(hotplug)", &error));
+            // SAFETY: the window was created and is owned by this thread;
+            // the invalid-handle case skips the call so `Drop`'s teardown
+            // never destroys an already-destroyed window.
+            if !self.window.0.is_null() {
+                match unsafe { DestroyWindow(self.window) } {
+                    Ok(()) => {
+                        self.window = HWND::default();
+                    }
+                    Err(error) => {
+                        first_error.get_or_insert(binding_error("DestroyWindow(hotplug)", &error));
+                    }
+                }
             }
             first_error.map_or(Ok(()), Err)
         }
@@ -459,8 +615,8 @@ mod watch {
         /// process, the thread cannot be spawned, or the hidden window cannot
         /// be created.
         pub fn start() -> Result<Self, WindowsBackendError> {
-            let ownership = HotplugWatchOwnership::acquire()?;
             let generation = next_generation()?;
+            let ownership = HotplugWatchOwnership::acquire(generation)?;
             let (event_sender, event_receiver) = sync_channel(HOTPLUG_EVENT_CAPACITY);
             let counters = Arc::new(HotplugCounters::default());
             let (ready_sender, ready_receiver) = sync_channel(1);
@@ -500,7 +656,11 @@ mod watch {
                 }
                 Err(RecvTimeoutError::Timeout) => {
                     // Detach: the dropped ready receiver makes the thread tear
-                    // itself down and release process-global ownership.
+                    // itself down and release the claim once it unblocks. If
+                    // it stays wedged inside a native call instead, publish a
+                    // bounded reclaim so a later `start()` can take the claim
+                    // back rather than every start failing forever.
+                    publish_reclaim_deadline(generation);
                     drop(thread);
                     return Err(WindowsBackendError::HotplugRuntime(format!(
                         "hotplug watcher startup exceeded {} seconds",
@@ -656,10 +816,11 @@ mod watch {
             ));
         }
 
-        let loop_result = hotplug_message_loop(generation, public_sender, counters);
+        let loop_result = hotplug_message_loop(generation, native.window, public_sender, counters);
         let teardown_result = native.teardown();
         // Keep process-global ownership through native teardown so a
-        // replacement watcher cannot overlap this one's window.
+        // replacement watcher cannot overlap this one's window; the release
+        // itself is generation-checked (see `HotplugWatchOwnership`).
         drop(ownership);
         match (loop_result, teardown_result) {
             (Ok(()), Ok(())) => Ok(()),
@@ -743,6 +904,7 @@ mod watch {
 
     fn hotplug_message_loop(
         generation: u32,
+        watch_window: HWND,
         public_sender: &SyncSender<InventoryChange>,
         counters: &HotplugCounters,
     ) -> Result<(), WindowsBackendError> {
@@ -769,7 +931,16 @@ mod watch {
                 }
                 continue;
             }
-            if message.message == WM_DEVICECHANGE_VALUE
+            // Only messages the system delivered to the watcher's own
+            // window may be classified and have their lParam interpreted.
+            // Thread messages (a NULL hwnd) — including a forged
+            // WM_DEVICECHANGE carrying an arbitrary lParam that any
+            // same-session process posts with PostThreadMessageW — fall
+            // through unrecognized below.
+            let delivered_to_window =
+                trusted_window_delivery(message.hwnd.0 as usize, watch_window.0 as usize);
+            if delivered_to_window
+                && message.message == WM_DEVICECHANGE_VALUE
                 && matches!(
                     event,
                     Some(DBT_DEVICEARRIVAL_VALUE | DBT_DEVICEREMOVECOMPLETE_VALUE)
@@ -780,7 +951,12 @@ mod watch {
                 // header: not from our HID registration; ignore it.
                 continue;
             }
-            if let Some(change) = classify_hotplug_message(message.message, event) {
+            let change = if delivered_to_window {
+                classify_hotplug_message(message.message, event)
+            } else {
+                None
+            };
+            if let Some(change) = change {
                 note_observation(
                     &mut coalescer,
                     public_sender,
@@ -791,7 +967,8 @@ mod watch {
                 continue;
             }
             // Unrecognized messages take the ordinary dispatch path; the
-            // system STATIC window procedure ignores them.
+            // system STATIC window procedure ignores them, and dispatching
+            // a thread message (NULL hwnd) is a documented no-op.
             // SAFETY: `message` was initialized by GetMessageW; both calls are
             // synchronous and the record stays alive for them.
             unsafe {
@@ -805,10 +982,15 @@ mod watch {
         if message.lParam.0 == 0 {
             return false;
         }
-        // SAFETY: Win32 supplies a live DEV_BROADCAST_HDR for WM_DEVICECHANGE
-        // lParam; the header is read once and no pointer is retained.
-        let header = message.lParam.0 as *const DEV_BROADCAST_HDR;
-        unsafe { (*header).dbch_devicetype == DBT_DEVTYP_DEVICEINTERFACE }
+        // SAFETY: the caller reaches here only for messages delivered to the
+        // watcher's own window, so lParam carries a Win32-supplied
+        // DEV_BROADCAST_HDR. The fixed header is copied once and no pointer
+        // is retained. The size check then rejects headers smaller than the
+        // fixed header (for example one forged by a PostMessageW to the
+        // window itself) before the device type is consulted.
+        let header = unsafe { *(message.lParam.0 as *const DEV_BROADCAST_HDR) };
+        trusted_broadcast_header(header.dbch_size)
+            && header.dbch_devicetype == DBT_DEVTYP_DEVICEINTERFACE
     }
 }
 
@@ -887,6 +1069,41 @@ mod tests {
         assert_eq!(classify_hotplug_message(WM_DEVICECHANGE_VALUE, None), None);
         assert_eq!(classify_hotplug_message(WM_TIMER_VALUE, None), None);
         assert_eq!(classify_hotplug_message(0x0102, None), None);
+    }
+
+    #[test]
+    fn only_messages_delivered_to_the_watch_window_are_trusted() {
+        const WATCH_WINDOW: usize = 0x0001_0034;
+
+        assert!(trusted_window_delivery(WATCH_WINDOW, WATCH_WINDOW));
+        // Thread messages (a NULL hwnd) — for example a WM_DEVICECHANGE
+        // forged through PostThreadMessageW — are never trusted, regardless
+        // of their lParam.
+        assert!(!trusted_window_delivery(0, WATCH_WINDOW));
+        // Delivery to any other window is not trusted either.
+        assert!(!trusted_window_delivery(0x0001_0074, WATCH_WINDOW));
+    }
+
+    #[test]
+    fn broadcast_headers_smaller_than_the_fixed_header_are_untrusted() {
+        let header_bytes = u32::try_from(DEV_BROADCAST_HDR_BYTES).unwrap();
+
+        assert!(trusted_broadcast_header(header_bytes));
+        assert!(trusted_broadcast_header(u32::MAX));
+        assert!(!trusted_broadcast_header(0));
+        assert!(!trusted_broadcast_header(header_bytes - 1));
+    }
+
+    #[test]
+    fn wedged_startups_release_the_claim_only_after_the_reclaim_grace() {
+        // No reclaim published: a healthy watcher stays exclusive forever.
+        assert!(!hotplug_reclaim_expired(7, 0, 0, u64::MAX));
+        // Published for another generation: not honored against this owner.
+        assert!(!hotplug_reclaim_expired(7, 8, 1, u64::MAX));
+        // Published for the owner but the grace deadline has not passed.
+        assert!(!hotplug_reclaim_expired(7, 7, 5_000, 4_999));
+        // Published for the owner and expired: reclaimable.
+        assert!(hotplug_reclaim_expired(7, 7, 5_000, 5_000));
     }
 
     #[test]

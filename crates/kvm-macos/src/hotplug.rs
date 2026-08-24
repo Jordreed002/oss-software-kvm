@@ -279,21 +279,42 @@ fn forward_drained_changes(
     }
 }
 
+/// Returns whether a detached startup generation's process-global watcher
+/// claim may be reclaimed by a later `start()`.
+///
+/// A reclaim is honored only while the wedged generation still owns the
+/// claim and the grace deadline published when `start()` detached from it
+/// has passed. A healthy running watcher has no published reclaim, so it
+/// stays exclusive forever.
+#[cfg(any(target_os = "macos", test))]
+#[must_use]
+const fn hotplug_reclaim_expired(
+    owner_generation: u32,
+    reclaim_generation: u32,
+    reclaim_after_ms: u64,
+    now_ms: u64,
+) -> bool {
+    reclaim_after_ms != 0
+        && reclaim_generation != 0
+        && owner_generation == reclaim_generation
+        && now_ms >= reclaim_after_ms
+}
+
 #[cfg(target_os = "macos")]
 mod watch {
     use std::ffi::c_void;
     use std::panic::{catch_unwind, AssertUnwindSafe};
     use std::ptr;
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
     use std::sync::mpsc::{sync_channel, Receiver, RecvTimeoutError, SyncSender};
     use std::sync::Arc;
     use std::thread::{self, JoinHandle};
-    use std::time::{Duration, Instant};
+    use std::time::{Duration, Instant, SystemTime};
 
     use super::{
-        forward_drained_changes, ChangeCoalescer, HotplugCounters, HotplugDispatch,
-        HotplugStatistics, InventoryChange, HOTPLUG_COALESCE_WINDOW, HOTPLUG_EVENT_CAPACITY,
-        RAW_EVENT_CAPACITY,
+        forward_drained_changes, hotplug_reclaim_expired, ChangeCoalescer, HotplugCounters,
+        HotplugDispatch, HotplugStatistics, InventoryChange, HOTPLUG_COALESCE_WINDOW,
+        HOTPLUG_EVENT_CAPACITY, RAW_EVENT_CAPACITY,
     };
     use crate::native::{
         kCFRunLoopDefaultMode, CFRetain, CFRunLoopGetCurrent, CFRunLoopRef, CFRunLoopRunInMode,
@@ -313,38 +334,157 @@ mod watch {
     /// and provides the coalescer's poll granularity (well under the 200 ms
     /// quiet window).
     const RUN_LOOP_TICK: Duration = Duration::from_millis(50);
+    /// Grace after a startup was detached on timeout before its
+    /// process-global claim may be reclaimed by a later `start()`.
+    const HOTPLUG_OWNERSHIP_RECLAIM_GRACE: Duration = Duration::from_secs(5);
 
-    static HOTPLUG_WATCH_OWNED: AtomicBool = AtomicBool::new(false);
+    /// Process-global owner generation of the single-watcher claim; `0`
+    /// means unowned. Encoding ownership in one atomic makes every claim
+    /// and release a single generation compare-and-swap, so a wedged
+    /// startup's late release can never free a replacement watcher's claim.
+    static HOTPLUG_WATCH_OWNER_GENERATION: AtomicU32 = AtomicU32::new(0);
+    /// Generation a detached (timed-out) startup published as reclaimable.
+    static HOTPLUG_WATCH_RECLAIM_GENERATION: AtomicU32 = AtomicU32::new(0);
+    /// Epoch milliseconds after which that generation's claim may be
+    /// reclaimed; `0` means no reclaim is pending.
+    static HOTPLUG_WATCH_RECLAIM_AFTER_MS: AtomicU64 = AtomicU64::new(0);
+    static NEXT_HOTPLUG_GENERATION: AtomicU32 = AtomicU32::new(1);
+
+    fn epoch_millis() -> u64 {
+        SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .map_or(0, |duration| {
+                u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
+            })
+    }
+
+    fn next_generation() -> Result<u32, MacBackendError> {
+        NEXT_HOTPLUG_GENERATION
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+                current.checked_add(1)
+            })
+            .map_err(|_| {
+                MacBackendError::HotplugRuntime(
+                    "hotplug watcher generation space is exhausted".into(),
+                )
+            })
+    }
 
     /// Process-global single-watcher claim so two watchers cannot double-report
     /// the same native burst.
+    ///
+    /// Invariant: the claim never wedges. `start()` publishes a reclaim
+    /// entry for a startup generation it detached from after the bounded
+    /// ready timeout, so if that thread stays blocked inside a native call
+    /// (and therefore never drops its token), a later `start()` reclaims
+    /// the claim once the grace deadline passes. The wedged thread's stale
+    /// token then no-ops on release instead of releasing the replacement
+    /// watcher's claim, and because the ready receiver was dropped it skips
+    /// its run loop, tears down natively, and exits when it eventually
+    /// unblocks.
     #[derive(Debug)]
-    struct HotplugWatchOwnership;
+    struct HotplugWatchOwnership {
+        generation: u32,
+    }
 
     impl HotplugWatchOwnership {
-        fn acquire() -> Result<Self, MacBackendError> {
-            HOTPLUG_WATCH_OWNED
-                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-                .map(|_| Self)
-                .map_err(|_| MacBackendError::HotplugAlreadyRunning)
+        fn acquire(generation: u32) -> Result<Self, MacBackendError> {
+            loop {
+                let owner = HOTPLUG_WATCH_OWNER_GENERATION.load(Ordering::Acquire);
+                if owner == 0 {
+                    if HOTPLUG_WATCH_OWNER_GENERATION
+                        .compare_exchange(0, generation, Ordering::AcqRel, Ordering::Acquire)
+                        .is_ok()
+                    {
+                        return Ok(Self { generation });
+                    }
+                    // Raced with another starter; re-read the owner.
+                    continue;
+                }
+                let reclaim_generation = HOTPLUG_WATCH_RECLAIM_GENERATION.load(Ordering::Acquire);
+                let reclaim_after_ms = HOTPLUG_WATCH_RECLAIM_AFTER_MS.load(Ordering::Acquire);
+                if !hotplug_reclaim_expired(
+                    owner,
+                    reclaim_generation,
+                    reclaim_after_ms,
+                    epoch_millis(),
+                ) {
+                    return Err(MacBackendError::HotplugAlreadyRunning);
+                }
+                // One-shot deadline consumption keeps concurrent starters
+                // from double-reclaiming.
+                if HOTPLUG_WATCH_RECLAIM_AFTER_MS
+                    .compare_exchange(reclaim_after_ms, 0, Ordering::AcqRel, Ordering::Acquire)
+                    .is_err()
+                {
+                    continue;
+                }
+                if HOTPLUG_WATCH_OWNER_GENERATION
+                    .compare_exchange(owner, generation, Ordering::AcqRel, Ordering::Acquire)
+                    .is_ok()
+                {
+                    return Ok(Self { generation });
+                }
+                // The wedged thread released concurrently; retry normally.
+            }
         }
     }
 
     impl Drop for HotplugWatchOwnership {
         fn drop(&mut self) {
-            HOTPLUG_WATCH_OWNED.store(false, Ordering::Release);
+            // Generation-checked release: if this token's generation still
+            // owns the claim, free it and drop any reclaim published for it.
+            // A token whose claim was reclaimed is stale and must not
+            // release the replacement watcher's claim.
+            if HOTPLUG_WATCH_OWNER_GENERATION
+                .compare_exchange(self.generation, 0, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+                && HOTPLUG_WATCH_RECLAIM_GENERATION.load(Ordering::Acquire) == self.generation
+            {
+                HOTPLUG_WATCH_RECLAIM_GENERATION.store(0, Ordering::Release);
+                HOTPLUG_WATCH_RECLAIM_AFTER_MS.store(0, Ordering::Release);
+            }
         }
+    }
+
+    /// Publishes a bounded reclaim entry so a later `start()` can take the
+    /// process-global claim back from a startup thread that stayed blocked
+    /// inside a native call past the ready timeout.
+    fn publish_reclaim_deadline(generation: u32) {
+        let grace_ms =
+            u64::try_from(HOTPLUG_OWNERSHIP_RECLAIM_GRACE.as_millis()).unwrap_or(u64::MAX);
+        HOTPLUG_WATCH_RECLAIM_GENERATION.store(generation, Ordering::Release);
+        HOTPLUG_WATCH_RECLAIM_AFTER_MS
+            .store(epoch_millis().saturating_add(grace_ms), Ordering::Release);
     }
 
     #[derive(Debug)]
     pub(super) struct HotplugCallbackContext {
+        /// Revocation flag published before the cross-thread CG display
+        /// callback is removed: a callback that observes it returns without
+        /// touching the dispatch state. Only the CG display path needs
+        /// this — IOHID callbacks are delivered on the watcher's own run
+        /// loop, which has stopped by the time the flag matters.
+        detached: AtomicBool,
         dispatch: HotplugDispatch,
     }
 
     impl HotplugCallbackContext {
         #[cfg(test)]
         pub(super) fn new(dispatch: HotplugDispatch) -> Self {
-            Self { dispatch }
+            Self {
+                detached: AtomicBool::new(false),
+                dispatch,
+            }
+        }
+
+        /// Revokes callback authority ahead of native callback removal.
+        pub(super) fn detach(&self) {
+            self.detached.store(true, Ordering::Release);
+        }
+
+        fn is_detached(&self) -> bool {
+            self.detached.load(Ordering::Acquire)
         }
     }
 
@@ -389,7 +529,8 @@ mod watch {
         }
 
         fn start_with_window(window: Duration) -> Result<Self, MacBackendError> {
-            let ownership = HotplugWatchOwnership::acquire()?;
+            let generation = next_generation()?;
+            let ownership = HotplugWatchOwnership::acquire(generation)?;
             let (event_sender, event_receiver) = sync_channel(HOTPLUG_EVENT_CAPACITY);
             let (raw_sender, raw_receiver) = sync_channel(RAW_EVENT_CAPACITY);
             let counters = Arc::new(HotplugCounters::default());
@@ -434,7 +575,11 @@ mod watch {
                 Err(RecvTimeoutError::Timeout) => {
                     // Detach: the dropped ready receiver makes the thread skip
                     // its run loop, perform full native cleanup, and release
-                    // process-global ownership by itself.
+                    // the claim once it unblocks. If it stays wedged inside a
+                    // native call instead, publish a bounded reclaim so a
+                    // later `start()` can take the claim back rather than
+                    // every start failing forever.
+                    publish_reclaim_deadline(generation);
                     drop(thread);
                     return Err(MacBackendError::HotplugStartupTimedOut);
                 }
@@ -559,6 +704,7 @@ mod watch {
         };
 
         let mut context = Box::new(HotplugCallbackContext {
+            detached: AtomicBool::new(false),
             dispatch: HotplugDispatch {
                 sender: raw_sender,
                 counters: Arc::clone(counters),
@@ -655,13 +801,22 @@ mod watch {
             }
         }
 
-        // Teardown: revoke callback authority before freeing the context. No
-        // callback can be executing on this thread (its run loop is no longer
-        // running), and the removal call below unregisters the cross-thread
-        // CG notification before the box is dropped.
+        // Teardown: revoke callback authority before freeing the context.
+        // Unlike the IOHID callbacks (delivered on this thread's run loop,
+        // which is no longer running), the CG display callback is delivered
+        // on arbitrary threads, so a callback that began just before
+        // removal may still be executing when we get here. The order below
+        // makes that safe: mark the context detached first (any callback
+        // that observes the flag no-ops without touching dispatch state),
+        // then remove the registration (after it returns no new callback
+        // may start), then — right before the box is freed — wait one
+        // bounded grace so an in-flight callback can finish its single
+        // non-blocking try_send.
+        context.detach();
         let mut teardown_error = None;
-        // SAFETY: Removes exactly the (proc, user_info) pair registered above;
-        // the boxed context is still live.
+        // SAFETY: Removes exactly the (proc, user_info) pair registered
+        // above; the boxed context is still live and stays live through the
+        // grace period below, so an in-flight callback's reference is valid.
         let remove_status = unsafe {
             CGDisplayRemoveReconfigurationCallback(Some(hotplug_display_reconfigured), context_ptr)
         };
@@ -689,11 +844,20 @@ mod watch {
                 });
             }
         }
+        // Bounded grace for an in-flight cross-thread CG callback: one
+        // run-loop tick (50 ms) is orders of magnitude longer than the
+        // callback's single non-blocking try_send, so a callback that
+        // passed the detached check just before removal has returned by
+        // the time the sleep ends. IOHID callbacks need no grace: they are
+        // delivered on this very thread's run loop, which is no longer
+        // running.
+        thread::sleep(RUN_LOOP_TICK);
         drop(context);
         drop(manager);
         drop(retained);
         // Keep process-global ownership through native teardown so a
-        // replacement watcher cannot overlap this one's callbacks.
+        // replacement watcher cannot overlap this one's callbacks; the
+        // release itself is generation-checked (see `HotplugWatchOwnership`).
         drop(ownership);
 
         teardown_error.map_or(Ok(()), Err)
@@ -709,9 +873,18 @@ mod watch {
         }
         let _ = catch_unwind(AssertUnwindSafe(|| {
             // SAFETY: `user_info` is the boxed context owned by the watcher
-            // thread; the callback is unregistered before the box is dropped,
-            // and this callback performs no other native work.
+            // thread. The watcher keeps the box alive until after
+            // `CGDisplayRemoveReconfigurationCallback` returns plus a
+            // bounded grace sleep, and publishes `detached` before that
+            // removal, so this reference — and, when the flag is clear, the
+            // single non-blocking try_send below — happen while the box is
+            // alive. A callback that observes `detached` returns without
+            // touching the dispatch state at all. This callback performs
+            // no other native work.
             let context = unsafe { &*user_info.cast::<HotplugCallbackContext>() };
+            if context.is_detached() {
+                return;
+            }
             context.dispatch.dispatch(InventoryChange::DisplayChanged);
         }));
     }
@@ -740,7 +913,10 @@ mod watch {
         }
         let _ = catch_unwind(AssertUnwindSafe(|| {
             // SAFETY: The pointer refers to the boxed context owned by the
-            // watcher thread; callbacks are unscheduled before it is dropped.
+            // watcher thread. Unlike the CG display callback, IOHID
+            // callbacks are delivered on the watcher's own run loop, which
+            // has stopped and been unscheduled before the box is dropped,
+            // so no such callback can race teardown.
             let context = unsafe { &*context.cast::<HotplugCallbackContext>() };
             context.dispatch.dispatch(change);
         }));
@@ -1071,6 +1247,18 @@ mod tests {
         );
     }
 
+    #[test]
+    fn wedged_startups_release_the_claim_only_after_the_reclaim_grace() {
+        // No reclaim published: a healthy watcher stays exclusive forever.
+        assert!(!hotplug_reclaim_expired(7, 0, 0, u64::MAX));
+        // Published for another generation: not honored against this owner.
+        assert!(!hotplug_reclaim_expired(7, 8, 1, u64::MAX));
+        // Published for the owner but the grace deadline has not passed.
+        assert!(!hotplug_reclaim_expired(7, 7, 5_000, 4_999));
+        // Published for the owner and expired: reclaimable.
+        assert!(hotplug_reclaim_expired(7, 7, 5_000, 5_000));
+    }
+
     #[cfg(target_os = "macos")]
     mod native_tests {
         use std::ffi::c_void;
@@ -1110,6 +1298,28 @@ mod tests {
             // callbacks themselves never drain it.
             assert_eq!(receiver.try_recv(), Ok(InventoryChange::DisplayChanged));
             assert_eq!(statistics.raw_events_dropped, 2);
+            assert!(receiver.try_recv().is_err());
+        }
+
+        #[test]
+        fn detached_display_callback_no_ops_without_dispatching() {
+            // After `detach()`, a late cross-thread CG callback must return
+            // before touching the dispatch state: no counter changes and no
+            // observation reaches the raw channel.
+            let counters = Arc::new(HotplugCounters::default());
+            let (sender, receiver) = sync_channel(1);
+            let context = watch::HotplugCallbackContext::new(HotplugDispatch {
+                sender,
+                counters: Arc::clone(&counters),
+            });
+            let mut boxed = Box::new(context);
+            boxed.detach();
+            let context_ptr = ptr::from_mut(&mut *boxed).cast::<c_void>();
+
+            watch::hotplug_display_reconfigured(1, 0, context_ptr);
+
+            let statistics = counters.snapshot();
+            assert_eq!(statistics.raw_events, 0);
             assert!(receiver.try_recv().is_err());
         }
 
