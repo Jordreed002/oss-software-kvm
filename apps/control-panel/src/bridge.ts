@@ -1,6 +1,6 @@
 import { invoke } from "@tauri-apps/api/core";
 import type {
-  ControlDaemonStatus, DiagnosticsReport, DisplayPlacement, Placement, SetupSnapshot,
+  DaemonStatusReply, DiagnosticsReport, DisplayPlacement, Placement, SetupSnapshot,
 } from "./types";
 
 const inTauri = () => "__TAURI_INTERNALS__" in window;
@@ -270,5 +270,5 @@ export const api = {
   /** Reads the daemon's live status over the §31 local control endpoint
    *  (UDS / named pipe). Resolves to `{ state: "unreachable", ... }` when the
    *  daemon is not running — never rejects for a missing daemon. */
-  controlStatus: () => invokeOrPreview<ControlDaemonStatus>("control_status"),
+  controlStatus: () => invokeOrPreview<DaemonStatusReply>("control_status"),
 };

@@ -788,14 +788,17 @@ where
     ///
     /// Returns a coarse listener, authority, admission, or owned-task failure.
     pub async fn run_transport(
-        self,
+        mut self,
         shutdown: tokio::sync::watch::Receiver<bool>,
     ) -> Result<(), RuntimeTransportError> {
         let identity = self.host_identity.clone();
+        // Seed the control plane with the inventoried displays and topology so
+        // §31 GetDisplays/GetDisplaysTopology answer real data, mirroring
+        // `run_with_capture_status`.
         let control = ControlPlane::start(
             identity,
-            Vec::new(),
-            Vec::new(),
+            std::mem::take(&mut self.control_displays),
+            std::mem::take(&mut self.control_edges),
             LocalControlServerConfig::default(),
         );
         self.run_transport_ready(

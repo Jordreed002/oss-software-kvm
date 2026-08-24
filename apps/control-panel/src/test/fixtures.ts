@@ -1,5 +1,7 @@
 import type {
   CaptureDiagnostics,
+  DaemonStatus,
+  DaemonStatusReply,
   DiagnosticsReport,
   DisplayInfo,
   NetworkDiagnostics,
@@ -65,6 +67,38 @@ export function makeReport(overrides: Partial<DiagnosticsReport> = {}): Diagnost
     uptimeMs: 3_723_000,
     network: makeNetwork(),
     capture: makeCapture(),
+    ...overrides,
+  };
+}
+
+/** Canonical local-identity UUID used by the §31 daemon status fixtures. Its
+ *  byte form matches LOCAL_HOST_BYTES below. */
+export const LOCAL_HOST_UUID = "11111111-2222-4333-8444-555555555555";
+
+/** 16 bytes of LOCAL_HOST_UUID — the shape the backend really serializes for
+ *  the §31 `activeHost` field (a plain number array, camelCase keys). */
+export const LOCAL_HOST_BYTES = [
+  0x11, 0x11, 0x11, 0x11, 0x22, 0x22, 0x43, 0x33,
+  0x84, 0x44, 0x55, 0x55, 0x55, 0x55, 0x55, 0x55,
+];
+
+export function makeDaemonStatus(overrides: Partial<DaemonStatus> = {}): DaemonStatus {
+  return {
+    kvmEnabled: true,
+    clipboardEnabled: false,
+    peerState: "connected",
+    roundTripTimeMs: 4,
+    activeHost: [...LOCAL_HOST_BYTES],
+    protocolVersion: 3,
+    ...overrides,
+  };
+}
+
+export function makeDaemonStatusReply(overrides: Partial<DaemonStatusReply> = {}): DaemonStatusReply {
+  return {
+    state: "responded",
+    status: makeDaemonStatus(),
+    error: null,
     ...overrides,
   };
 }

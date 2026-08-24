@@ -195,7 +195,7 @@ export type DaemonControlState = "unreachable" | "responded" | "refused";
 
 /** Live daemon status from the §31 local control endpoint (UDS / named pipe).
  *  Mirrors the `control_status` Tauri reply's status payload. */
-export interface DaemonControlStatus {
+export interface DaemonStatus {
   kvmEnabled: boolean;
   clipboardEnabled: boolean;
   peerState: ControlPeerState;
@@ -207,8 +207,8 @@ export interface DaemonControlStatus {
 
 /** Reply of the `control_status` Tauri command: the daemon's live §31 state,
  *  with `status` present only for "responded" and `error` for "refused". */
-export interface ControlDaemonStatus {
+export interface DaemonStatusReply {
   state: DaemonControlState;
-  status: DaemonControlStatus | null;
+  status: DaemonStatus | null;
   error: string | null;
 }

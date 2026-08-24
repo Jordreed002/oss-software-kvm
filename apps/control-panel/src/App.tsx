@@ -3,11 +3,12 @@ import {
     Activity, ArrowLeftRight, Check, CircleAlert, Copy, KeyRound,
   Handshake, Laptop, Link2, LoaderCircle, Monitor, MousePointer2, Play, Radio, ShieldCheck, Square, Unplug, X,
 } from "lucide-react";
-import { api, uuidToBytes } from "./bridge";
+import { api } from "./bridge";
+import { DaemonStatusCard } from "./components/DaemonStatusCard";
 import { ArrangeStep } from "./components/DisplayLayoutEditor";
-import { PrimaryButton, SectionHeading } from "./components/shared";
+import { CheckRow, PrimaryButton, SectionHeading } from "./components/shared";
 import { DiagnosticsDashboard } from "./DiagnosticsDashboard";
-import type { ControlDaemonStatus, ControlPeerState, SetupSnapshot } from "./types";
+import type { SetupSnapshot } from "./types";
 
 const steps = ["This computer", "Pair", "Arrange", "Ready"] as const;
 
@@ -274,62 +275,6 @@ function InputAuthorityPanel({ snapshot }: { snapshot: SetupSnapshot }) {
   </section>;
 }
 
-function DaemonStatusCard({ snapshot }: { snapshot: SetupSnapshot }) {
-  const [status, setStatus] = useState<ControlDaemonStatus | null>(null);
-
-  useEffect(() => {
-    let alive = true;
-    const pull = () => {
-      api.controlStatus().then((reply) => { if (alive) setStatus(reply); }).catch(() => undefined);
-    };
-    pull();
-    const timer = window.setInterval(pull, 2000);
-    return () => { alive = false; window.clearInterval(timer); };
-  }, []);
-
-  const live = status?.state === "responded" ? status.status : null;
-  const localBytes = snapshot.local ? uuidToBytes(snapshot.local.hostId) : null;
-  const activeHostLocal = !!live && !!localBytes && bytesEqual(live.activeHost, localBytes);
-  const peerName = snapshot.peer?.displayName ?? "Paired computer";
-  const connectionDetail: [string, boolean] =
-    status === null
-      ? ["Contacting the daemon's local control endpoint…", false]
-      : status.state === "unreachable"
-        ? ["Daemon not running at the local control endpoint", false]
-        : status.state === "refused"
-          ? [`Daemon refused the status request (${status.error ?? "error"})`, false]
-          : [peerConnectionDetail(live?.peerState ?? "disconnected", live?.roundTripTimeMs ?? null), live?.peerState === "connected"];
-  const routingDetail: [string, boolean] = live
-    ? live.kvmEnabled
-      ? ["Input routing is armed between both computers", true]
-      : ["Input stays local (routing gated or failsafe released)", false]
-    : ["Waiting for the daemon's routing state…", false];
-
-  return <section className="checklist" aria-label="Live daemon status (spec 31 control link)">
-    <CheckRow label="Daemon control link" detail={connectionDetail[0]} good={status?.state === "responded"} />
-    <CheckRow label="Peer connection" detail={connectionDetail[0]} good={connectionDetail[1]} />
-    <CheckRow label="KVM routing" detail={routingDetail[0]} good={routingDetail[1]} />
-    {live && (
-      <CheckRow
-        label="Input destination"
-        detail={activeHostLocal ? `Active host is this computer (protocol v${live.protocolVersion})` : `Active host is ${peerName} (protocol v${live.protocolVersion})`}
-        good={live.peerState === "connected"}
-      />
-    )}
-  </section>;
-}
-
-function peerConnectionDetail(state: ControlPeerState, roundTripTimeMs: number | null): string {
-  const stateText = state.replaceAll("_", " ");
-  return roundTripTimeMs === null
-    ? `Peer link: ${stateText}`
-    : `Peer link: ${stateText} · round trip ${roundTripTimeMs} ms`;
-}
-
-function bytesEqual(left: number[], right: number[]): boolean {
-  return left.length === right.length && left.every((byte, index) => byte === right[index]);
-}
-
 function DeveloperDiagnosticsPanel({ diagnostics, busy, onRepair }: { diagnostics: NonNullable<SetupSnapshot["developerDiagnostics"]>; busy: string | null; onRepair: () => void }) {
   const mismatch = diagnostics.lanBinding === "mismatch";
   return <details className={`developer-diagnostics ${mismatch ? "has-mismatch" : ""}`} open={mismatch}>
@@ -396,7 +341,6 @@ function runtimeFaultMessage(fault: SetupSnapshot["runtimeFault"]) {
   }
 }
 
-function CheckRow({ label, detail, good }: { label: string; detail: string; good: boolean }) { return <div className="check-row"><span className={good ? "good" : "pending"}>{good ? <Check size={16}/> : "·"}</span><div><strong>{label}</strong><small>{detail}</small></div><em>{good ? "READY" : "PENDING"}</em></div>; }
 function Loading({ error }: { error: string | null }) { return <main className="loading"><div className="brand-mark"><ArrowLeftRight /></div><h1>Link Console</h1>{error ? <p>{error}</p> : <LoaderCircle className="spin" />}</main>; }
 
 export default App;

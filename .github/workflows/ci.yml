@@ -75,6 +75,30 @@ jobs:
       - name: Build
         run: npm run build
 
+  # apps/control-panel/src-tauri is excluded from the root cargo workspace
+  # (it has its own Cargo.lock), so the `rust` job's --workspace runs never
+  # compile or lint it. Lint and test the panel's Rust backend directly on the
+  # two desktop targets it ships on. ubuntu is deliberately excluded: the
+  # webkit2gtk system deps it would need are not worth maintaining for a
+  # desktop-only panel.
+  panel-rust:
+    name: Panel Rust (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Check lints
+        run: cargo clippy --manifest-path apps/control-panel/src-tauri/Cargo.toml --all-targets -- -D warnings
+      - name: Run tests
+        run: cargo test --manifest-path apps/control-panel/src-tauri/Cargo.toml
+
   cargo-deny:
     name: cargo-deny
     runs-on: ubuntu-latest
@@ -123,7 +147,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      # Pin the MSRV (workspace Cargo.toml rust-version) instead of inheriting
+      # stable: rustdoc lint churn on the stable channel must not break this
+      # job spuriously between MSRV bumps.
+      - uses: dtolnay/rust-toolchain@1.91
       - uses: Swatinem/rust-cache@v2
       - name: Build documentation with warnings denied
         env:
