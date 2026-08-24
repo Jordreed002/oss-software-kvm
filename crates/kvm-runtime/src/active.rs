@@ -56,6 +56,12 @@ const CAPTURE_POLL_TICK: Duration = Duration::from_millis(4);
 // contention against the synchronous native capture callback.
 const TRANSPORT_SERVICE_TICK: Duration = Duration::from_millis(8);
 const SHUTDOWN_SETTLE_TIMEOUT: Duration = Duration::from_secs(3);
+/// Environment variable the launcher (for example the control panel, which
+/// provisions the directory holding the runtime profile, the `kvm-config`
+/// store file, and TLS material) can use to point the runtime at the daemon
+/// data directory. Composition reads it solely for advisory, best-effort
+/// artifacts such as the failsafe audit sink.
+const SOFTWARE_KVM_DATA_DIR: &str = "SOFTWARE_KVM_DATA_DIR";
 
 /// Coarse local inventory-change category surfaced by a platform hotplug
 /// watcher.
@@ -531,7 +537,12 @@ impl ControlPlane {
                     kvm_daemon::failsafe_hook::trip();
                     self.kvm_gate = false;
                     if let Ok(mut manager) = manager.lock() {
-                        let _ = manager.native_capture_discontinued(now_ns);
+                        // Mirrors DisableKvm: the failsafe itself never
+                        // fails, but its immediate cleanup attempt is
+                        // logged when the exact session cannot reconcile.
+                        if manager.native_capture_discontinued(now_ns).is_err() {
+                            developer_event("control=failsafe_cleanup_rejected");
+                        }
                     }
                 }
                 ControlCommand::DisableKvm => {
@@ -545,6 +556,12 @@ impl ControlPlane {
                 }
                 ControlCommand::EnableKvm => {
                     developer_event("control=kvm_enabled");
+                    // The command still acknowledges (the owner-loop gate
+                    // opens), but a latched process failsafe can never be
+                    // re-armed: the manager rejects the rearm, the rejection
+                    // is logged, and the coarse §31 status keeps reporting
+                    // `kvm_enabled=false` because routing stays gated until
+                    // the process restarts.
                     self.kvm_gate = true;
                     if let Ok(mut manager) = manager.lock() {
                         if manager
@@ -1947,6 +1964,39 @@ fn now_ns(started: Instant) -> u64 {
     duration_ns(now_duration(started))
 }
 
+/// Conventional failsafe audit sink location inside the daemon data directory
+/// — the same directory that holds the `kvm-config` store file, using the
+/// daemon's conventional file name. The sink is best-effort: I/O failures
+/// disable it without failing any safety path.
+fn failsafe_audit_sink_path(data_directory: &std::path::Path) -> std::path::PathBuf {
+    data_directory.join(kvm_daemon::FAILSAFE_AUDIT_FILENAME)
+}
+
+/// Wires the manager's best-effort failsafe audit JSONL sink (advisory only).
+///
+/// The daemon data directory is owned by the launcher — the control panel
+/// provisions it with the runtime profile, the `kvm-config` store file, and
+/// TLS material — and is communicated to the runtime through
+/// [`SOFTWARE_KVM_DATA_DIR`]. When the launcher provides it, every failsafe
+/// event is mirrored into the capped JSONL file next to that material via
+/// [`failsafe_audit_sink_path`]; without it the bounded in-memory ring still
+/// records events. Failure here can never gate input.
+fn wire_failsafe_audit_sink<I, O>(manager: &mut PeerManager<I, O>)
+where
+    I: OutputInjectionBackend,
+    O: kvm_daemon::OutboundPeer,
+{
+    match std::env::var_os(SOFTWARE_KVM_DATA_DIR).filter(|directory| !directory.is_empty()) {
+        Some(directory) => {
+            manager.enable_failsafe_audit_file(failsafe_audit_sink_path(std::path::Path::new(
+                &directory,
+            )));
+            developer_event("failsafe=audit_sink_ready");
+        }
+        None => developer_event("failsafe=audit_sink_absent detail:data_directory_unspecified"),
+    }
+}
+
 fn duration_ns(duration: Duration) -> u64 {
     u64::try_from(duration.as_nanos()).unwrap_or(u64::MAX)
 }
@@ -2047,6 +2097,9 @@ impl PreparedTwoHostAlpha {
         // The daemon binary installs the process panic hook; this manager
         // must observe it so a panic anywhere fails open (release + gate).
         manager.arm_panic_failsafe();
+        // Best-effort failsafe audit sink (advisory only); see
+        // [`wire_failsafe_audit_sink`].
+        wire_failsafe_audit_sink(&mut manager);
         let workspace = WorkspaceControlPlane::new(
             remote_peer,
             prepared_workspace.inventory,
@@ -2544,5 +2597,215 @@ mod tests {
         assert_eq!(gated.status.peer_state, ControlPeerState::Connected);
 
         plane.shutdown_service().await;
+    }
+
+    // --- Failsafe interlock (manager + control plane) -----------------------
+
+    /// Every await in these tests sits inside a `timeout` wrapper so a wiring
+    /// bug fails the suite instead of hanging it (repo history).
+    const FAILSAFE_TEST_TIMEOUT: Duration = Duration::from_secs(5);
+
+    const LOCAL_PEER_ID: kvm_types::PeerId = kvm_types::PeerId::from_bytes([2; 16]);
+    const DIAL_PEER_ID: kvm_types::PeerId = kvm_types::PeerId::from_bytes([3; 16]);
+    const FAILSAFE_REMOTE_HOST: HostId = HostId::from_bytes([11; 16]);
+    const FAILSAFE_REMOTE_DISPLAY: DisplayId = DisplayId::from_bytes([13; 16]);
+    const FAILSAFE_DEVICE: kvm_types::DeviceId = kvm_types::DeviceId::from_bytes([14; 16]);
+
+    /// Injection backend stub: the failsafe interlock under test never
+    /// injects, so a no-op backend suffices.
+    #[derive(Debug)]
+    struct StubInjection;
+
+    impl OutputInjectionBackend for StubInjection {
+        fn inject(
+            &mut self,
+            _event: &kvm_input::InputEvent,
+        ) -> Result<(), kvm_daemon::PlatformError> {
+            Ok(())
+        }
+    }
+
+    fn failsafe_captured_key(
+        sequence: u64,
+        code: kvm_input::KeyCode,
+        state: kvm_input::KeyState,
+    ) -> kvm_daemon::CapturedInput {
+        kvm_daemon::CapturedInput::new(
+            kvm_input::InputEvent::new(
+                sequence,
+                sequence,
+                LOCAL_HOST,
+                FAILSAFE_DEVICE,
+                kvm_input::InputPayload::Key { code, state },
+            ),
+            kvm_daemon::EventClassification::Physical,
+        )
+    }
+
+    /// Minimal armed manager over the daemon crate's public composition API,
+    /// mirroring the daemon's own test harness (one paired dialer, one local
+    /// display, one selected workspace plane).
+    fn armed_failsafe_manager() -> PeerManager<StubInjection, ManagedSessionOutbound> {
+        use kvm_config::PairedHostConfig;
+        use kvm_security::{IdentityFingerprint, PairedPeer, PeerIdentity};
+
+        let remote_identity = PeerIdentity::new(
+            DIAL_PEER_ID,
+            FAILSAFE_REMOTE_HOST,
+            "selected",
+            IdentityFingerprint::from_sha256([11; 32]),
+        )
+        .unwrap();
+        let mut config = Config::default();
+        config.paired_hosts.push(PairedHostConfig {
+            host_id: FAILSAFE_REMOTE_HOST,
+            peer_id: DIAL_PEER_ID,
+            name: "selected".into(),
+            platform: kvm_types::Platform::Windows,
+            identity_fingerprint: remote_identity.fingerprint().to_string(),
+            last_address: None,
+        });
+        let initial = WorkspaceState::new(
+            LOCAL_HOST,
+            LOCAL_HOST,
+            LogicalPointer::new(DISPLAY, 0.0, 0.0),
+        );
+        let core = DaemonCore::new(config, initial, LOCAL_PLATFORM).unwrap();
+        let coordinator = PeerSessionCoordinator::new(
+            core,
+            remote_identity.clone(),
+            StubInjection,
+            ManagedSessionOutbound::detached(),
+        )
+        .unwrap();
+        let gate = ConnectionGenerationGate::new(
+            WirePeerId(LOCAL_PEER_ID.into_bytes()),
+            WirePeerId(DIAL_PEER_ID.into_bytes()),
+        )
+        .unwrap();
+        let supervisor = PeerSessionSupervisor::new(gate, coordinator);
+        let paired = PairedPeer::from_persisted_public_identity(remote_identity);
+        let mut manager = PeerManager::new(
+            LOCAL_PEER_ID,
+            [ManagedPairedPeer::new(&paired, supervisor)],
+            PeerManagerConfig::default(),
+        )
+        .unwrap();
+        manager.arm_panic_failsafe();
+
+        let mut inventory =
+            DisplayInventory::new(LOCAL_HOST, DisplayInventoryConfig::default()).unwrap();
+        inventory
+            .apply_local_snapshot(1, vec![display(LOCAL_HOST, true)])
+            .unwrap();
+        let plane = WorkspaceControlPlane::new(
+            DIAL_PEER_ID,
+            inventory,
+            PointerHandoffConfig::new(Duration::from_secs(1)).unwrap(),
+            initial,
+            LogicalPointer::new(DISPLAY, 0.0, 0.0),
+            vec![
+                WorkspacePlacement::new(DISPLAY, Point::new(0.0, 0.0)),
+                WorkspacePlacement::new(FAILSAFE_REMOTE_DISPLAY, Point::new(200.0, 0.0)),
+            ],
+            vec![WorkspaceLink::new(
+                DISPLAY,
+                Edge::Right,
+                FAILSAFE_REMOTE_DISPLAY,
+                Edge::Left,
+            )],
+        )
+        .unwrap();
+        manager.attach_workspace_control(plane).unwrap();
+        manager
+            .rearm_native_capture(CaptureLifecycleState::Running)
+            .unwrap();
+        manager
+    }
+
+    /// A `ControlPlane` whose command queue the test owns, so commands can be
+    /// forwarded exactly the way the §31 service does (no socket needed).
+    fn control_plane_with_commands(
+        identity: LocalHostIdentity,
+    ) -> (ControlPlane, tokio::sync::mpsc::Sender<ControlCommand>) {
+        let (command_tx, command_rx) = tokio::sync::mpsc::channel(CONTROL_COMMAND_QUEUE_CAPACITY);
+        let plane = ControlPlane {
+            commands: command_rx,
+            events: None,
+            view: Arc::new(Mutex::new(ControlServiceView::default())),
+            identity,
+            kvm_gate: true,
+            service: None,
+            service_shutdown: None,
+            last_peer_state: None,
+            last_active_host: None,
+        };
+        (plane, command_tx)
+    }
+
+    fn failsafe_identity() -> LocalHostIdentity {
+        LocalHostIdentity {
+            host_id: LOCAL_HOST,
+            peer_id: LOCAL_PEER_ID,
+            platform: LOCAL_PLATFORM,
+            selected_peer: SelectedPeerIdentity {
+                host_id: FAILSAFE_REMOTE_HOST,
+                peer_id: DIAL_PEER_ID,
+                display_name: "selected".to_owned(),
+            },
+        }
+    }
+
+    #[test]
+    fn failsafe_audit_sink_path_uses_the_conventional_data_directory_name() {
+        let path = failsafe_audit_sink_path(std::path::Path::new("/data"));
+        assert_eq!(
+            path,
+            std::path::PathBuf::from("/data").join(kvm_daemon::FAILSAFE_AUDIT_FILENAME)
+        );
+    }
+
+    #[tokio::test]
+    async fn trigger_failsafe_then_enable_kvm_stays_gated_but_acknowledges() {
+        use kvm_daemon::{PeerManagerError, SelectedCaptureState};
+        use kvm_input::{KeyCode, KeyState};
+
+        // The process flag trips through the real §31 command path; it is
+        // never cleared in production semantics, and no other test in this
+        // binary arms a manager against it.
+        let manager = Arc::new(Mutex::new(armed_failsafe_manager()));
+        let (mut plane, command_tx) = control_plane_with_commands(failsafe_identity());
+
+        // Sanity: before the failsafe the manager accepts a rearm.
+        {
+            let mut guard = manager.lock().unwrap();
+            guard
+                .rearm_native_capture(CaptureLifecycleState::Running)
+                .unwrap();
+        }
+
+        for command in [ControlCommand::TriggerFailsafe, ControlCommand::EnableKvm] {
+            tokio::time::timeout(FAILSAFE_TEST_TIMEOUT, command_tx.send(command))
+                .await
+                .expect("command send timed out")
+                .expect("command channel accepts the forwarded command");
+        }
+        plane.drain_commands(&manager, 1);
+
+        // The command still acknowledges: the owner-loop gate opened.
+        assert!(plane.kvm_gate);
+        // But the latched failsafe cannot be re-armed: the manager rejects
+        // the rearm and every capture keeps failing open as Local, so the
+        // coarse §31 status honestly reports `kvm_enabled=false`.
+        let mut guard = manager.lock().unwrap();
+        assert!(matches!(
+            guard.rearm_native_capture(CaptureLifecycleState::Running),
+            Err(PeerManagerError::FailsafeLatched)
+        ));
+        let outcome = guard.route_selected_capture(
+            failsafe_captured_key(1, KeyCode::KeyA, KeyState::Pressed),
+            2,
+        );
+        assert_eq!(outcome.state(), SelectedCaptureState::Local);
     }
 }

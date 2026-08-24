@@ -53,6 +53,14 @@ static WAKER: OnceLock<Box<dyn Fn() + Send + Sync>> = OnceLock::new();
 #[cfg(test)]
 pub(crate) static TEST_TRIP_GUARD: Mutex<()> = Mutex::new(());
 
+/// Resets the trip flag. Test-only: production never clears a tripped
+/// failsafe (recovery is a process restart). Callers must already hold
+/// [`TEST_TRIP_GUARD`] so a cleared flag cannot race another test's trip.
+#[cfg(test)]
+pub(crate) fn clear_trip_for_test() {
+    FAILSAFE_TRIPPED.store(false, Ordering::Release);
+}
+
 /// Installs the panic failsafe hook, preserving the previous hook's output.
 ///
 /// Idempotent: the second and later calls are no-ops. The hook forwards every
@@ -119,15 +127,11 @@ mod tests {
 
     use super::*;
 
-    /// Clears the trip flag. Test-only: production never clears a tripped
-    /// failsafe. Callers must hold [`TEST_TRIP_GUARD`].
-    fn clear_trip_for_test() {
-        FAILSAFE_TRIPPED.store(false, Ordering::Release);
-    }
-
     #[test]
     fn explicit_trip_sets_the_flag_and_waker_stays_invocable() {
-        let _guard = TEST_TRIP_GUARD.lock().ok();
+        let _guard = TEST_TRIP_GUARD
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         clear_trip_for_test();
         assert!(!tripped());
 
@@ -156,7 +160,9 @@ mod tests {
 
     #[test]
     fn at_most_one_waker_registration_wins() {
-        let _guard = TEST_TRIP_GUARD.lock().ok();
+        let _guard = TEST_TRIP_GUARD
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let first = register_waker(Box::new(|| {}));
         let second = register_waker(Box::new(|| {}));
         assert!(
@@ -170,10 +176,15 @@ mod tests {
 
     #[test]
     fn panic_through_the_hook_trips_the_failsafe_and_preserves_output() {
-        let _guard = TEST_TRIP_GUARD.lock().ok();
+        let _guard = TEST_TRIP_GUARD
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         clear_trip_for_test();
 
         let previous_ran = Arc::new(AtomicBool::new(false));
+        // Save the hook this test replaces so it can be restored verbatim
+        // afterwards instead of leaving a synthetic quiet hook behind.
+        let prior_hook = panic::take_hook();
         {
             let marker = Arc::clone(&previous_ran);
             panic::set_hook(Box::new(move |_info| {
@@ -194,10 +205,11 @@ mod tests {
             "the previous hook's output path must be preserved"
         );
         assert!(tripped(), "a panic through the hook must trip");
-        // Leave a quiet hook behind so later panics in this test binary cannot
-        // trip the flag under other tests. `Once` cannot re-arm `install`.
-        let _ = panic::take_hook();
-        panic::set_hook(Box::new(|_| {}));
+        // Restore the exact hook that was installed before this test replaced
+        // it. Later panics in this test binary observe the pre-test hook, and
+        // because it is not the failsafe-wrapping hook, they cannot trip the
+        // flag under other tests. `Once` cannot re-arm `install`.
+        panic::set_hook(prior_hook);
         clear_trip_for_test();
     }
 }

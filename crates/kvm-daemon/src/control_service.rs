@@ -232,7 +232,7 @@ impl ControlService {
                 connection,
                 Arc::clone(&self.view),
                 self.commands.clone(),
-                self.events.resubscribe(),
+                Some(self.events.resubscribe()),
                 shutdown.clone(),
             ));
         }
@@ -242,11 +242,17 @@ impl ControlService {
 /// Answers frames on one panel connection until the peer goes away, the
 /// connection errors, or shutdown is signalled — then shuts the write half so
 /// the panel observes closure instead of a hang.
+///
+/// The §31 event receiver is held in an [`Option`]: once the broadcast sender
+/// side is gone (`Closed`) the branch is disabled by precondition instead of
+/// parking the whole task, so the connection keeps answering requests (and
+/// still observes shutdown) instead of leaking a task that no longer serves
+/// frames.
 async fn serve_connection(
     mut connection: kvm_network::LocalControlConnection,
     view: Arc<dyn ControlViewSource>,
     commands: mpsc::Sender<ControlCommand>,
-    mut events: broadcast::Receiver<ControlEvent>,
+    mut events: Option<broadcast::Receiver<ControlEvent>>,
     mut shutdown: watch::Receiver<bool>,
 ) {
     loop {
@@ -258,7 +264,12 @@ async fn serve_connection(
                 }
                 continue;
             }
-            received = events.recv() => {
+            received = async {
+                match events.as_mut() {
+                    Some(receiver) => receiver.recv().await,
+                    None => std::future::pending().await,
+                }
+            }, if events.is_some() => {
                 match received {
                     Ok(event) => {
                         if connection
@@ -271,9 +282,9 @@ async fn serve_connection(
                     }
                     // Bounded broadcast: a lagging panel misses events.
                     Err(broadcast::error::RecvError::Lagged(_)) => {}
-                    // No emitters remain; park this branch.
+                    // No emitters remain; stop selecting this branch.
                     Err(broadcast::error::RecvError::Closed) => {
-                        std::future::pending::<()>().await;
+                        events = None;
                     }
                 }
                 continue;
@@ -821,6 +832,47 @@ mod tests {
             assert!(matches!(error, kvm_network::LocalIpcError::Closed));
 
             fixture.finish().await;
+        }
+
+        #[tokio::test]
+        async fn a_closed_event_broadcast_still_answers_requests_and_shuts_down_cleanly() {
+            let fixture = spawn_service(CONTROL_COMMAND_QUEUE_CAPACITY);
+            let mut panel = connect(&fixture.path).await;
+            // One round trip first so the connection is being served.
+            assert_eq!(
+                request(&mut panel, ControlRequest::GetStatus).await,
+                ControlResponse::Status(sample_view().status)
+            );
+
+            // Every emitter goes away: the connection observes broadcast
+            // Closed. It must disable that branch and keep serving frames
+            // instead of parking forever.
+            let Fixture {
+                commands: _commands,
+                events,
+                shutdown,
+                run,
+                path,
+            } = fixture;
+            drop(events);
+            assert_eq!(
+                request(&mut panel, ControlRequest::GetStatus).await,
+                ControlResponse::Status(sample_view().status)
+            );
+
+            // Shutdown is still observed and the service exits cleanly.
+            let mut run = run;
+            shutdown.send(true).expect("signal shutdown");
+            let joined = timeout(TEST_TIMEOUT, &mut run)
+                .await
+                .expect("service run timed out");
+            assert!(joined.is_ok_and(|result| result.is_ok()));
+            let closed = timeout(TEST_TIMEOUT, panel.recv())
+                .await
+                .expect("panel recv timed out")
+                .unwrap_err();
+            assert!(matches!(closed, kvm_network::LocalIpcError::Closed));
+            clean_up(&path);
         }
 
         #[tokio::test]

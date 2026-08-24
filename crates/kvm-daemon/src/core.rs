@@ -848,14 +848,36 @@ impl DaemonCore {
                 self.source_latency.push(span);
             }
         }
+        // Trust gate for the physical bookkeeping below: only a trusted,
+        // local, well-formed physical record may touch per-device state.
+        let trusted_physical = captured.classification == EventClassification::Physical
+            && captured.event.source_host == self.workspace.local_host
+            && captured.event.source_device.into_bytes() != [0; 16]
+            && captured.event.payload.is_finite();
+        // §17/§26 semantic wiring: fold every *trusted physical* key transition
+        // into the per-device modifier tracker before any disposition or
+        // affine-decision gate — including the dangling-`pending_remote`
+        // rejection below — so the snapshot mirrors physical reality rather
+        // than routing outcomes (a release arriving while an affine decision
+        // is outstanding must still clear its modifier: the stage's contract
+        // is to never over-count). Failures of the stage are fail-open to
+        // physical passthrough — they never gate or rewrite input.
+        if trusted_physical {
+            if let Err(error) = self.semantic.observe(
+                self.config.keyboard.mode,
+                captured.event.source_device,
+                &captured.event.payload,
+            ) {
+                warn!(
+                    ?error,
+                    "semantic modifier tracking degraded; failing open to physical"
+                );
+            }
+        }
         if self.pending_remote.is_some() {
             return Err(CoreCaptureError::Unavailable);
         }
-        if captured.classification != EventClassification::Physical
-            || captured.event.source_host != self.workspace.local_host
-            || captured.event.source_device.into_bytes() == [0; 16]
-            || !captured.event.payload.is_finite()
-        {
+        if !trusted_physical {
             return Ok(CaptureDecision::Local(CaptureOutcome::local(
                 false,
                 CaptureRouteState::Local,
@@ -863,22 +885,6 @@ impl DaemonCore {
         }
 
         let device = captured.event.source_device;
-        // §17/§26 semantic wiring: fold every *trusted physical* key transition
-        // into the per-device modifier tracker before any disposition is
-        // decided, so the snapshot mirrors physical reality rather than
-        // routing outcomes (a failsafe-drain or locally delivered release must
-        // clear held modifiers exactly as a remotely forwarded one would).
-        // Failures of the stage are fail-open to physical passthrough — they
-        // never gate or rewrite input.
-        if let Err(error) =
-            self.semantic
-                .observe(self.config.keyboard.mode, device, &captured.event.payload)
-        {
-            warn!(
-                ?error,
-                "semantic modifier tracking degraded; failing open to physical"
-            );
-        }
         let stateful = PhysicalControl::from_payload(captured.event.payload);
         let (control, transition, previous_latch) = match stateful {
             Some((control, PhysicalTransition::Press)) => {
@@ -3060,6 +3066,38 @@ mod tests {
         let effect = prepare_remote(&mut core, key(DEVICE, KeyCode::KeyC, KeyState::Pressed));
         assert_eq!(effect.semantic_translation(), None);
         core.confirm_remote_input(effect, 9, 9).unwrap();
+    }
+
+    #[test]
+    fn release_during_a_dangling_remote_decision_still_clears_the_semantic_tracker() {
+        // The tracker's contract is to never over-count: a physical release
+        // must fold even while an affine remote decision from the same device
+        // is still outstanding (`pending_remote` dangles), or the stage would
+        // retain a phantom held modifier after the release.
+        let mut core = semantic_core();
+        core.update_workspace(workspace(REMOTE), 1).unwrap();
+
+        // The modifier press routes remote and leaves the affine decision
+        // outstanding (unconfirmed), so the next preparation is Unavailable.
+        let effect = prepare_remote(
+            &mut core,
+            key(DEVICE, KeyCode::ControlLeft, KeyState::Pressed),
+        );
+        assert_eq!(core.semantic.tracked_devices(), 1);
+
+        assert!(matches!(
+            core.prepare_captured(key(DEVICE, KeyCode::ControlLeft, KeyState::Released), 2),
+            Err(CoreCaptureError::Unavailable)
+        ));
+        assert_eq!(
+            core.semantic.tracked_devices(),
+            0,
+            "the dangling-decision rejection must not skip the semantic fold"
+        );
+
+        // The outstanding press still settles through its ordinary fail path.
+        let outcome = core.fail_remote_input(effect, 3).unwrap();
+        assert_eq!(outcome.disposition(), CaptureDisposition::AllowLocal);
     }
 
     #[test]

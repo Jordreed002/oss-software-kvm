@@ -5,6 +5,9 @@
 //! records one event here. The trail is a bounded ring buffer (newest last,
 //! oldest evicted) exposed read-only for diagnostics, plus an optional
 //! best-effort JSONL sink with a hard size cap and rotation-by-truncation.
+//! Ring recording is synchronous; sink lines are only queued by `record` and
+//! written by `flush_sink` on the manager's periodic service tick, so the
+//! synchronous capture callback never touches the filesystem.
 //!
 //! The panic hook itself cannot record: hooks must stay lock-free
 //! (see [`crate::failsafe_hook`]). Its event is recorded by the manager when
@@ -74,12 +77,17 @@ pub struct FailsafeAuditEvent {
 /// The manager-owned failsafe trail: ring buffer plus optional JSONL sink.
 ///
 /// All mutation happens through the manager's serialized authority; no locks
-/// are taken here.
+/// are taken here. The in-memory ring records synchronously; JSONL sink lines
+/// are only *queued* by [`FailsafeAuditLog::record`] — the actual file I/O
+/// happens on [`FailsafeAuditLog::flush_sink`], driven by the manager's
+/// periodic service tick, so the synchronous capture callback never touches
+/// the filesystem.
 #[derive(Default)]
 pub(crate) struct FailsafeAuditLog {
     entries: VecDeque<FailsafeAuditEvent>,
     next_sequence: u64,
     sink: Option<PathBuf>,
+    pending_sink_lines: VecDeque<String>,
 }
 
 impl fmt::Debug for FailsafeAuditLog {
@@ -88,15 +96,19 @@ impl fmt::Debug for FailsafeAuditLog {
             .debug_struct("FailsafeAuditLog")
             .field("retained", &self.entries.len())
             .field("has_sink", &self.sink.is_some())
+            .field("pending_sink_lines", &self.pending_sink_lines.len())
             .finish_non_exhaustive()
     }
 }
 
 impl FailsafeAuditLog {
     /// Records one event: pushes it onto the ring (evicting the oldest entry
-    /// beyond [`FAILSAFE_AUDIT_CAPACITY`]) and best-effort appends it to the
-    /// JSONL sink when one is configured. Sink I/O failures never fail the
-    /// safety path; they disable the sink for the remainder of the trail.
+    /// beyond [`FAILSAFE_AUDIT_CAPACITY`]) and, when a JSONL sink is
+    /// configured, queues its line for the next [`Self::flush_sink`] instead
+    /// of writing from the caller's context — `record` runs on the capture
+    /// path, which must stay free of file I/O. The queue carries at most
+    /// [`FAILSAFE_AUDIT_CAPACITY`] lines (one per ring event); the oldest
+    /// queued line is dropped on overflow, mirroring the ring.
     pub(crate) fn record(&mut self, cause: FailsafeEventCause, now_ns: u64) {
         let sequence = self.next_sequence;
         self.next_sequence = self.next_sequence.wrapping_add(1);
@@ -109,10 +121,10 @@ impl FailsafeAuditLog {
         while self.entries.len() > FAILSAFE_AUDIT_CAPACITY {
             self.entries.pop_front();
         }
-        if let Some(path) = self.sink.clone() {
-            let line = format_jsonl_line(&event);
-            if append_capped(&path, &line, FAILSAFE_AUDIT_FILE_CAP_BYTES).is_err() {
-                self.sink = None;
+        if self.sink.is_some() {
+            self.pending_sink_lines.push_back(format_jsonl_line(&event));
+            while self.pending_sink_lines.len() > FAILSAFE_AUDIT_CAPACITY {
+                self.pending_sink_lines.pop_front();
             }
         }
     }
@@ -126,6 +138,24 @@ impl FailsafeAuditLog {
     #[must_use]
     pub(crate) fn snapshot(&self) -> Vec<FailsafeAuditEvent> {
         self.entries.iter().copied().collect()
+    }
+
+    /// Drains the queued sink lines into the JSONL file with a hard size cap
+    /// and rotation-by-truncation. Best-effort: the first I/O failure disables
+    /// the sink for the remainder of the trail (and drops its queued lines)
+    /// without failing the safety path.
+    pub(crate) fn flush_sink(&mut self) {
+        let Some(path) = self.sink.clone() else {
+            self.pending_sink_lines.clear();
+            return;
+        };
+        while let Some(line) = self.pending_sink_lines.pop_front() {
+            if append_capped(&path, &line, FAILSAFE_AUDIT_FILE_CAP_BYTES).is_err() {
+                self.sink = None;
+                self.pending_sink_lines.clear();
+                return;
+            }
+        }
     }
 }
 
@@ -265,6 +295,48 @@ mod tests {
     }
 
     #[test]
+    fn ring_records_immediately_and_the_sink_writes_only_on_flush() {
+        let directory = std::env::temp_dir().join(format!(
+            "kvm-failsafe-audit-flush-{}",
+            std::process::id().wrapping_mul(5)
+        ));
+        std::fs::create_dir_all(&directory).expect("temp directory is created");
+        let path = directory.join(FAILSAFE_AUDIT_FILENAME);
+        let _ = std::fs::remove_file(&path);
+
+        let mut log = FailsafeAuditLog::default();
+        log.set_sink(path.clone());
+        // Recording from the capture callback context is synchronous for the
+        // ring only: the event is observable immediately, the file is not
+        // touched until the service-tick flush.
+        log.record(FailsafeEventCause::RoutingBudgetExceeded, 11);
+        log.record(FailsafeEventCause::PanicHookTripped, 12);
+        assert_eq!(log.snapshot().len(), 2);
+        assert!(!path.exists(), "no file I/O may happen on record");
+
+        log.flush_sink();
+        let contents = std::fs::read_to_string(&path).expect("sink is readable after flush");
+        assert_eq!(contents.lines().count(), 2);
+        let first: FailsafeAuditEvent = serde_json::from_str(contents.lines().next().unwrap_or(""))
+            .expect("first line parses back");
+        assert_eq!(first.cause, FailsafeEventCause::RoutingBudgetExceeded);
+        let second: FailsafeAuditEvent =
+            serde_json::from_str(contents.lines().nth(1).unwrap_or(""))
+                .expect("second line parses back");
+        assert_eq!(second.cause, FailsafeEventCause::PanicHookTripped);
+
+        // A later record starts a fresh queue; flushing again appends only it.
+        log.record(FailsafeEventCause::ChordActivated, 13);
+        assert_eq!(log.snapshot().len(), 3);
+        log.flush_sink();
+        let contents = std::fs::read_to_string(&path).expect("sink is readable after flush");
+        assert_eq!(contents.lines().count(), 3);
+
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_dir(&directory);
+    }
+
+    #[test]
     fn failing_sink_is_disabled_after_first_error() {
         // A sink whose parent directory vanished cannot be appended to; the
         // audit must drop it silently instead of failing the record path.
@@ -272,6 +344,15 @@ mod tests {
         log.set_sink(PathBuf::from("/nonexistent-kvm-audit-dir/failsafe.jsonl"));
         log.record(FailsafeEventCause::ChordActivated, 5);
         assert_eq!(log.snapshot().len(), 1);
+        assert!(
+            log.sink.is_some(),
+            "record queues without touching the file"
+        );
+        log.flush_sink();
         assert!(log.sink.is_none(), "the broken sink is disabled");
+        assert!(
+            log.pending_sink_lines.is_empty(),
+            "queued lines are dropped"
+        );
     }
 }

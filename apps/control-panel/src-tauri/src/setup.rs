@@ -1434,6 +1434,9 @@ pub(crate) fn start_runtime(service: State<'_, SetupService>) -> Result<SetupSna
         .stdin(Stdio::null())
         .stdout(Stdio::from(stdout_log))
         .stderr(Stdio::from(stderr_log));
+    // The runtime reads this to activate its failsafe-audit JSONL sink in the
+    // launcher-owned data directory (in-memory ring only when absent).
+    command.env("SOFTWARE_KVM_DATA_DIR", &service.directory);
     if cfg!(debug_assertions) {
         command.env("SOFTWARE_KVM_DEV_LOG", "1");
     }

@@ -721,20 +721,21 @@ where
         }
     }
 
-    /// One-shot release after the process panic failsafe is observed tripped.
-    /// Later captures keep failing open without repeating the audit entry.
+    /// Releases held input after the process panic failsafe is observed
+    /// tripped. Only the audit entry is one-shot; the cleanup itself is
+    /// idempotent and runs on every observation so later ticks keep
+    /// reconciling anything the first pass could not deliver.
     fn release_for_panic_failsafe(&mut self, now_ns: u64) {
         self.selected_capture_available = false;
-        if self.failsafe.panic_released {
-            return;
+        if !self.failsafe.panic_released {
+            self.failsafe.panic_released = true;
+            self.failsafe_audit
+                .record(FailsafeEventCause::PanicHookTripped, now_ns);
+            warn!(
+                manager_id = self.manager_id,
+                "process panic failsafe observed; held input released and suppression gated"
+            );
         }
-        self.failsafe.panic_released = true;
-        self.failsafe_audit
-            .record(FailsafeEventCause::PanicHookTripped, now_ns);
-        warn!(
-            manager_id = self.manager_id,
-            "process panic failsafe observed; held input released and suppression gated"
-        );
         self.fail_open_selected_session(now_ns);
     }
 
@@ -763,15 +764,24 @@ where
     /// A routing budget watchdog trip is cleared here too: a verified fresh
     /// native generation is the same operator-owned recovery signal.
     ///
+    /// A latched process panic failsafe is the one condition rearm can never
+    /// clear: recovery is a process restart, so rearm fails loudly (the
+    /// runtime logs the rejection) instead of silently leaving every capture
+    /// rejected while the panel believes routing is enabled.
+    ///
     /// # Errors
     ///
-    /// Rejects an unknown/non-running lifecycle or a manager in shutdown.
+    /// Rejects an unknown/non-running lifecycle, a manager in shutdown, or an
+    /// armed manager whose process panic failsafe has tripped.
     pub fn rearm_native_capture(
         &mut self,
         lifecycle: CaptureLifecycleState,
     ) -> Result<(), PeerManagerError> {
         if self.shutting_down || lifecycle != CaptureLifecycleState::Running {
             return Err(PeerManagerError::PeerRejected);
+        }
+        if self.failsafe.armed && crate::failsafe_hook::tripped() {
+            return Err(PeerManagerError::FailsafeLatched);
         }
         self.selected_capture_available = true;
         self.failsafe.budget_gated = false;
@@ -795,10 +805,17 @@ where
             self.release_for_panic_failsafe(now_ns);
         }
         // Failsafe publication below still runs so the snapshot the runtime
-        // observes reflects the suspended routing state.
-        let changed = self.selected_lifecycle_tick_inner(now_ns)?;
-        self.reconcile_pressed_state(now_ns)?;
-        Ok(changed)
+        // observes reflects the suspended routing state. The pressed-state
+        // sweep runs unconditionally: an inner-tick failure must never starve
+        // the stuck-key reconciliation, so both errors are combined (the
+        // supervisor error wins when both fail) and propagated together.
+        let changed = self.selected_lifecycle_tick_inner(now_ns);
+        let swept = self.reconcile_pressed_state(now_ns);
+        let result = changed.and_then(|changed| swept.map(|_| changed));
+        // Queued audit-sink lines are written here — on the service tick —
+        // so the synchronous capture callback never performs file I/O.
+        self.failsafe_audit.flush_sink();
+        result
     }
 
     fn selected_lifecycle_tick_inner(&mut self, now_ns: u64) -> Result<bool, PeerManagerError> {
@@ -827,8 +844,9 @@ where
     ///
     /// Returns the number of entries whose release entered the exact admitted
     /// FIFO. Absent sessions hold nothing, so this succeeds with zero. The
-    /// supervisor's periodic tick runs the same sweep; this method exists for
-    /// explicit reconciliation and tests.
+    /// manager's periodic service tick drives this sweep after the supervisor
+    /// tick (whose own core tick only drains failsafe-suspended keys); this
+    /// method is the exact sweep path shared by that tick and tests.
     ///
     /// # Errors
     ///
@@ -878,7 +896,9 @@ where
     /// The path should live in the daemon's data directory — the same
     /// directory holding the `kvm-config` store file; the conventional name
     /// is [`FAILSAFE_AUDIT_FILENAME`]. The parent directory must already
-    /// exist. Sink I/O is best-effort and never fails a safety path.
+    /// exist. Recording stays synchronous in memory only; the queued lines
+    /// are written by the periodic service tick and once more at shutdown.
+    /// Sink I/O is best-effort and never fails a safety path.
     pub fn enable_failsafe_audit_file(&mut self, path: impl Into<std::path::PathBuf>) {
         self.failsafe_audit.set_sink(path.into());
     }
@@ -2285,6 +2305,10 @@ where
         if let Some(workspace) = self.workspace.as_mut() {
             workspace.shutdown();
         }
+        // Best-effort final flush so events recorded just before teardown —
+        // for example the last failsafe observation — still reach the JSONL
+        // sink even if no further tick runs.
+        self.failsafe_audit.flush_sink();
         if failures == 0 {
             Ok(())
         } else {
@@ -2727,6 +2751,8 @@ pub enum PeerManagerError {
     RoutePolicyPersistence,
     #[error("peer reconciliation failed for {failures} managed peers")]
     ReconciliationFailed { failures: usize },
+    #[error("process panic failsafe is latched; routing stays gated until the process restarts")]
+    FailsafeLatched,
     #[error(transparent)]
     Role(#[from] kvm_network::ConnectionRoleError),
     #[error("peer supervisor rejected the operation")]
@@ -3348,14 +3374,9 @@ mod tests {
         remote_peer_id: PeerId,
         outbound: TestOutbound,
     ) -> PeerManager<TestInjection, TestOutbound> {
-        let mut manager = PeerManager::new(
-            LOCAL_PEER,
-            [managed_peer_with_outbound(
-                LOCAL_PEER,
-                remote_peer_id,
-                11,
-                outbound,
-            )],
+        manager_with_options(
+            remote_peer_id,
+            outbound,
             PeerManagerConfig {
                 reconnect: ReconnectPolicy {
                     initial_delay: Duration::from_secs(1),
@@ -3364,6 +3385,25 @@ mod tests {
                 },
                 ..PeerManagerConfig::default()
             },
+        )
+    }
+
+    /// Manager harness over an explicit configuration (the routing-budget
+    /// watchdog tests inject a tiny budget through here).
+    fn manager_with_options(
+        remote_peer_id: PeerId,
+        outbound: TestOutbound,
+        config: PeerManagerConfig,
+    ) -> PeerManager<TestInjection, TestOutbound> {
+        let mut manager = PeerManager::new(
+            LOCAL_PEER,
+            [managed_peer_with_outbound(
+                LOCAL_PEER,
+                remote_peer_id,
+                11,
+                outbound,
+            )],
+            config,
         )
         .unwrap();
         let mut inventory =
@@ -4366,6 +4406,323 @@ mod tests {
         let rearmed =
             manager.route_selected_capture(captured_key(3, KeyCode::KeyB, KeyState::Pressed), 8);
         assert_eq!(rearmed.disposition(), CaptureDisposition::AllowLocal);
+    }
+
+    /// Counts the `ReleaseInput` frames the peer FIFO has received so far.
+    fn release_count(outbound: &TestOutbound) -> usize {
+        outbound
+            .messages()
+            .iter()
+            .filter(|message| matches!(message, WireMessage::ReleaseInput(_)))
+            .count()
+    }
+
+    /// The configured default maximum key hold in nanoseconds.
+    fn max_hold_ns() -> u64 {
+        u64::try_from(DEFAULT_MAXIMUM_KEY_HOLD.as_nanos()).unwrap_or(u64::MAX)
+    }
+
+    #[test]
+    fn routing_budget_watchdog_gates_releases_and_is_cleared_by_rearm() {
+        let outbound = TestOutbound::default();
+        let mut manager = manager_with_options(
+            DIAL_PEER,
+            outbound.clone(),
+            PeerManagerConfig {
+                routing_budget: Duration::from_nanos(1),
+                ..PeerManagerConfig::default()
+            },
+        );
+        activate_selected(&mut manager);
+        commit_selected_pointer(&mut manager, &outbound, 3);
+        outbound.clear();
+
+        // The very first routing call already exceeds the injectable budget:
+        // the record itself is delivered, then the watchdog gates suppression,
+        // releases the just-held key, and counts the trip.
+        assert_eq!(
+            manager
+                .route_selected_capture(captured_key(1, KeyCode::KeyA, KeyState::Pressed), 5)
+                .state(),
+            SelectedCaptureState::RemoteQueued
+        );
+        assert_eq!(manager.routing_budget_exceeded_count(), 1);
+        assert_eq!(release_count(&outbound), 1, "held input must be released");
+
+        // Later captures fail open as `Local` (capture itself is healthy; only
+        // the degraded routing path is gated) rather than `Rejected`.
+        let gated =
+            manager.route_selected_capture(captured_key(2, KeyCode::KeyB, KeyState::Pressed), 6);
+        assert_eq!(gated.disposition(), CaptureDisposition::AllowLocal);
+        assert_eq!(gated.state(), SelectedCaptureState::Local);
+        assert_eq!(manager.routing_budget_exceeded_count(), 1);
+
+        // A verified fresh native generation is the operator-owned recovery
+        // signal. Proving the budget marker (not the capture gate) produced
+        // the `Local` shape: rearm succeeds, and gating again through the
+        // ordinary discontinuity path now rejects with `Rejected`, the
+        // non-budget rejection category.
+        manager
+            .rearm_native_capture(CaptureLifecycleState::Running)
+            .unwrap();
+        manager.native_capture_discontinued(7).unwrap();
+        let rejected =
+            manager.route_selected_capture(captured_key(3, KeyCode::KeyB, KeyState::Pressed), 8);
+        assert_eq!(rejected.state(), SelectedCaptureState::Rejected);
+    }
+
+    #[test]
+    fn panic_failsafe_rejects_capture_before_routing_with_a_one_shot_audit() {
+        let _guard = crate::failsafe_hook::TEST_TRIP_GUARD
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        crate::failsafe_hook::clear_trip_for_test();
+
+        let outbound = TestOutbound::default();
+        let mut manager = manager_with_outbound(DIAL_PEER, outbound.clone());
+        manager.arm_panic_failsafe();
+        activate_selected(&mut manager);
+        commit_selected_pointer(&mut manager, &outbound, 3);
+        assert_eq!(
+            manager
+                .route_selected_capture(captured_key(1, KeyCode::KeyA, KeyState::Pressed), 5)
+                .state(),
+            SelectedCaptureState::RemoteQueued
+        );
+        outbound.clear();
+
+        crate::failsafe_hook::trip();
+        let rejected =
+            manager.route_selected_capture(captured_key(2, KeyCode::KeyB, KeyState::Pressed), 6);
+        // Rejected before any routing: the decision is local and the held key
+        // from before the trip is released through the exact FIFO.
+        assert_eq!(rejected.disposition(), CaptureDisposition::AllowLocal);
+        assert_eq!(rejected.state(), SelectedCaptureState::Local);
+        assert!(outbound
+            .messages()
+            .iter()
+            .all(|message| !matches!(message, WireMessage::Input(_))));
+        assert_eq!(release_count(&outbound), 1);
+        assert_eq!(
+            manager
+                .failsafe_events()
+                .iter()
+                .filter(|event| event.cause == FailsafeEventCause::PanicHookTripped)
+                .count(),
+            1,
+            "the audit entry is recorded exactly once"
+        );
+
+        // Later captures keep failing open without repeating the audit entry.
+        let again =
+            manager.route_selected_capture(captured_key(3, KeyCode::KeyC, KeyState::Pressed), 7);
+        assert_eq!(again.state(), SelectedCaptureState::Local);
+        assert_eq!(
+            manager
+                .failsafe_events()
+                .iter()
+                .filter(|event| event.cause == FailsafeEventCause::PanicHookTripped)
+                .count(),
+            1
+        );
+
+        crate::failsafe_hook::clear_trip_for_test();
+    }
+
+    #[test]
+    fn panic_failsafe_cleanup_runs_on_every_observation() {
+        let _guard = crate::failsafe_hook::TEST_TRIP_GUARD
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        crate::failsafe_hook::clear_trip_for_test();
+
+        let outbound = TestOutbound::default();
+        let mut manager = manager_with_outbound(DIAL_PEER, outbound.clone());
+        manager.arm_panic_failsafe();
+        activate_selected(&mut manager);
+        commit_selected_pointer(&mut manager, &outbound, 3);
+        assert_eq!(
+            manager
+                .route_selected_capture(captured_key(1, KeyCode::KeyA, KeyState::Pressed), 5)
+                .state(),
+            SelectedCaptureState::RemoteQueued
+        );
+        outbound.clear();
+        // The first observation's release delivery fails; the entry stays
+        // owned for the next observation. Three failures exhaust every
+        // internal retry the first observation performs (immediate drain,
+        // generation-fatal drain, and the retire-path drain).
+        outbound.fail_times(3, OutboundPeerError::Full);
+
+        crate::failsafe_hook::trip();
+        let first =
+            manager.route_selected_capture(captured_key(2, KeyCode::KeyB, KeyState::Pressed), 6);
+        assert_eq!(first.state(), SelectedCaptureState::Local);
+        assert_eq!(release_count(&outbound), 0, "the failed delivery holds");
+
+        // The cleanup is idempotent and runs again: the second observation
+        // re-attempts the release, which now delivers, while the audit entry
+        // stays one-shot.
+        let second =
+            manager.route_selected_capture(captured_key(3, KeyCode::KeyC, KeyState::Pressed), 7);
+        assert_eq!(second.state(), SelectedCaptureState::Local);
+        assert_eq!(release_count(&outbound), 1);
+        assert_eq!(
+            manager
+                .failsafe_events()
+                .iter()
+                .filter(|event| event.cause == FailsafeEventCause::PanicHookTripped)
+                .count(),
+            1
+        );
+
+        crate::failsafe_hook::clear_trip_for_test();
+    }
+
+    #[test]
+    fn rearm_is_rejected_while_the_process_failsafe_is_latched() {
+        let _guard = crate::failsafe_hook::TEST_TRIP_GUARD
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        crate::failsafe_hook::clear_trip_for_test();
+
+        let mut armed = manager(DIAL_PEER);
+        armed.arm_panic_failsafe();
+        // Before the failsafe trips, rearm is accepted.
+        armed
+            .rearm_native_capture(CaptureLifecycleState::Running)
+            .unwrap();
+
+        crate::failsafe_hook::trip();
+        assert!(matches!(
+            armed.rearm_native_capture(CaptureLifecycleState::Running),
+            Err(PeerManagerError::FailsafeLatched)
+        ));
+        // An unarmed manager (embedded/test composition) ignores the process
+        // flag: only armed observation interprets the latch.
+        let mut unarmed = manager(DIAL_PEER);
+        unarmed
+            .rearm_native_capture(CaptureLifecycleState::Running)
+            .unwrap();
+
+        crate::failsafe_hook::clear_trip_for_test();
+    }
+
+    #[test]
+    fn reconcile_pressed_state_delegates_and_leaves_entries_owned_on_error() {
+        let outbound = TestOutbound::default();
+        let mut manager = manager_with_outbound(DIAL_PEER, outbound.clone());
+        activate_selected(&mut manager);
+        commit_selected_pointer(&mut manager, &outbound, 3);
+        assert_eq!(
+            manager
+                .route_selected_capture(captured_key(1, KeyCode::KeyA, KeyState::Pressed), 5)
+                .state(),
+            SelectedCaptureState::RemoteQueued
+        );
+        outbound.clear();
+
+        // The held press is older than the configured bound, but its release
+        // delivery fails: the sweep's error propagates and the entry stays
+        // owned for retry (nothing is dropped or double-released).
+        let stale = 5 + max_hold_ns() + 1;
+        outbound.fail_times(1, OutboundPeerError::Full);
+        assert!(manager.reconcile_pressed_state(stale).is_err());
+        assert_eq!(release_count(&outbound), 0);
+        // A repeat sweep observes the still-owned entry and queues nothing
+        // new — the release remains retained, not lost.
+        assert_eq!(manager.reconcile_pressed_state(stale + 1).unwrap(), 0);
+        assert_eq!(release_count(&outbound), 0);
+
+        // The explicit reconciliation retry owns the next delivery attempt and
+        // delivers exactly the retained release.
+        assert!(matches!(
+            manager.retry_reconciliation(DIAL_PEER, stale + 2).unwrap(),
+            SupervisorEventOutcome::Retired(_)
+        ));
+        assert_eq!(release_count(&outbound), 1);
+    }
+
+    #[test]
+    fn lifecycle_tick_error_does_not_starve_the_pressed_state_sweep() {
+        let outbound = TestOutbound::default();
+        let mut manager = manager_with_outbound(DIAL_PEER, outbound.clone());
+        activate_selected(&mut manager);
+        commit_selected_pointer(&mut manager, &outbound, 3);
+        assert_eq!(
+            manager
+                .route_selected_capture(captured_key(1, KeyCode::KeyA, KeyState::Pressed), 5)
+                .state(),
+            SelectedCaptureState::RemoteQueued
+        );
+        outbound.clear();
+
+        // Force the inner lifecycle tick to fail the same way the pointer
+        // timeout test does: a pending handoff whose deadline expires. With
+        // authority remote, the pending transition is the remote host's
+        // pointer leaving its display towards this host.
+        let epoch = manager
+            .workspace
+            .as_ref()
+            .unwrap()
+            .pointer()
+            .unwrap()
+            .protocol_epoch();
+        {
+            let workspace = manager.workspace.as_mut().unwrap();
+            let peer = manager.peers.get_mut(&DIAL_PEER).unwrap();
+            peer.supervisor
+                .apply_workspace_test_message(
+                    workspace,
+                    WireMessage::PointerLeave(PointerLeaveV1 {
+                        transition_id: 1,
+                        workspace_epoch: epoch,
+                        sequence: 1,
+                        source_host: WireHostId(REMOTE_HOST.into_bytes()),
+                        source_display: WireDisplayId(REMOTE_DISPLAY.into_bytes()),
+                        edge: WireEdge::Left,
+                        normalized_position: 0.5,
+                    }),
+                    6,
+                )
+                .unwrap();
+        }
+        // A failing inbound release makes the tick's generation-fatal
+        // reconciliation abort BEFORE it queues any remote-held release (the
+        // inbound release runs first, see the F-03 ordering): the stale
+        // outbound-held press can then only be released by the sweep.
+        {
+            let peer = manager.peers.get_mut(&DIAL_PEER).unwrap();
+            peer.supervisor
+                .test_hold_inbound(
+                    InputEvent::new(
+                        2,
+                        2,
+                        REMOTE_HOST,
+                        DEVICE,
+                        InputPayload::Key {
+                            code: KeyCode::KeyB,
+                            state: KeyState::Pressed,
+                        },
+                    ),
+                    7,
+                )
+                .unwrap();
+            peer.supervisor.test_injection_mut().fail_times(1);
+        }
+        outbound.clear();
+        let stale = 7 + max_hold_ns() + 1;
+
+        // The tick still reports the inner failure, and the pressed-state
+        // sweep must run in the same call: the stale held press is released
+        // even though the tick errored (an inner error may never starve the
+        // stuck-key reconciliation).
+        assert!(manager.selected_lifecycle_tick(stale).is_err());
+        assert_eq!(
+            release_count(&outbound),
+            1,
+            "the sweep must release the stale held press during the errored tick"
+        );
     }
 
     #[test]
