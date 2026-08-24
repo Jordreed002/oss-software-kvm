@@ -49,3 +49,23 @@ deny:
 # Build docs with warnings denied, matching the CI docs job.
 doc:
     RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --document-private-items
+
+# Sign the kvm-runtime dev binary with a stable local identity so macOS TCC
+# grants (Accessibility, Input Monitoring) survive rebuilds. Unsigned dev
+# binaries are ad-hoc signed; every rebuild changes the signature and macOS
+# silently drops the permission, which surfaces as "native capture lifecycle
+# failed" / diagnose-native reporting accessibility=false. Re-run after any
+# rebuild, then grant Accessibility once; the grant persists across future
+# rebuild+sign cycles. No-op with a helpful message when no identity exists.
+dev-sign:
+    #!/bin/sh
+    set -e
+    binary=target/debug/kvm-runtime
+    identity=$(security find-identity -v -p codesigning | sed -n 's/^.*[0-9A-F]\{40\} "\(.*\)"$/\1/p' | head -1)
+    if [ -z "$identity" ] || [ ! -x "$binary" ]; then
+        echo "no codesigning identity found (create one in Xcode → Settings → Accounts)" \
+        "or kvm-runtime is not built yet" >&2
+        exit 0
+    fi
+    codesign --force --sign "$identity" "$binary"
+    echo "signed $binary with: $identity"
