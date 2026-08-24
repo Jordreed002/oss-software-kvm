@@ -46,17 +46,32 @@ Auditors: runtime/panel/config, natives+protocol-v4, daemon-modules
 
 | ID | Finding | Status |
 |---|---|---|
-| H1 | `selected_lifecycle_tick` error ordering starved the stuck-key sweep; stale comment claimed supervisor also sweeps | 🔧 round B |
-| H2 | Zero tests for the manager-level failsafe interlock (watchdog/panic gate/reconcile) | 🔧 round B |
-| H3 | `EnableKvm` silently no-ops after `TriggerFailsafe`; panel shows enabled | 🔧 round B |
-| M1 | Panic-failsafe one-shot skipped deeper cleanup on later observations | 🔧 round B |
-| M2 | Semantic tracker could over-count (observe skipped on dangling pending_remote) | 🔧 round B |
-| M3 | Control connection parked forever on broadcast Closed (task leak) | 🔧 round B |
-| M4 | Watchdog remediation did sync file I/O inside the capture callback | 🔧 round B (stretch) → cycle 2 if deferred |
-| M5 | Failsafe audit JSONL sink never wired in production | 🔧 round B |
+| H1 | `selected_lifecycle_tick` error ordering starved the stuck-key sweep; stale comment claimed supervisor also sweeps | ✅ `2434316` |
+| H2 | Zero tests for the manager-level failsafe interlock (watchdog/panic gate/reconcile) | ✅ `2434316` (9 discriminating tests) |
+| H3 | `EnableKvm` silently no-ops after `TriggerFailsafe`; panel shows enabled | ✅ `2434316` (FailsafeLatched + control=kvm_enable_rejected) |
+| M1 | Panic-failsafe one-shot skipped deeper cleanup on later observations | ✅ `2434316` |
+| M2 | Semantic tracker could over-count (observe skipped on dangling pending_remote) | ✅ `2434316` |
+| M3 | Control connection parked forever on broadcast Closed (task leak) | ✅ `2434316` |
+| M4 | Watchdog remediation did sync file I/O inside the capture callback | ✅ `2434316` (queue + flush on service tick) |
+| M5 | Failsafe audit JSONL sink never wired in production | ✅ `2434316` (SOFTWARE_KVM_DATA_DIR; panel sets it) |
 | M6 | Inbound held state has no age-based sweep (only peer-liveness) | ⏸ cycle 2 (M/L effort) |
-| L1-L4 | Unlogged TriggerFailsafe errors; poisoned test guard; unbounded panel-connection tasks; hot-path audit record | 🔧 round B (L1, L2, L3) / falls out of M4 (L4) |
+| L1-L4 | Unlogged TriggerFailsafe errors; poisoned test guard; unbounded panel-connection tasks; hot-path audit record | L1/L2 ✅ `2434316`; L3 ❌ open (cap concurrent panel connections); L4 ✅ via M4 |
 | — | Verified sound: panic-hook lock-freedom, watchdog mechanics, semantic chord lifecycle bounds, control-service discipline, single-mutex concurrency | — |
+
+### Network / IPC audit (cycle 1, completed late)
+
+| ID | Finding | Status |
+|---|---|---|
+| H-1 | `ReliableReorderBuffer` wedges permanently: retransmissions of delivered-but-unacked sequences insert below-`next_sequence` entries that never drain; at capacity every later insert is dropped for the session's lifetime (masked by TLS fallback) | ✅ `16955e4` |
+| H-2 | Adaptive pacing escalation (8/16 ms) never reaches the wire: `flush_pending` has no pacing gate, so the 4 ms tick pins effective cadence; only redundancy escalation is real | ✅ `16955e4` |
+| M-1 | IPC socket 0600-after-bind umask window on Linux `/tmp` defaults; the umask mitigation the docs assume is performed nowhere | ❌ open (cycle 2) |
+| M-2 | One transient accept error (EMFILE/ECONNABORTED/pipe-busy) permanently kills the control plane until restart | ✅ `16955e4` |
+| M-3 | Blocking `UnixStream::connect` stale-probe on the async runtime can pin a Tokio worker when the live daemon's accept loop is saturated | ❌ open (cycle 2) |
+| L-1 | `next_delay_with_jitter` is dead in production; docs claim otherwise | ❌ open (cycle 2) |
+| L-2 | Client `connect` deadline arithmetic can panic on absurd timeouts; overshoots budget by up to one cadence | ✅ `16955e4` |
+| L-3 | `shadow_reliable` counts a never-sent `WouldBlock` datagram as attempt 1 | ✅ `16955e4` |
+| L-4 | Pacing comment describes a state healthy links can't reach | ✅ `16955e4` |
+| — | Verified sound: framing bounds-before-alloc, accept/permit race, named-pipe rotation, stale-socket recovery, Zeroizing keys + directional nonces, pacing arithmetic, tooling-fn equivalence (benches/fuzz exercise production symbols) | — |
 
 ### Standing backlog (pre-audit, hardware-independent)
 
@@ -72,6 +87,11 @@ clipboard image types · README modifier-mapping section · PeerState::Discoveri
 
 ### Loop status
 
-Cycle 1 fixes: 2 commits of direct fixes (`edec6af`, plus `7a13ef6`/`d12c243`),
-round B in flight (daemon hardening + tests). Next: network/IPC audit results →
-cycle 2 (M4/M6 + standing backlog top items) → re-audit until no Highs remain.
+Cycle 1 complete (2026-08-24): all four audits delivered, every High fixed
+(`edec6af`, `7a13ef6`, `d12c243`, `2434316`, `16955e4`); 35 commits on the
+branch; workspace clippy clean (pedantic + diagnostics), 859+ tests plus 63
+panel tests green (only the documented macOS-firewall listener flake varies).
+
+Open for cycle 2: network M-1 (umask window) + M-3 (blocking probe) + L-1
+(jitter dedup); daemon M6 (inbound age sweep) + L3 (connection cap);
+NumLock-extended hardware check; the standing feature backlog above.
