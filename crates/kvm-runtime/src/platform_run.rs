@@ -110,8 +110,10 @@ async fn run_windows(
     use kvm_config::ModifierRoleMapping;
     use kvm_windows::{WindowsDisplayBackend, WindowsInputBackend, WindowsOutputBackend};
 
-    let prepared = prepare(profile_path)
-        .map_err(|_| NativeRuntimeError::new(NativeRuntimeErrorKind::Preparation))?;
+    let prepared = prepare(profile_path).map_err(|error| {
+        eprintln!("preparation failed: {:?}", error.kind());
+        NativeRuntimeError::new(NativeRuntimeErrorKind::Preparation)
+    })?;
     let local_host = prepared.local_host_id();
     let output = if prepared.selected_peer_platform() == Some(kvm_types::Platform::MacOS) {
         match prepared.selected_modifier_role_mapping() {
@@ -152,8 +154,10 @@ async fn run_macos(
     use kvm_config::ModifierRoleMapping;
     use kvm_macos::{MacDisplayBackend, MacInputBackend, MacOutputBackend};
 
-    let prepared = prepare(profile_path)
-        .map_err(|_| NativeRuntimeError::new(NativeRuntimeErrorKind::Preparation))?;
+    let prepared = prepare(profile_path).map_err(|error| {
+        eprintln!("preparation failed: {:?}", error.kind());
+        NativeRuntimeError::new(NativeRuntimeErrorKind::Preparation)
+    })?;
     let local_host = prepared.local_host_id();
     let output = if prepared.selected_peer_platform() == Some(kvm_types::Platform::Windows) {
         match prepared.selected_modifier_role_mapping() {
