@@ -24,6 +24,7 @@ pub(crate) enum ControlDaemonState {
 
 /// Panel-ready projection of the §31 `ControlStatus`.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub(crate) struct DaemonControlStatus {
     pub kvm_enabled: bool,
     pub clipboard_enabled: bool,
@@ -180,7 +181,9 @@ mod tests {
         let responded = ControlStatusReply::from(ControlStatusPoll::Status(sample_status()));
         let json = serde_json::to_string(&responded).expect("serialize");
         assert!(json.contains(r#""state":"responded""#));
-        assert!(json.contains(r#""peer_state":"degraded""#));
-        assert!(json.contains(r#""kvm_enabled":true"#));
+        assert!(json.contains(r#""peerState":"degraded""#));
+        assert!(json.contains(r#""kvmEnabled":true"#));
+        assert!(json.contains(r#""roundTripTimeMs":4"#));
+        assert!(json.contains(r#""activeHost":["#));
     }
 }

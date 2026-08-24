@@ -7,6 +7,9 @@ use kvm_runtime::{execute_with_shutdown, RuntimeCommandOutcome};
 
 #[tokio::main]
 async fn main() -> ExitCode {
+    // The panel spawns this binary, not the kvm-daemon skeleton; the panic
+    // failsafe must be live here for the armed manager to observe it.
+    kvm_daemon::failsafe_hook::install();
     let mut arguments: Vec<_> = std::env::args().skip(1).collect();
     if arguments.len() == 1 && arguments[0] == "diagnose-native" {
         return diagnose_native();

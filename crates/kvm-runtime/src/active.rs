@@ -2446,6 +2446,10 @@ mod tests {
         assert_eq!(logical_dimension(f64::from(u32::MAX) + 16.0), 0);
     }
 
+    // Unix-gated like the daemon crate's transport tests: the named-pipe
+    // server on Windows rejects a filesystem socket path, so the bind
+    // assertion below is only meaningful where UDS exists.
+    #[cfg(unix)]
     #[tokio::test]
     async fn control_view_refresh_publishes_change_events_and_carries_display_sections() {
         use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
