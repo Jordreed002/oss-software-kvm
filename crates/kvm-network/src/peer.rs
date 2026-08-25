@@ -1704,6 +1704,7 @@ async fn run_session_with_stats<S: SecurePeerStream, A: SessionAdmission>(
     let mut pointer_recovery_tick = tokio::time::interval(Duration::from_millis(2));
     pointer_recovery_tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
     let mut pointer_recovery = VecDeque::new();
+    let mut pointer_fold: Option<PointerMoveFold> = None;
     let mut read_progress = FrameReadProgress::default();
     // Reused across drains so a multi-frame burst is decoded and dispatched
     // without per-drain or per-frame allocation.
@@ -1816,19 +1817,45 @@ async fn run_session_with_stats<S: SecurePeerStream, A: SessionAdmission>(
                             if let Some(stats) = stats {
                                 stats.record_pointer_datagram_inbound();
                             }
-                            let mut smoothed = smooth_pointer_recovery(
-                                input,
-                                observation.gaps,
-                                observation.recovery_milliunits,
-                                pointer_recovery.len(),
-                            );
-                            if let Some(input) = smoothed.pop_front() {
-                                send_event(events, PeerEvent::PointerDatagram {
-                                    peer: admitted.clone(),
+                            if observation.gaps == 0
+                                && matches!(
+                                    input.payload,
+                                    kvm_protocol::WireInputPayloadV1::PointerMove { .. }
+                                )
+                            {
+                                // Happy path: hold the move for at most one
+                                // recovery tick so bursty datagram arrival is
+                                // released on an even cadence instead of
+                                // reproducing network jitter as cursor stutter.
+                                match pointer_fold.as_mut() {
+                                    Some(fold) => {
+                                        if let Some(flushed) = fold.fold(input) {
+                                            send_event(
+                                                events,
+                                                PeerEvent::PointerDatagram {
+                                                    peer: admitted.clone(),
+                                                    input: flushed,
+                                                },
+                                            )?;
+                                        }
+                                    }
+                                    None => pointer_fold = Some(PointerMoveFold::new(input)),
+                                }
+                            } else {
+                                let mut smoothed = smooth_pointer_recovery(
                                     input,
-                                })?;
+                                    observation.gaps,
+                                    observation.recovery_milliunits,
+                                    pointer_recovery.len(),
+                                );
+                                if let Some(input) = smoothed.pop_front() {
+                                    send_event(events, PeerEvent::PointerDatagram {
+                                        peer: admitted.clone(),
+                                        input,
+                                    })?;
+                                }
+                                pointer_recovery.extend(smoothed);
                             }
-                            pointer_recovery.extend(smoothed);
                         }
                         for message in observation.reliable_messages {
                             if let Some(stats) = stats {
@@ -1913,12 +1940,24 @@ async fn run_session_with_stats<S: SecurePeerStream, A: SessionAdmission>(
                     }
                 }
             }
-            _ = pointer_recovery_tick.tick(), if !pointer_recovery.is_empty() => {
+            _ = pointer_recovery_tick.tick(), if pointer_fold.is_some() || !pointer_recovery.is_empty() => {
                 if let Some(input) = pointer_recovery.pop_front() {
                     send_event(events, PeerEvent::PointerDatagram {
                         peer: admitted.clone(),
                         input,
                     })?;
+                } else if let Some(fold) = pointer_fold.as_mut() {
+                    if let Some(input) = fold.take() {
+                        send_event(events, PeerEvent::PointerDatagram {
+                            peer: admitted.clone(),
+                            input,
+                        })?;
+                    }
+                    let drained =
+                        fold.folded == 0 && fold.total_dx == 0.0 && fold.total_dy == 0.0;
+                    if drained {
+                        pointer_fold = None;
+                    }
                 }
             }
         }
@@ -2406,6 +2445,83 @@ fn route_outbound(
         }
     }
     enqueue(queue, message)
+}
+
+/// Folds consecutive happy-path pointer-move datagrams into a single
+/// combined move released on the recovery-tick cadence.
+///
+/// Datagram arrival times jitter with the network; injecting each datagram
+/// the instant it lands reproduces that jitter as visible cursor stutter on
+/// the controlled host. Holding each move for at most one tick (~2 ms) and
+/// releasing accumulated motion on a steady cadence evens out the motion at
+/// an imperceptible latency cost. Sustained bursts are bounded by
+/// [`PointerMoveFold::FOLD_LIMIT`], which forces an immediate flush so lag
+/// cannot accumulate without limit.
+struct PointerMoveFold {
+    template: kvm_protocol::InputEventV1,
+    total_dx: f64,
+    total_dy: f64,
+    folded: usize,
+}
+
+impl PointerMoveFold {
+    /// Maximum datagrams held before an immediate forced flush bounds
+    /// worst-case added latency.
+    const FOLD_LIMIT: usize = 12;
+
+    fn new(input: kvm_protocol::InputEventV1) -> Self {
+        let mut fold = Self {
+            template: input,
+            total_dx: 0.0,
+            total_dy: 0.0,
+            folded: 1,
+        };
+        // Seed the window with this move's delta; the template keeps the
+        // move's metadata but never replays its payload directly.
+        if let kvm_protocol::WireInputPayloadV1::PointerMove { dx, dy } = std::mem::replace(
+            &mut fold.template.payload,
+            kvm_protocol::WireInputPayloadV1::PointerMove { dx: 0.0, dy: 0.0 },
+        ) {
+            fold.total_dx = dx;
+            fold.total_dy = dy;
+        }
+        fold
+    }
+
+    /// Folds one move into the buffer. Returns `Some` only when the buffer
+    /// overflows: the accumulated motion is flushed immediately and this
+    /// input opens the next window.
+    fn fold(&mut self, input: kvm_protocol::InputEventV1) -> Option<kvm_protocol::InputEventV1> {
+        if let kvm_protocol::WireInputPayloadV1::PointerMove { dx, dy } = input.payload {
+            self.total_dx += dx;
+            self.total_dy += dy;
+        }
+        self.template.sequence = input.sequence;
+        self.template.timestamp_ns = input.timestamp_ns;
+        self.folded += 1;
+        if self.folded > Self::FOLD_LIMIT {
+            let flushed = self.take();
+            *self = Self::new(input);
+            flushed
+        } else {
+            None
+        }
+    }
+
+    /// Takes the accumulated motion as one combined move, leaving the buffer
+    /// empty and ready for the next window.
+    fn take(&mut self) -> Option<kvm_protocol::InputEventV1> {
+        let payload = kvm_protocol::WireInputPayloadV1::PointerMove {
+            dx: std::mem::take(&mut self.total_dx),
+            dy: std::mem::take(&mut self.total_dy),
+        };
+        let folded = std::mem::take(&mut self.folded);
+        (folded > 0).then(|| {
+            let mut event = self.template.clone();
+            event.payload = payload;
+            event
+        })
+    }
 }
 
 fn smooth_pointer_recovery(
@@ -5273,5 +5389,96 @@ mod tests {
 
         shutdown_sender.send(true).unwrap();
         assert_eq!(task.await.unwrap().unwrap(), PersistentExit::Shutdown);
+    }
+}
+
+#[cfg(test)]
+mod pointer_fold_tests {
+    #![allow(clippy::float_cmp, clippy::cast_precision_loss)]
+
+    use super::*;
+    use kvm_protocol::{WireDeviceId, WireHostId, WireInputPayloadV1};
+
+    fn move_event(sequence: u64, dx: f64, dy: f64) -> kvm_protocol::InputEventV1 {
+        kvm_protocol::InputEventV1 {
+            sequence,
+            timestamp_ns: sequence * 1_000_000,
+            source_host: WireHostId([1; 16]),
+            source_device: WireDeviceId([2; 16]),
+            payload: WireInputPayloadV1::PointerMove { dx, dy },
+        }
+    }
+
+    #[test]
+    fn fold_sums_deltas_and_keeps_latest_metadata() {
+        let mut fold = PointerMoveFold::new(move_event(1, 3.0, -1.5));
+        fold.fold(move_event(2, 0.25, 0.75));
+        fold.fold(move_event(3, -2.0, 4.0));
+        let combined = fold.take().expect("folded moves must combine");
+        match combined.payload {
+            WireInputPayloadV1::PointerMove { dx, dy } => {
+                assert_eq!(dx, 1.25);
+                assert_eq!(dy, 3.25);
+            }
+            other => panic!("unexpected payload {other:?}"),
+        }
+        assert_eq!(combined.sequence, 3);
+        assert_eq!(combined.timestamp_ns, 3_000_000);
+        assert_eq!(combined.source_host, move_event(0, 0.0, 0.0).source_host);
+    }
+
+    #[test]
+    fn take_resets_the_window() {
+        let mut fold = PointerMoveFold::new(move_event(1, 5.0, 5.0));
+        assert!(fold.take().is_some());
+        assert!(fold.take().is_none());
+        fold.fold(move_event(2, 1.0, 1.0));
+        let next = fold.take().expect("next window must combine independently");
+        assert_eq!(
+            next.payload,
+            WireInputPayloadV1::PointerMove { dx: 1.0, dy: 1.0 }
+        );
+    }
+
+    #[test]
+    fn overflow_flushes_accumulated_motion_immediately() {
+        let mut fold = PointerMoveFold::new(move_event(0, 10.0, 10.0));
+        // The seed plus FOLD_LIMIT-1 folds stay buffered.
+        for sequence in 1..PointerMoveFold::FOLD_LIMIT {
+            assert!(
+                fold.fold(move_event(u64::try_from(sequence).unwrap(), 1.0, 1.0))
+                    .is_none(),
+                "folding within the limit must not flush"
+            );
+        }
+        // The datagram that would exceed the limit forces an immediate flush
+        // of the accumulated motion, then opens the next window itself.
+        let flushed = fold
+            .fold(move_event(
+                u64::try_from(PointerMoveFold::FOLD_LIMIT).unwrap(),
+                1.0,
+                1.0,
+            ))
+            .expect("overflow must flush the previous window");
+        // The flushed window includes every fold plus the overflowing input.
+        let total = 10.0 + f64::from(u32::try_from(PointerMoveFold::FOLD_LIMIT).unwrap());
+        assert_eq!(
+            flushed.payload,
+            WireInputPayloadV1::PointerMove {
+                dx: total,
+                dy: total
+            }
+        );
+        assert_eq!(
+            flushed.sequence,
+            u64::try_from(PointerMoveFold::FOLD_LIMIT).unwrap()
+        );
+        let next = fold
+            .take()
+            .expect("overflowing input opens the next window");
+        assert_eq!(
+            next.payload,
+            WireInputPayloadV1::PointerMove { dx: 1.0, dy: 1.0 }
+        );
     }
 }
