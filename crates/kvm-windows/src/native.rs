@@ -72,7 +72,7 @@ use crate::capture::{
 };
 use crate::identity::{container_scoped_raw_input_identity, usb_ids_from_device_path};
 use crate::mapping::{
-    key_record_for_macos_source, mouse_action, MouseAction, ModifierRoleMapping, WHEEL_DELTA,
+    key_record_for_macos_source, mouse_action, ModifierRoleMapping, MouseAction, WHEEL_DELTA,
 };
 use crate::ownership::{ClaimError, RegistrationState};
 use crate::{

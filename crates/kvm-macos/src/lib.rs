@@ -82,9 +82,12 @@ pub struct CaptureStatistics {
     pub transition_discontinuities: u64,
     /// Sessions terminated because the delivery worker disconnected.
     pub delivery_disconnects: u64,
-    /// Suppression requests ignored in observation mode or for non-physical input.
+    /// Suppression requests ignored in observation mode or for KVM-tagged
+    /// injection (which must pass through to avoid a feedback loop).
     pub ignored_suppression_requests: u64,
-    /// Physical Quartz events synchronously suppressed by whole-host alpha.
+    /// Quartz events synchronously suppressed by whole-host alpha (every
+    /// non-KVM-tagged event, including trackpad input that classifies
+    /// `Unknown` because it lacks the HID-system source state).
     pub suppressed_events: u64,
     /// Quartz records whose supported fields could not be translated.
     pub untranslated_events: u64,

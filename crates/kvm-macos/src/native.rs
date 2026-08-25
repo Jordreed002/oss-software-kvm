@@ -86,6 +86,12 @@ const CAPTURE_STARTUP_TIMEOUT: Duration = Duration::from_secs(5);
 const CAPTURE_STOP_TIMEOUT: Duration = Duration::from_secs(2);
 const POINTER_BURST_RESYNC: Duration = Duration::from_millis(100);
 const POINTER_ACTIVE_RESYNC: Duration = Duration::from_millis(32);
+/// How often the posted-destination clamp re-reads the display topology.
+/// Display changes are rare and hot-plug events also trigger daemon-level
+/// refreshes, so a slow cadence bounds staleness without per-event syscalls.
+const DESKTOP_BOUNDS_REFRESH: Duration = Duration::from_secs(2);
+/// Upper bound on displays considered for the destination clamp.
+const MAX_CLAMPED_DISPLAYS: usize = 8;
 static WHOLE_HOST_CAPTURE_OWNED: AtomicBool = AtomicBool::new(false);
 
 #[repr(C)]
@@ -1026,6 +1032,16 @@ pub struct MacOutputBackend {
     last_pointer_resync: Option<Instant>,
     horizontal_scroll_remainder: f64,
     vertical_scroll_remainder: f64,
+    /// Sub-pixel motion carried between moves so rounding each posted
+    /// destination to integral pixels loses no accumulated travel.
+    move_remainder_x: f64,
+    move_remainder_y: f64,
+    /// Union of active display bounds as `(min_x, min_y, max_x, max_y)`.
+    /// Posted destinations are clamped into it so edge overshoot lands on
+    /// the exact screen row instead of out-of-bounds coordinates that
+    /// `WindowServer` renders unpredictably (breaking `Dock` reveal).
+    desktop_bounds: Option<(f64, f64, f64, f64)>,
+    bounds_refreshed_at: Option<Instant>,
 }
 
 impl std::fmt::Debug for MacOutputBackend {
@@ -1051,6 +1067,10 @@ impl MacOutputBackend {
             last_pointer_resync: None,
             horizontal_scroll_remainder: 0.0,
             vertical_scroll_remainder: 0.0,
+            move_remainder_x: 0.0,
+            move_remainder_y: 0.0,
+            desktop_bounds: None,
+            bounds_refreshed_at: None,
         }
     }
 
@@ -1071,6 +1091,10 @@ impl MacOutputBackend {
             last_pointer_resync: None,
             horizontal_scroll_remainder: 0.0,
             vertical_scroll_remainder: 0.0,
+            move_remainder_x: 0.0,
+            move_remainder_y: 0.0,
+            desktop_bounds: None,
+            bounds_refreshed_at: None,
         }
     }
 
@@ -1090,6 +1114,10 @@ impl MacOutputBackend {
             last_pointer_resync: None,
             horizontal_scroll_remainder: 0.0,
             vertical_scroll_remainder: 0.0,
+            move_remainder_x: 0.0,
+            move_remainder_y: 0.0,
+            desktop_bounds: None,
+            bounds_refreshed_at: None,
         }
     }
 
@@ -1113,6 +1141,52 @@ impl MacOutputBackend {
 
     fn pointer_event_location(&mut self, now: Instant) -> Result<CGPoint, MacBackendError> {
         self.pointer_base(now)
+    }
+
+    /// Rounds a raw travel total to integral pixels, carrying the sub-pixel
+    /// remainder so repeated small deltas still reach their exact target.
+    /// Posted destinations must be integral: Quartz rounds fractional
+    /// coordinates independently per event, which splits the two clicks of
+    /// a double-click onto neighbouring pixels.
+    fn integral_destination(&mut self, total_x: f64, total_y: f64) -> CGPoint {
+        let x = total_x.round();
+        let y = total_y.round();
+        self.move_remainder_x = total_x - x;
+        self.move_remainder_y = total_y - y;
+        CGPoint { x, y }
+    }
+
+    /// Clamps a posted destination into the union of the active displays,
+    /// refreshing the cached bounds on a slow cadence. Overshoot past a
+    /// screen edge lands on the exact edge row — what the Dock's reveal
+    /// zone needs — instead of out-of-bounds coordinates. Returns the
+    /// clamped point; when clamping occurred, sub-pixel remainders carried
+    /// toward the blocked axis are discarded so they cannot accumulate
+    /// pressure that later distorts motion away from the edge.
+    fn desktop_clamped(&mut self, now: Instant, mut point: CGPoint) -> CGPoint {
+        let stale = self
+            .bounds_refreshed_at
+            .is_none_or(|at| now.saturating_duration_since(at) > DESKTOP_BOUNDS_REFRESH);
+        if stale {
+            self.desktop_bounds = active_display_bounds();
+            self.bounds_refreshed_at = Some(now);
+        }
+        let Some((min_x, min_y, max_x, max_y)) = self.desktop_bounds else {
+            return point;
+        };
+        // Exact bounds checks: the question is whether clamping moved the
+        // point, not whether two computed floats are "equal".
+        let blocked_x = point.x < min_x || point.x > max_x;
+        let blocked_y = point.y < min_y || point.y > max_y;
+        point.x = point.x.clamp(min_x, max_x);
+        point.y = point.y.clamp(min_y, max_y);
+        if blocked_x {
+            self.move_remainder_x = 0.0;
+        }
+        if blocked_y {
+            self.move_remainder_y = 0.0;
+        }
+        point
     }
 
     fn ensure_accessibility() -> Result<(), MacBackendError> {
@@ -1166,10 +1240,16 @@ impl MacOutputBackend {
             InputPayload::PointerMove { dx, dy } => {
                 let now = Instant::now();
                 let location = self.pointer_base(now)?;
-                let destination = CGPoint {
-                    x: location.x + dx,
-                    y: location.y + dy,
-                };
+                // Round to integral pixels, carrying sub-pixel travel in the
+                // remainders: posting fractional coordinates makes Quartz
+                // round each event independently, so two clicks of a
+                // double-click can land on neighbouring pixels and no longer
+                // register as a double-click.
+                let destination = self.integral_destination(
+                    location.x + dx + self.move_remainder_x,
+                    location.y + dy + self.move_remainder_y,
+                );
+                let destination = self.desktop_clamped(now, destination);
                 if !destination.x.is_finite() || !destination.y.is_finite() {
                     return Err(MacBackendError::UnsupportedInput(
                         "pointer destination is outside finite coordinate space",
@@ -1521,6 +1601,16 @@ extern "C" fn quartz_event_tap_callback(
     }
 }
 
+/// Whether a `SuppressLocal` disposition from the routing callback may be
+/// honored for an event of this classification while whole-host capture is
+/// active. Everything except this daemon's own tagged injection is treated
+/// as local physical input: built-in trackpads do not use the HID-system
+/// source state, so their events classify [`EventClassification::Unknown`]
+/// and must still be suppressed for one visible destination.
+const fn whole_host_suppression_applies(classification: EventClassification, active: bool) -> bool {
+    !matches!(classification, EventClassification::InjectedByKvm) && active
+}
+
 fn terminally_deactivate_whole_host(context: &WholeHostCallbackContext) {
     context.active.store(false, Ordering::Release);
     // SAFETY: The run loop remains live for the complete callback lifetime.
@@ -1646,9 +1736,14 @@ fn dispatch_quartz_event(
         context.counters.set_health(CaptureHealth::CallbackOverran);
         terminally_deactivate_whole_host(context);
     }
+    // Whole-host control promises one visible destination: every event the
+    // tap intercepts is suppressed unless it is this daemon's own tagged
+    // injection. Physical HID-state events and Unknown-classified events
+    // (built-in trackpads do not use the HID-system source state, so their
+    // moves classify as Unknown) are both local physical input; only
+    // KVM-tagged injection must pass through to avoid a feedback loop.
     if disposition == CaptureDisposition::SuppressLocal
-        && classification == EventClassification::Physical
-        && context.active.load(Ordering::Acquire)
+        && whole_host_suppression_applies(classification, context.active.load(Ordering::Acquire))
     {
         context
             .counters
@@ -2249,6 +2344,56 @@ fn current_pointer_location() -> Result<CGPoint, MacBackendError> {
     Ok(unsafe { CGEventGetLocation(event.0.cast_mut()) })
 }
 
+/// Union bounds of every active display as `(min_x, min_y, max_x, max_y)`.
+/// Returns `None` when Quartz reports no displays rather than guessing a
+/// clamp region. Coordinates are global logical pixels (primary display
+/// origin at top-left, y increasing downward).
+fn active_display_bounds() -> Option<(f64, f64, f64, f64)> {
+    let mut displays = [0_u32; MAX_CLAMPED_DISPLAYS];
+    let mut count = 0_u32;
+    // SAFETY: `displays` holds room for MAX_CLAMPED_DISPLAYS ids and `count`
+    // is written by the call.
+    let status = unsafe {
+        CGGetActiveDisplayList(
+            displays.len().try_into().ok()?,
+            displays.as_mut_ptr(),
+            &raw mut count,
+        )
+    };
+    if status != 0 || count == 0 {
+        return None;
+    }
+    let mut bounds: Option<(f64, f64, f64, f64)> = None;
+    for &display in &displays[..count as usize] {
+        // SAFETY: `display` came from the active list above.
+        let frame = unsafe { CGDisplayBounds(display) };
+        let (left, top) = (frame.origin.x, frame.origin.y);
+        let (right, bottom) = (
+            frame.origin.x + frame.size.width,
+            frame.origin.y + frame.size.height,
+        );
+        if !(left.is_finite()
+            && top.is_finite()
+            && right.is_finite()
+            && bottom.is_finite()
+            && right > left
+            && bottom > top)
+        {
+            continue;
+        }
+        bounds = Some(match bounds {
+            None => (left, top, right, bottom),
+            Some((min_x, min_y, max_x, max_y)) => (
+                min_x.min(left),
+                min_y.min(top),
+                max_x.max(right),
+                max_y.max(bottom),
+            ),
+        });
+    }
+    bounds
+}
+
 fn post_owned_event(event: CGEventRef, operation: &'static str) -> Result<(), MacBackendError> {
     let event = OwnedCF::new(event.cast(), operation)?;
     // SAFETY: The event is live. User-data is a signed 64-bit field intended for
@@ -2426,6 +2571,73 @@ mod tests {
             button_event(PointerButton::Other(9), ButtonState::Released),
             (CG_EVENT_OTHER_MOUSE_UP, 9)
         );
+    }
+
+    #[test]
+    fn trackpad_unknown_events_are_suppressible_but_kvm_tags_are_not() {
+        // Built-in trackpad input classifies Unknown and must be suppressed:
+        // it is physical local movement even without the HID-system state.
+        assert!(whole_host_suppression_applies(
+            EventClassification::Unknown,
+            true
+        ));
+        assert!(whole_host_suppression_applies(
+            EventClassification::Physical,
+            true
+        ));
+        // The daemon's own tagged injection must pass through untouched.
+        assert!(!whole_host_suppression_applies(
+            EventClassification::InjectedByKvm,
+            true
+        ));
+        // An inactive tap never suppresses regardless of classification.
+        assert!(!whole_host_suppression_applies(
+            EventClassification::Unknown,
+            false
+        ));
+        assert!(!whole_host_suppression_applies(
+            EventClassification::InjectedByKvm,
+            false
+        ));
+    }
+
+    #[test]
+    #[allow(clippy::float_cmp)]
+    fn integral_destinations_carry_sub_pixel_travel() {
+        let mut backend = MacOutputBackend::new();
+        // Mirrors the move path: base position + delta + carried remainder.
+        let first = backend.integral_destination(0.0 + 0.4, 5.0 - 0.3);
+        assert_eq!((first.x, first.y), (0.0, 5.0));
+        // The carried 0.4 / -0.3 make these small steps cross pixel lines.
+        let second = backend.integral_destination(
+            first.x + 0.4 + backend.move_remainder_x,
+            first.y - 0.4 + backend.move_remainder_y,
+        );
+        assert_eq!((second.x, second.y), (1.0, 4.0));
+        assert!((backend.move_remainder_x - (-0.2)).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    #[allow(clippy::float_cmp)]
+    fn desktop_clamp_lands_overshoot_on_the_edge_row() {
+        let mut backend = MacOutputBackend::new();
+        backend.desktop_bounds = Some((0.0, 0.0, 1920.0, 1080.0));
+        backend.bounds_refreshed_at = Some(Instant::now());
+        let clamped = backend.desktop_clamped(
+            Instant::now(),
+            CGPoint {
+                x: 960.0,
+                y: 1085.0,
+            },
+        );
+        // The Dock's reveal zone needs the cursor on the exact bottom row.
+        assert_eq!(clamped.y, 1080.0);
+        assert_eq!(clamped.x, 960.0);
+        // Travel blocked by the edge must not distort later motion.
+        assert_eq!(backend.move_remainder_y, 0.0);
+        let inside = backend.desktop_clamped(Instant::now(), CGPoint { x: -3.0, y: 12.0 });
+        assert_eq!(inside.x, 0.0);
+        assert_eq!(inside.y, 12.0);
     }
 
     #[test]

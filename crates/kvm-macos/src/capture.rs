@@ -105,15 +105,21 @@ pub const fn classify_quartz_user_data(user_data: i64) -> EventClassification {
 ///
 /// # F-09: known misclassification vectors (accepted, documented)
 ///
-/// This classification is a heuristic over unauthenticated Quartz metadata, so
-/// two false-positive directions exist and are deliberately accepted:
+/// This classification is a heuristic over unauthenticated Quartz metadata.
+/// Whole-host suppression treats every class except [`InjectedByKvm`] as
+/// suppressible local input — built-in trackpads do not use the HID-system
+/// source state, so their events classify `Unknown` and must still be
+/// suppressed for the "one visible destination" invariant to hold. Two
+/// false-positive directions exist and are deliberately accepted:
 ///
 /// 1. *Injected-as-physical.* Another Accessibility-privileged process (a rival
 ///    KVM/synergy tool, an assistive switch, a macro driver) that posts events
 ///    via the HID-system event source at `kCGHIDEventTap` produces
 ///    `source_state_id == HID_SYSTEM` and is classified `Physical`. When this
-///    host is the non-active side of the workspace, such an event could be
-///    suppressed instead of passed through.
+///    host is the non-active side of the workspace, such an event is
+///    suppressed instead of passed through. Private-session synthetic events
+///    (classified `Unknown`) are likewise suppressed during whole-host
+///    control.
 /// 2. *Spoofed KVM tag.* A privileged process can set `kCGEventSourceUserData`
 ///    to `KVM_EVENT_TAG` and be classified `InjectedByKvm`, which suppression
 ///    ignores.

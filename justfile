@@ -50,6 +50,16 @@ deny:
 doc:
     RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --document-private-items
 
+# Build the release runtime and (re)start the dev stack once.
+# Equivalent: scripts/dev.sh
+dev:
+    scripts/dev.sh
+
+# Hot-reload: watch workspace crates, rebuild + restart on change.
+# Equivalent: scripts/dev.sh watch
+dev-watch:
+    scripts/dev.sh watch
+
 # Sign the kvm-runtime dev binaries with a stable local identity so macOS TCC
 # grants (Accessibility, Input Monitoring) survive rebuilds. Unsigned dev
 # binaries are ad-hoc signed; every rebuild changes the signature and macOS
