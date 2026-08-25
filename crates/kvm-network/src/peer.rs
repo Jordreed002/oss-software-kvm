@@ -1699,7 +1699,7 @@ async fn run_session_with_stats<S: SecurePeerStream, A: SessionAdmission>(
         };
     let mut pointer_probe_tick = tokio::time::interval(Duration::from_secs(1));
     pointer_probe_tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
-    let mut pointer_flush_tick = tokio::time::interval(Duration::from_millis(4));
+    let mut pointer_flush_tick = tokio::time::interval(Duration::from_millis(2));
     pointer_flush_tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
     let mut pointer_recovery_tick = tokio::time::interval(Duration::from_millis(2));
     pointer_recovery_tick.set_missed_tick_behavior(MissedTickBehavior::Skip);

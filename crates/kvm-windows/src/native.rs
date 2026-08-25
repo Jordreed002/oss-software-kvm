@@ -41,8 +41,8 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
     SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, INPUT_MOUSE, KEYBDINPUT, KEYEVENTF_EXTENDEDKEY,
     KEYEVENTF_KEYUP, KEYEVENTF_SCANCODE, MOUSEEVENTF_HWHEEL, MOUSEEVENTF_LEFTDOWN,
     MOUSEEVENTF_LEFTUP, MOUSEEVENTF_MIDDLEDOWN, MOUSEEVENTF_MIDDLEUP, MOUSEEVENTF_MOVE,
-    MOUSEEVENTF_MOVE_NOCOALESCE, MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP, MOUSEEVENTF_WHEEL,
-    MOUSEEVENTF_XDOWN, MOUSEEVENTF_XUP, MOUSEINPUT, VIRTUAL_KEY,
+    MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP, MOUSEEVENTF_WHEEL, MOUSEEVENTF_XDOWN,
+    MOUSEEVENTF_XUP, MOUSEINPUT, VIRTUAL_KEY,
 };
 use windows::Win32::UI::Input::{
     GetRawInputData, GetRawInputDeviceInfoW, GetRawInputDeviceList, RegisterRawInputDevices,
@@ -1221,12 +1221,12 @@ impl WindowsOutputBackend {
                 if x == 0 && y == 0 {
                     return Ok(());
                 }
-                send_inputs(&[mouse_input(
-                    x,
-                    y,
-                    0,
-                    MOUSEEVENTF_MOVE | MOUSEEVENTF_MOVE_NOCOALESCE,
-                )])
+                // Plain `MOUSEEVENTF_MOVE` (no `MOVE_NOCOALESCE`) lets the
+                // OS mouse thread coalesce backlogged micro-moves into fewer
+                // WM_MOUSEMOVE deliveries; the cursor still lands on the
+                // exact accumulated offset, but a busy injection pipeline
+                // smooths instead of stuttering.
+                send_inputs(&[mouse_input(x, y, 0, MOUSEEVENTF_MOVE)])
             }
             InputPayload::PointerButton { button, state } => {
                 let action = mouse_action(button, state).ok_or_else(|| {

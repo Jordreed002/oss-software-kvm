@@ -49,13 +49,14 @@ const POINTER_FLAG_REBASE: u8 = 0x01;
 // a pixel-scale addend is at risk of rounding away, so senders rebase.
 const POINTER_TOTALS_REBASE_THRESHOLD: f64 = 1_099_511_627_776.0;
 const MAX_TRACKED_DEVICES: usize = 64;
-/// Baseline pacing interval before any feedback has been observed. Once the
-/// adaptive controller engages, the interval moves within
-/// [`PACING_INTERVAL_MIN`]..=[`PACING_INTERVAL_MAX`].
-const POINTER_PACING_INTERVAL: Duration = Duration::from_millis(4);
-/// Fastest pacing the adaptive controller may select. Reachable only after
-/// at least one feedback episode followed by a sustained feedback-free
-/// window; a link that never reported a gap stays at the 4 ms baseline.
+/// Baseline pacing interval before any feedback has been observed. Matches
+/// the receiving session's 2 ms pointer-release tick so the fold buffer is
+/// fed at the finest cadence it can drain. Once the adaptive controller
+/// engages, the interval moves within [`PACING_INTERVAL_MIN`]
+/// ..=[`PACING_INTERVAL_MAX`].
+const POINTER_PACING_INTERVAL: Duration = Duration::from_millis(2);
+/// Fastest pacing the adaptive controller may select. Equal to the baseline:
+/// a healthy link paces as fast as the release cadence allows.
 const PACING_INTERVAL_MIN: Duration = Duration::from_millis(2);
 /// Slowest pacing the adaptive controller may select under worst-case loss.
 const PACING_INTERVAL_MAX: Duration = Duration::from_millis(16);
@@ -139,7 +140,7 @@ struct PendingReliable {
 /// feedback storms: the receiver's gap reports arriving close together.
 /// Relaxation (fewer copies, shorter interval) requires a sustained feedback
 /// silence, and only engages once at least one gap report has been observed —
-/// before that the path keeps the fixed no-evidence baseline (4 ms pacing,
+/// before that the path keeps the fixed no-evidence baseline (2 ms pacing,
 /// no redundancy), exactly matching the pre-adaptive behavior on a loss-free
 /// link. Oscillation is prevented by construction:
 ///
@@ -465,7 +466,7 @@ impl PointerDatagramPath {
 
     pub(crate) fn flush_pending(&mut self) -> io::Result<usize> {
         // The flush tick is the controller's relaxation heartbeat: it fires
-        // on the session's 4 ms cadence whether or not anything is pending,
+        // on the session's 2 ms cadence whether or not anything is pending,
         // so a feedback-free window relaxes pacing even on an idle path.
         self.pacing.refresh(self.started_at.elapsed());
         if !self.ready || self.pending.is_empty() {
@@ -473,7 +474,7 @@ impl PointerDatagramPath {
         }
         // The escalated pacing interval must govern the wire, not just the
         // event-driven path in `try_send_pointer`: without this gate the
-        // 4 ms flush tick drains `pending` regardless of the controller's
+        // 2 ms flush tick drains `pending` regardless of the controller's
         // decision and the 8/16 ms degraded states never materialize.
         // Pending stays queued for the next eligible tick.
         if self
@@ -1604,7 +1605,7 @@ mod tests {
         pacing.note_feedback(Duration::from_millis(5));
         pacing.note_feedback(Duration::from_millis(10));
         assert_eq!(pacing.redundancy_budget, REDUNDANCY_BUDGET_MIN);
-        assert_eq!(pacing.pacing_interval(), Duration::from_millis(8));
+        assert_eq!(pacing.pacing_interval(), Duration::from_millis(4));
     }
 
     #[test]
@@ -1680,17 +1681,17 @@ mod tests {
         let mut pacing = AdaptivePacing::new();
         pacing.note_feedback(Duration::from_millis(5));
         pacing.note_feedback(Duration::from_millis(10));
-        assert_eq!(pacing.pacing_interval(), Duration::from_millis(8));
+        assert_eq!(pacing.pacing_interval(), Duration::from_millis(4));
 
         // One feedback after the quiet gap is not enough to re-escalate.
         pacing.note_feedback(Duration::from_millis(500));
-        assert_eq!(pacing.pacing_interval(), Duration::from_millis(8));
+        assert_eq!(pacing.pacing_interval(), Duration::from_millis(4));
         assert_eq!(pacing.redundancy_budget, REDUNDANCY_BUDGET_MIN);
 
         // A second feedback inside the storm window escalates one level.
         pacing.note_feedback(Duration::from_millis(520));
         assert_eq!(pacing.redundancy_budget, 4);
-        assert_eq!(pacing.pacing_interval(), Duration::from_millis(16));
+        assert_eq!(pacing.pacing_interval(), Duration::from_millis(8));
     }
 
     #[test]
@@ -1775,7 +1776,7 @@ mod tests {
         recv(&mut a).await;
 
         assert_eq!(a.pacing.redundancy_budget, REDUNDANCY_BUDGET_MIN);
-        assert_eq!(a.pacing.pacing_interval(), Duration::from_millis(8));
+        assert_eq!(a.pacing.pacing_interval(), Duration::from_millis(4));
 
         // The escalation's redundant copies are actually spent on the wire,
         // and the escalated interval genuinely gates the flush: only an
