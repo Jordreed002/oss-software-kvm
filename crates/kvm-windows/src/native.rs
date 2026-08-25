@@ -71,7 +71,9 @@ use crate::capture::{
     LOW_LEVEL_KEY_UP, LOW_LEVEL_MOUSE_INJECTED,
 };
 use crate::identity::{container_scoped_raw_input_identity, usb_ids_from_device_path};
-use crate::mapping::{key_record_for_macos_source, mouse_action, ModifierRoleMapping, WHEEL_DELTA};
+use crate::mapping::{
+    key_record_for_macos_source, mouse_action, MouseAction, ModifierRoleMapping, WHEEL_DELTA,
+};
 use crate::ownership::{ClaimError, RegistrationState};
 use crate::{
     derive_device_id, CapabilityState, CaptureStatistics, SuppressionScope, WindowsBackendError,
