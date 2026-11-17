@@ -1,0 +1,10 @@
+[package]
+name = "kvm-agent-model"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Pure lifecycle model for the rebuilt per-user KVM agent"
+
+[lints]
+workspace = true

@@ -690,6 +690,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "kvm-agent-model"
+version = "0.1.0"
+
+[[package]]
 name = "kvm-clipboard"
 version = "0.1.0"
 dependencies = [
