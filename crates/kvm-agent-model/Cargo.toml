@@ -8,3 +8,7 @@ description = "Pure lifecycle model for the rebuilt per-user KVM agent"
 
 [lints]
 workspace = true
+
+[[bench]]
+name = "lifecycle"
+harness = false
