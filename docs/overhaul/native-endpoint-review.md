@@ -4,6 +4,10 @@ These endpoints are prototypes. Do not expose mutating commands until the remain
 
 ## Windows review and corrections
 
+Follow-up Opus review of `6ccda8d` accepted the account/session checks for read-only status integration. It did not accept mutating commands or claim process-signature, elevation, Low-IL or second-user acceptance. Coordinator subsequently normalized peer-verification failures to `PermissionDenied` while retaining the native error source, disconnected clients on listener-replacement failures, forced disconnect on listener Drop, and strengthened the PID-zero error test. A new slow-reader regression proves that an owner waiting for client EOF preserves the final reply before forced disconnect. This is a required owner protocol pattern, not an automatic guarantee supplied by writing a frame.
+
+Current coordinator Windows evidence after these corrections: fourteen IPC tests and strict all-target clippy pass. Rebind/backoff, logon-token policy, integrity read-back and physical/elevated-client evidence remain outstanding. The reviewed read-only route must impose per-connection deadlines and finite lifetime and must represent lost replies as unknown.
+
 Opus reviewed `windows.rs` at `dcd1466` and local Tokio/mio implementation details. It accepted FFI lifetimes/alignment, token/SID/descriptor ownership, the protected user/SYSTEM DACL and fail-closed first-instance collision behavior for the stated prototype. No additional native tests were run by that review.
 
 Coordinator corrections after review:
