@@ -19,7 +19,9 @@
 //!   injection succeeded anywhere.
 
 pub mod event;
+pub mod held;
 pub mod queue;
 
 pub use event::{DeviceId, EventKind, InputEvent, KeyCode, PointerButton, Timestamp, Transition};
+pub use held::{HeldControl, HeldError, HeldSet};
 pub use queue::RingFifo;
