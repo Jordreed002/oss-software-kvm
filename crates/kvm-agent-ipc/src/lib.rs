@@ -10,6 +10,9 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 #[cfg(windows)]
 pub mod windows;
 
+#[cfg(unix)]
+pub mod unix;
+
 /// Framing failures never include payload contents.
 #[derive(Debug)]
 pub enum FrameError {
