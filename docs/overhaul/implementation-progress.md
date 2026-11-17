@@ -2,6 +2,20 @@
 
 Evidence checkpoint: 2026-11-17. This ledger records delivered work and acceptance evidence. It does not estimate completion percentages or close physical gates from software checks.
 
+## Current superseding checkpoint at eefc899, 2026-11-17
+
+This note governs current status where earlier checkpoints differ. Those checkpoints preserve the evidence and pending work at their recorded revisions. The full rebuild remains incomplete, and software checks and source inspection close no physical acceptance gate.
+
+Opus delivered the UI redesign in `3651210`, changing only `AgentUtility.tsx`, `agent.css` and `AgentUtility.test.tsx`. Root passed TypeScript checking, all 122 frontend tests and the production build. Native Windows observation confirmed the connected redesigned view, unknown input authority, readiness at 0 of 6 and disabled controls. The view fit the native window without scrolling. Earlier statements that the UI had never been observed are historical, superseded only by the connected baseline and redesigned render evidence. Unavailable-state behavior, recovery and tray reopening remain unverified. Refresh after stopping the agent was not executed.
+
+The user reported a yellow monitor border, likely the Windows capture-tool indicator. Root stopped screenshot inspection, reset the Node capture kernel and stopped its owned Vite, utility, agent and inspection-helper processes. Screenshot inspection and native GUI tools remain stopped. This documentation update resumes neither. No KVM capture or sharing was enabled by the UI validation.
+
+Benchmark commit `4c392ec` accepts the Opus-reviewed corrections. Documentation commit `7a401f2` preserves the original `eb40c9b` dirty-run identity and measurement scope. This does not close a physical gate or accept numerical release budgets.
+
+Commit `eefc899` adds `docs/adr/0006-layout-and-edge-handoff.md`. GLM task `58e43242` owns the new `kvm-layout` implementation. Delivery and acceptance are still pending, and mandatory coordinator-owned Opus review must follow delivery. The ADR defines the implementation contract; it is not implementation or runtime proof.
+
+Windows is available now. Mac physical validation waits for later availability; earlier native Mac software evidence remains scoped to its recorded source. The separate identity-storage delegation remains cancelled and has not resumed. Native capture/injection, authenticated two-host sharing, installed lifecycle and physical performance/release acceptance remain open. This update uses read-only git inspection and supplied evidence, with no new tests, builds, app launches or GUI validation.
+
 ## Current acceptance checkpoint, 2026-11-17
 
 The benchmark review and its corrections are complete. Commit `4c392ec` accepts the bounded input microbenchmark implementation after coordinator-owned Opus review. The corrected optimized run and strict all-target clippy passed. Best-case occupancy and head-stage-only engine scope are labelled, short fault batches carry a timer-quantization caveat, and the wraparound assertion uses the total warmup-plus-sample count. The measurements documented below retain their original `eb40c9b` dirty-run identity; no physical gate or numerical release budget is accepted. The development utility remains accepted at `eb40c9b` with live desktop validation outstanding. Windows is available now; Mac physical validation waits for later availability.
