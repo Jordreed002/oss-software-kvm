@@ -1,6 +1,6 @@
 # Software KVM utility overhaul recommendation
 
-Status: proposed for user sign-off. Prepared 2026-11-17 after comparing independent Codex, Astra and Opus proposals. Base `code-review-remediation` at `9edb5ed`; planning branch `overhaul/widget-app-planning`. This document governs the recommendation where independent proposals disagree. Implementation has not begun.
+Status: implementation authorized by the user, 2026-11-17. Prepared after comparing independent Codex, Astra and Opus proposals, then revised for the requested ground-up Rust rebuild. Base `code-review-remediation` at `9edb5ed`; branch `overhaul/widget-app-planning`. This document governs the direction where independent proposals disagree. Initial implementation lanes are active; completed work and verification belong in `implementation-progress.md`.
 
 Scope revised by the user: rebuild the Rust application from the ground up, with selective reuse allowed. Performance is a primary architectural and release requirement. This direction supersedes the selective backend overhaul recommended in the original independent proposals. `rust-rebuild-strategy.md` defines the revised backend work and performance gates.
 
@@ -112,11 +112,11 @@ Start with signed manual releases. User-approved in-app updates follow only when
 
 No telemetry upload is proposed. Local logs rotate with a documented retention period. Redacted support bundles are user initiated. Release CI builds from locked inputs, verifies signatures, records checksums/provenance and includes licenses. Credentials for signing are unavailable to untrusted fork builds.
 
-## Approval requested
+## Implementation authority
 
 The user has requested a ground-up Rust rebuild with selective reuse and performance as a primary requirement. The revised implementation proposal combines that requirement with compact tray/menu-bar home, focused setup/settings, agent-owned durable state, explicit Quit stopping sharing, opt-in startup, optional plain-text clipboard, two-host LAN scope, Windows/macOS parity and user-approved updates after installed lifecycle validation.
 
-Visual variants, new Rust architecture, measured performance budgets and installed helper behavior return for phase-zero review before full implementation. Independently persistent invisible sharing, pinned widget, new platforms and multi-peer scope remain separate decisions. The requested Rust rebuild does not depend on proving the old architecture irreparable.
+The user has authorized proceeding with the plan and frequent commits. Visual variants, new Rust architecture, measured performance budgets and installed helper behavior are reviewable phase-zero checkpoints; continue independent authorized implementation while hardware evidence is pending. Independently persistent invisible sharing, pinned widget, new platforms and multi-peer scope remain separate decisions. The requested Rust rebuild does not depend on proving the old architecture irreparable.
 
 Before phase zero closes, supply or confirm the supported OS/CPU matrix, final product/application identifiers, available Windows/macOS test machines, and signing ownership/budget. These do not prevent approving the product direction or beginning the baseline/design spike.
 

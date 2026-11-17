@@ -1,6 +1,6 @@
 # Rust rebuild and performance strategy
 
-Status: scope updated to reflect the user's instructions on 2026-11-17. Planning only. This supersedes the original selective-backend-refactor recommendation. Both Windows 11 and macOS remain required platforms.
+Status: implementation authorized by the user on 2026-11-17. This supersedes the original selective-backend-refactor recommendation. Both Windows 11 and macOS remain required platforms. GLM handles routine implementation with Opus review; Opus owns UI; Sol handles routine implementation and evidence-based progress tracking. The coordinator integrates verified work in frequent commits.
 
 ## Required outcome
 
