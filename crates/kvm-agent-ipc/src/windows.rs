@@ -237,17 +237,23 @@ fn retryable_connect(error: &io::Error) -> bool {
 ///
 /// # Errors
 /// Returns identity/API errors immediately. Only missing or busy pipes are retried
-/// within the caller's timeout; expiration returns `TimedOut`.
+/// within the caller's timeout. Expiration after a missing endpoint returns
+/// `NotFound`; a busy endpoint or exhausted verification budget returns `TimedOut`.
 pub async fn connect(channel: &str, timeout: Duration) -> io::Result<NamedPipeClient> {
     let deadline = tokio::time::Instant::now()
         .checked_add(timeout)
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "timeout too large"))?;
     let identity = current_identity()?;
     let path = endpoint_name(channel, &identity)?;
+    let mut last_missing = false;
     loop {
         if tokio::time::Instant::now() >= deadline {
             return Err(io::Error::new(
-                io::ErrorKind::TimedOut,
+                if last_missing {
+                    io::ErrorKind::NotFound
+                } else {
+                    io::ErrorKind::TimedOut
+                },
                 "pipe connection timed out",
             ));
         }
@@ -263,6 +269,7 @@ pub async fn connect(channel: &str, timeout: Duration) -> io::Result<NamedPipeCl
                 return Ok(stream);
             }
             Err(error) if retryable_connect(&error) => {
+                last_missing = error.raw_os_error() == Some(ERROR_FILE_NOT_FOUND.cast_signed());
                 tokio::time::sleep_until(
                     deadline.min(tokio::time::Instant::now() + Duration::from_millis(5)),
                 )
@@ -547,7 +554,7 @@ mod tests {
                 .await
                 .unwrap_err()
                 .kind(),
-            io::ErrorKind::TimedOut
+            io::ErrorKind::NotFound
         );
         let delayed = async {
             tokio::time::sleep(Duration::from_millis(10)).await;
