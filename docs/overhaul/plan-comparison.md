@@ -2,6 +2,10 @@
 
 Prepared by the coordinating Codex agent on 2026-11-17. All three proposals were independently written against `9edb5ed` before comparison. This is a qualitative design assessment, not measured software performance or a vote by the three models. The consolidated recommendation is in `recommended-plan.md`.
 
+## Subsequent user scope decision
+
+The user subsequently requested a ground-up rebuild of the Rust application, allowing selective reuse, and made performance a primary requirement. This overrides the selective backend overhaul recommended by all three original proposals. The comparison below records the original assessment; its recommendations to retain or evolve existing Rust subsystems no longer define implementation scope. The updated `recommended-plan.md` and `rust-rebuild-strategy.md` govern the new work. The models have not re-reviewed the revised scope.
+
 ## Strengths and weaknesses
 
 | Proposal | Strongest contribution | Weakness or unresolved assumption | Consolidated decision |
