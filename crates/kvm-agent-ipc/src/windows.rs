@@ -101,7 +101,7 @@ fn current_sid() -> io::Result<String> {
 
 fn descriptor(sid: &str) -> io::Result<LocalBlock> {
     // sid comes only from ConvertSidToStringSidW, never from an external client.
-    let sddl: Vec<u16> = format!("D:P(A;;GA;;;SY)(A;;GA;;;{sid})")
+    let sddl: Vec<u16> = format!("O:{sid}D:P(A;;GA;;;SY)(A;;GA;;;{sid})S:(ML;;NWNR;;;ME)")
         .encode_utf16()
         .chain(Some(0))
         .collect();
@@ -128,6 +128,7 @@ pub struct UserPipe {
     path: String,
     sid: String,
     admission: std::sync::Arc<tokio::sync::Semaphore>,
+    poisoned: bool,
 }
 
 /// One accepted connection. Drop it before accepting another client.
@@ -135,6 +136,14 @@ pub struct UserPipe {
 pub struct UserConnection {
     stream: NamedPipeServer,
     _permit: tokio::sync::OwnedSemaphorePermit,
+}
+
+impl Drop for UserConnection {
+    fn drop(&mut self) {
+        // Force pending writes to fail. mio deliberately leaves writes alive
+        // on drop; without disconnect a nonreading client can pin an instance.
+        let _ = self.stream.disconnect();
+    }
 }
 
 impl UserConnection {
@@ -203,6 +212,7 @@ impl UserPipe {
             path,
             sid,
             admission: std::sync::Arc::new(tokio::sync::Semaphore::new(1)),
+            poisoned: false,
         })
     }
 
@@ -218,12 +228,22 @@ impl UserPipe {
     /// # Errors
     /// Returns `WouldBlock` while a connection is held. Other errors are terminal:
     /// close the listener rather than attempting to reuse a partially connected
-    /// server. The owner must enforce connection deadlines and command policy.
+    /// server. Cancelling this future poisons the listener, including during
+    /// connect. The owner must enforce connection deadlines and command policy.
     pub async fn accept(&mut self) -> io::Result<UserConnection> {
+        if self.poisoned {
+            return Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "listener must be recreated after cancellation or failure",
+            ));
+        }
         let permit =
             self.admission.clone().try_acquire_owned().map_err(|_| {
                 io::Error::new(io::ErrorKind::WouldBlock, "pipe client already active")
             })?;
+        // Set before awaiting: cancellation cannot accidentally reuse a
+        // connected client or half-completed replacement operation.
+        self.poisoned = true;
         self.server.connect().await?;
         // Tokio may defer closing a dropped overlapped pipe handle until its
         // cancellation completion is serviced. Keep the two-instance OS bound
@@ -245,6 +265,7 @@ impl UserPipe {
             }
         };
         let stream = mem::replace(&mut self.server, next);
+        self.poisoned = false;
         Ok(UserConnection {
             stream,
             _permit: permit,
@@ -256,6 +277,7 @@ impl UserPipe {
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use tokio::io::AsyncReadExt;
     use tokio::net::windows::named_pipe::ClientOptions;
     static NEXT: AtomicUsize = AtomicUsize::new(0);
     fn channel() -> String {
@@ -303,5 +325,50 @@ mod tests {
                 io::ErrorKind::InvalidInput
             );
         }
+    }
+
+    #[tokio::test]
+    async fn cancelled_accept_is_terminal() {
+        let mut server = UserPipe::bind(&channel()).unwrap();
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(5), server.accept())
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            server.accept().await.unwrap_err().kind(),
+            io::ErrorKind::BrokenPipe
+        );
+    }
+
+    #[tokio::test]
+    async fn nonreading_client_cannot_pin_retired_server() {
+        let mut server = UserPipe::bind(&channel()).unwrap();
+        let mut stalled = ClientOptions::new().open(server.path()).unwrap();
+        let mut first = server.accept().await.unwrap();
+        let payload = vec![0_u8; 65_536];
+        let _ = first.stream().try_write(&payload);
+        drop(first);
+        // Keep the original client's handle live while accepting a new one.
+        let mut next = ClientOptions::new().open(server.path()).unwrap();
+        let mut second = tokio::time::timeout(std::time::Duration::from_secs(1), server.accept())
+            .await
+            .unwrap()
+            .unwrap();
+        crate::write_frame(&mut next, b"ok", 8).await.unwrap();
+        let mut buffer = [0_u8; 8];
+        assert_eq!(
+            crate::read_frame(second.stream(), &mut buffer)
+                .await
+                .unwrap(),
+            Some(b"ok".as_slice())
+        );
+        let result = tokio::time::timeout(
+            std::time::Duration::from_millis(250),
+            stalled.read(&mut buffer),
+        )
+        .await
+        .unwrap();
+        assert!(matches!(result, Ok(0) | Err(_)));
     }
 }
