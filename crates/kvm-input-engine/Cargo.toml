@@ -12,3 +12,7 @@ kvm-foundation = { path = "../kvm-foundation" }
 
 [lints]
 workspace = true
+
+[[bench]]
+name = "input_path"
+harness = false
