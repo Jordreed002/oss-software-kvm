@@ -6,7 +6,7 @@ Evidence checkpoint: 2026-11-17. This ledger records delivered work and acceptan
 
 The user approved a ground-up Rust rebuild with selective reuse and performance as a primary requirement. ADR `docs/adr/0003-ground-up-rebuild.md` records the accepted direction and ownership. Acceptance supersedes older proposed/planning status text in the recommendation and strategy documents.
 
-Observed branch: `overhaul/widget-app-planning`. Inspected HEAD: `5b1688cbc95af3b23b25fbe5dde48236555def35`. Planning comparison base remains `code-review-remediation` at `9edb5ed`. Only this ledger and `performance-baseline.md` were dirty before this bounded tracking update. Their previous uncommitted evidence is retained below or in the baseline history. This task makes no commits or branch changes.
+Observed branch: `overhaul/widget-app-planning`. Current inspected HEAD: `b993c2d816b42cae7076545f57195dd59580074a`, which corrects the API bootstrap and safety-command contract. Planning comparison base remains `code-review-remediation` at `9edb5ed`. The earlier checkpoint inspected `5b1688cbc95af3b23b25fbe5dde48236555def35` and recorded only this ledger and `performance-baseline.md` as dirty then. Current git status has modified `Cargo.lock`, Unix IPC source and this ledger, plus untracked API, macOS ACL and agent code. This tracking task edits only this ledger and makes no commits or branch changes.
 
 ## Current work lanes
 
@@ -16,8 +16,9 @@ Observed branch: `overhaul/widget-app-planning`. Inspected HEAD: `5b1688cbc95af3
 | GLM 5.3 Rust foundation | Accepted in `f4ddbf3` after review and coordinator corrections | GLM delivery was conditionally accepted with one `unused_self` lint. Coordinator added the exact allow, redacted debug payloads, corrected the layout doc and added a counting allocator integration test with a positive control. Coordinator reports foundation 17 unit tests plus one integration test and clippy passing. This establishes bounded foundation evidence, not native fast-path acceptance. |
 | Opus UI implementation | Development UI accepted in `ef7b213` | Coordinator reports `npm test` with 82 passing tests and `npm run build` passing. No browser or native validation. |
 | Lifecycle model | Fixes accepted in `b660e2e`; Opus review `00e5c53c` accepted lifecycle | Fixes follow the Opus high cancellation finding. Current API includes `new(instance: u128)`, `CancelPrepare`, `DrainTicket` and `retry_cleanup`. Coordinator reports 12 tests and clippy passing. |
-| GLM new API | Task `214f83f0` in progress | `5b1688c` defines the precision-safe versioned replacement API contract. Implementation is not accepted. All GLM work requires Opus review. |
-| Native agent and hardware performance | No real native agent yet; physical metrics unmeasured | No capture/injection adapters, installed lifecycle or physical latency, jitter, release, energy or native resource acceptance established by this evidence. |
+| GLM new API | Review candidate `214f83f0` complete; corrections `01afd013` active | Frozen GLM API review rejected B1, H1 and H2. HEAD `b993c2d` corrects the contract; implementation remains unaccepted and mandatory Opus delta review remains outstanding. See the dated coordinator checkpoint below. |
+| Unix canonical paths and macOS ACLs | Uncommitted; Opus review `45236d86` active | Coordinator Windows/WSL checks passed as recorded below. Native macOS ACL execution and review acceptance remain outstanding. |
+| Native agent and hardware performance | Uncommitted library-only idle read-only owner; physical metrics unmeasured | `crates/kvm-agent` is not a running agent or integrated UI. Its API dependency is unaccepted. No capture/injection adapters, installed lifecycle or physical latency, jitter, release, energy or native resource acceptance established by this evidence. |
 
 Coordinator integration addendum: the lifecycle model now has 14 passing tests, including forged future cleanup attempts and retry during an outstanding preparation fence, plus a `waiting_for_preparation` status accessor. New `kvm-agent-ipc` provides bounded, caller-buffer framing only; its five tests cover fragmented reads, exact boundaries, rejected lengths before body reads, partial frames and rejected writes. Both packages pass actual-workspace strict clippy. The framing layer implements no native endpoint or authorization, so the native-agent gate stays open. These checks extend the earlier checkpoint; they do not retroactively change the recorded benchmark build identity.
 
@@ -60,7 +61,7 @@ These are intermediate implementations, not physical input-path or release accep
 | --- | --- | --- |
 | 0. Baseline, architecture and experience | In progress. Accepted ADR, contracts and metadata tooling exist. | Physical legacy baseline, named machines/support matrix, numeric budgets, complete architecture/reuse register, visual variant approval and installed shell/permission/signing spike. |
 | 1. Rust foundation and fast path | Bounded foundation accepted after review; native fast path incomplete. | Native adapters, authenticated two-host slice, both-direction ordered-state/emergency-release and measured budgets. Allocation test evidence covers the tested queue operations only. |
-| 2. Agent and control plane | Reviewed pure lifecycle model accepted; new API implementation in progress. No real native agent yet. | Idle agent, authority, identity/enrollment, topology/configuration, implemented authenticated versioned API, confirmed native outcomes and contention evidence. GLM implementation requires Opus review. |
+| 2. Agent and control plane | Reviewed pure lifecycle model accepted; API corrections active after rejected review. Uncommitted library-only idle owner exists; no running agent or UI integration. | Corrected API acceptance after mandatory Opus delta review, runtime status, authority, identity/enrollment, topology/configuration, confirmed native outcomes and contention evidence. |
 | 3. Tray shell and daily UI | Development UI accepted; native shell incomplete. | Browser validation, reviewed design, native tray/single instance/supervision, accessible setup/settings, 100 open/dismiss cycles, DPI and visible/hidden resource gates. |
 | 4. Security and migration | Pending. | Enrollment review, endpoint authorization, transactional settings, credential migration/rollback and release diagnostics validation. |
 | 5. Lifecycle and physical acceptance | Pending; physical metrics unmeasured. | Both receiving OSes, 100 combined lifecycle/fault transitions each, no stuck input/duplicate owner, 24-hour soak and full performance matrix. |
@@ -144,6 +145,56 @@ Actual root-workspace script verification in this increment:
 
 WSL used only existing isolated `CARGO_HOME=target/wsl-tools/cargo`, `RUSTUP_HOME=target/wsl-tools/rustup` and `CARGO_TARGET_DIR=target/wsl-check`, with absolute `/mnt/c/dev/oss-software-kvm/` prefixes and its Cargo bin directory on PATH. Bootstrap/check helpers and toolchains under ignored `target` are local validation artifacts, not shipped tooling. Windows Rust 1.97.1 and Linux Rust 1.100.0 differ. These correctness checks are not controlled same-toolchain performance comparisons, and no benchmarks were run.
 
-GLM API task `214f83f0` remains in progress and unaccepted, with Opus review required. Its untracked crate and possible shared uncommitted `Cargo.lock` entry were not edited or staged by this lane. No commits, branches, manifests, lockfiles, application code or UI were changed by this increment.
+At that script checkpoint, GLM API task `214f83f0` was recorded as in progress and unaccepted, with Opus review required. That status is historical: the review candidate is now complete and corrections are underway, as recorded below. Its untracked crate and possible shared uncommitted `Cargo.lock` entry were not edited or staged by that lane. No commits, branches, manifests, lockfiles, application code or UI were changed by that increment.
 
 Remaining gates include macOS execution, agent-command integration, native capture/injection, hardware latency/release/energy/resource measurement, adversarial endpoint policy tests, signed application identity, installed lifecycle and release acceptance. These scripts provide no physical or native input certification. Earlier metadata collector and lifecycle benchmark work remains delivered with its recorded scope and limitations.
+
+## Unix ancestor and Darwin ACL delivery, 2026-11-17
+
+Coordinator acceptance includes `d745128`, the asynchronous Unix bind with lifetime flock and confirmed stale recovery, and `035c768`, the rebuild scripts with actual root Windows and WSL checks passing. This bounded increment was checked at workspace HEAD `a9bf492de4130d7099974a5fd880e0db9ed890b6`. API work still requires Opus review and is not accepted by this delivery.
+
+Only `crates/kvm-agent-ipc/src/unix.rs`, its new `unix/macos_acl.rs` module and this ledger were edited here. The pre-existing modified `Cargo.lock` and untracked API crate were left untouched. No commits, branches, users, system permissions or UI changes were made.
+
+Bind and connect require an absolute directory, reject parent traversal and direct directory symlinks, including trailing-separator spellings, and canonicalize its parent once. They validate canonical ancestors from root before creating or using the runtime directory. Every ancestor must be owned by root or the effective UID; group/other write requires the sticky bit and that same trusted ownership. System ancestor aliases such as `/var` are resolved, then subsequent socket, lock and Drop operations use the canonical absolute path. The immediate directory must be user-owned mode 0700. Existing lifetime lock acquisition, stale-probe await, held-connection admission and cancellation ordering are preserved.
+
+On macOS, the directory, socket and existing stale socket reject every extended ACL entry. The lock ACL is checked through its open file descriptor. Canonical ancestors permit empty or deny-only ACLs and reject every allow or unknown tag, including read-only or inherit-only allow entries. This conservative policy avoids guessing group membership and does not reject normal deny-only system ACLs. It may reject otherwise safe installations with ancestor allow entries. Retrieval failures, unsupported filesystems and unexpected iterator/tag errors fail closed. A non-null empty ACL is accepted by iterating entries, not by testing allocation presence. Darwin's documented iterator exhaustion is `-1/EINVAL`, including FIRST on an empty OS-returned ACL as confirmed in Apple's implementation. Owned ACL allocations are freed through RAII; narrow FFI declarations, constants and safety comments are confined to the macOS module because the current libc dependency lacks these declarations.
+
+Apple primary sources used for the ABI, constants and behavior:
+
+- [Libc sys/acl.h](https://github.com/apple-oss-distributions/Libc/blob/main/include/sys/acl.h)
+- [ACL retrieval manual](https://github.com/apple-oss-distributions/Libc/blob/main/posix1e/acl_get.3)
+- [ACL entry manual](https://github.com/apple-oss-distributions/Libc/blob/main/posix1e/acl_get_entry.3)
+- [Darwin ACL iterator implementation](https://github.com/apple-oss-distributions/Libc/blob/main/posix1e/acl_entry.c)
+
+Actual final root-workspace validation passed:
+
+- `powershell -NoProfile -File scripts/check-rebuild.ps1 -MacOS`: focused format checks, Windows IPC 12 tests, model 14 tests, foundation 23 unit tests and one allocation integration test, strict host clippy and strict aarch64-apple-darwin all-target cross-clippy. Cargo again emitted a nonfatal Windows incremental-cache access-denied note.
+- WSL `/bin/sh target/wsl-tools/check-runner.sh`: the root POSIX rebuild script passed focused format checks, Linux IPC 15 tests, model 14 tests, foundation 23 unit tests and one allocation integration test, and strict Linux all-target clippy. It used existing isolated CARGO_HOME/RUSTUP_HOME beneath ignored `target/wsl-tools` and CARGO_TARGET_DIR beneath `target/wsl-check`. No Apple target was installed in WSL, so its macOS option explicitly skipped.
+- `cargo check --locked --offline -p kvm-agent-ipc --target aarch64-apple-darwin --tests` passed on Windows. This compiles the macOS private-fixture test but does not execute it.
+
+Three new Linux-executed tests distinguish nonsticky world-writable ancestor rejection before directory creation, direct directory symlink refusal on bind/connect, and accepted trusted canonical paths with absolute socket cleanup after an ancestor alias is removed. Existing lock collision, stale recovery, replacement-file preservation and cancellation tests still pass. A macOS-gated fixture test removes/adds ACLs only on its own private temporary directory and covers empty, deny-only and allow-entry policy. It has not run on physical macOS. The first Linux clippy run rejected the no-op non-macOS ACL wrapper's Result type; a localized allowance documents its shared fallible macOS contract, and the final complete script passed.
+
+These path and ACL checks are snapshots. They do not pin directory handles or prevent a malicious process with the same UID, or root, from renaming/replacing components between validation and use. Flock coordinates compliant owners only. UID authentication does not establish signed application/code identity. Remaining gates include independent security review, actual macOS ACL execution and adversarial filesystem tests, signed/installed agent identity, API Opus review and command integration, and native input, physical performance and release acceptance.
+
+## Coordinator evidence and next milestone, 2026-11-17
+
+This update preserves the earlier delivery and validation checkpoints above. Current source/git inspection confirms HEAD `b993c2d`, the uncommitted Unix canonical-path/macOS ACL changes, and untracked `crates/kvm-agent-api` and `crates/kvm-agent`. The review outcomes, active task identifiers and rerun results below are supplied coordinator evidence. This documentation task ran no builds or tests and claims no additional acceptance.
+
+The original GLM API task `214f83f0` completed its review candidate. The frozen GLM API review rejected B1 for missing agent instance identity in Hello, H1 for missing explicit protocol errors, and H2 for revision-bound Pause/Failsafe. GLM correction task `01afd013` is active. HEAD `b993c2d` corrects the contract, including Hello bootstrap identity, explicit protocol errors and safety commands without revision preconditions. A contract correction does not accept the implementation. Mandatory Opus delta review remains outstanding.
+
+Opus review `45236d86` is active for Sol's uncommitted Unix canonical-path and macOS ACL changes. The coordinator independently reran:
+
+- `scripts/check-rebuild.ps1 -MacOS`: Windows IPC 14, model 14, foundation 23 unit tests and one allocator integration test passed, along with strict host clippy and strict Apple Silicon cross-clippy.
+- `target/wsl-tools/check.sh`: Linux IPC 15, model 14, foundation 23 unit tests and one allocator integration test passed, along with strict Linux clippy.
+
+These are later coordinator reruns, distinct from the earlier commands and Windows IPC counts retained above. Cross-clippy does not execute macOS code. Native macOS ACL checks have never been executed.
+
+The new uncommitted `crates/kvm-agent` contains a library-only idle read-only owner. Source inspection shows process-owned lifecycle state and read-only snapshots with unconfirmed prerequisites and unsupported mutation capabilities. It is not a running agent and has no integrated UI. Its dependency on the draft API is not accepted, and this checkpoint claims no agent tests or runtime acceptance.
+
+The next concrete milestone is runtime status after the corrected API passes mandatory Opus delta review. That requires adapting the idle owner to the accepted contract and demonstrating runtime Hello/bootstrap and read-only status before UI integration acceptance. Full rebuild completion, performance acceptance, native input acceptance, macOS execution and installed release acceptance remain open.
+
+### Coordinator process-host draft, 2026-11-17
+
+After Sol's progress refresh, the uncommitted `kvm-agent` crate gained a development `serve` binary. It owns a single-thread Tokio runtime, serves one verified native connection at a time with a two-second total connection budget, handles Ctrl+C, and bounds endpoint recovery attempts. Unix takes an explicit absolute runtime directory; Windows uses the session-scoped control channel. It starts no input capture, injection, discovery or legacy runtime. This is an unaccepted draft, not an observed running agent or UI integration.
+
+Windows `cargo test --offline -p kvm-agent` passed six library tests. Strict all-target host clippy passed. Apple Silicon all-target cross-clippy passed after downloading the already locked signal dependencies, errno and signal-hook-registry. The first offline cross-check failed because those dependencies were not cached. No macOS binary executed. The API is still undergoing GLM correction and mandatory Opus delta review, so the owner and binary remain uncommitted and will need adaptation and renewed checks against the final contract. The earlier library-only description remains historical evidence of the preceding state.
