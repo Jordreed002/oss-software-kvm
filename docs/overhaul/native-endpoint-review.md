@@ -1,0 +1,32 @@
+# Native control endpoint security checkpoint
+
+These endpoints are prototypes. Do not expose mutating commands until the remaining authorization and protocol gates below are satisfied. User identity is not installed-application identity.
+
+## Windows review and corrections
+
+Opus reviewed `windows.rs` at `dcd1466` and local Tokio/mio implementation details. It accepted FFI lifetimes/alignment, token/SID/descriptor ownership, the protected user/SYSTEM DACL and fail-closed first-instance collision behavior for the stated prototype. No additional native tests were run by that review.
+
+Coordinator corrections after review:
+
+- A connection's Drop explicitly disconnects before releasing its stream, preventing a stalled pending write from indefinitely pinning a server instance. A regression test keeps the nonreading client's handle live while a replacement client completes a frame roundtrip.
+- A listener becomes poisoned before awaiting connection/rotation. Any cancellation or terminal error requires recreation; a later accept cannot reuse a half-completed client. The timeout regression test verifies rejection after cancellation.
+- The descriptor explicitly names its owner and includes a Medium integrity no-read-up/no-write-up mandatory label. Creation succeeds on this Windows process. Low-integrity denial has not yet been tested.
+
+Current Windows evidence: nine IPC tests pass; strict all-target clippy passes. This is not proof of every ACL principal, session policy or signed client identity.
+
+Remaining before mutation exposure:
+
+1. Client verifies server process/user/session and rejects foreign endpoint owners before sending sensitive messages.
+2. Server validates client process/session and the approved integrity policy beyond the current DACL.
+3. Session-scoped namespace/logon-SID policy and explicit collision diagnostics.
+4. API first-message/busy behavior and bounded client/server deadlines.
+5. Read-back ACL/owner/label checks; low-integrity and second-user/squatter tests; loopback remote rejection; connection churn and cancellation/retry tests.
+6. Clear process-identity policy. Same-user malicious code is not excluded by an account SID or predictable pipe name.
+
+## Unix and macOS prototype
+
+The Unix listener creates or validates a user-owned directory without group/other permissions, binds a 0600 socket, checks accepted peer UID, limits accepted connections and deletes only its own matching socket inode on Drop. Existing socket paths are never unlinked to obtain ownership.
+
+The caller must select a stable application-owned directory beneath trusted ancestors. The prototype does not validate the entire ancestor chain against concurrent rename, does not identify a signed application, and has no client connector/server-identity validation yet. These limitations are explicit preconditions, not completed security guarantees. Stale socket recovery and user-session policy need owner-level design.
+
+Installed the Rust standard library target `aarch64-apple-darwin` and cross-checked this crate with `cargo check -p kvm-agent-ipc --target aarch64-apple-darwin --tests` and strict cross-target clippy. This checks the Unix source/tests against macOS types; it does not link, launch or run them on macOS. Native tests for same-user frames, directory privacy, collision refusal and replacement-file preservation remain to run on a Unix host. No input capture is activated by these endpoint tests.
