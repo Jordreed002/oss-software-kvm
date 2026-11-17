@@ -757,6 +757,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "kvm-foundation"
+version = "0.1.0"
+
+[[package]]
 name = "kvm-input"
 version = "0.1.0"
 dependencies = [

@@ -1,0 +1,11 @@
+[package]
+name = "kvm-foundation"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Dependency-free physical input event values and bounded single-owner FIFO storage for Software KVM"
+
+[lints]
+workspace = true
