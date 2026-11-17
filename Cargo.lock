@@ -690,6 +690,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "kvm-agent"
+version = "0.1.0"
+dependencies = [
+ "kvm-agent-api",
+ "kvm-agent-ipc",
+ "kvm-agent-model",
+ "tokio",
+ "uuid",
+]
+
+[[package]]
+name = "kvm-agent-api"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "uuid",
+]
+
+[[package]]
 name = "kvm-agent-ipc"
 version = "0.1.0"
 dependencies = [

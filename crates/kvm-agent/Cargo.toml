@@ -1,0 +1,20 @@
+[package]
+name = "kvm-agent"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Replacement per-user KVM agent owner and control service"
+
+[dependencies]
+kvm-agent-api = { path = "../kvm-agent-api" }
+kvm-agent-ipc = { path = "../kvm-agent-ipc" }
+kvm-agent-model = { path = "../kvm-agent-model" }
+tokio = { version = "1", features = ["io-util", "time", "rt", "macros", "signal"] }
+uuid = { version = "1", features = ["v4"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt", "macros"] }
+
+[lints]
+workspace = true

@@ -1,0 +1,363 @@
+{
+  "contract": "software-kvm-agent schema version 1",
+  "directions": [
+    "client",
+    "server"
+  ],
+  "expect": [
+    "ok",
+    "shape",
+    "nil_instance",
+    "wrong_protocol",
+    "field_empty",
+    "field_too_large",
+    "field_invalid_characters",
+    "version_invalid",
+    "payload_too_large"
+  ],
+  "notes": [
+    "Valid entries must decode successfully; byte_exact entries must also re-encode to the exact file bytes. The marked exceptions are the whitespace-padded boundary fixture and the JSON-escaped fixture, which decode to canonical values but are deliberately not canonical bytes.",
+    "Invalid entries must be rejected with exactly the listed error category.",
+    "Duplicate JSON keys are always shape errors, in every position: a plain data field, the correlation id, an internally tagged type tag, or a nested reason. Non-Rust decoders must reject duplicate keys rather than accepting the last value; JSON-test last-value-wins semantics are non-conforming for this contract.",
+    "Protocol errors have closed payload-free reasons. The codec permits correlation presence for any reason; the owner omits it for Hello or undecodable input and echoes it only for decoded correlated requests.",
+    "The future-range Hello (2..=3) is valid JSON for this schema and must decode; negotiation with this codec then rejects it because the codec supports only version 1.",
+    "The oversize payload is a valid Hello padded with insignificant whitespace to 16385 bytes, so the payload cap is its only defect; a decoder without the cap would accept it.",
+    "All structs use JSON objects and all enum tags use strings. Arrays and numeric enum indices are shape errors, including in nested fields."
+  ],
+  "valid": [
+    {
+      "file": "client_hello.json",
+      "direction": "client"
+    },
+    {
+      "file": "client_hello_at_limit.json",
+      "direction": "client",
+      "byte_exact": false
+    },
+    {
+      "file": "client_hello_future_range.json",
+      "direction": "client"
+    },
+    {
+      "file": "client_snapshot_request.json",
+      "direction": "client"
+    },
+    {
+      "file": "client_snapshot_request_escaped.json",
+      "direction": "client",
+      "byte_exact": false
+    },
+    {
+      "file": "client_pause_u64max.json",
+      "direction": "client"
+    },
+    {
+      "file": "client_resume_revision.json",
+      "direction": "client"
+    },
+    {
+      "file": "server_hello.json",
+      "direction": "server"
+    },
+    {
+      "file": "server_snapshot_idle.json",
+      "direction": "server"
+    },
+    {
+      "file": "server_snapshot_draining_latched.json",
+      "direction": "server"
+    },
+    {
+      "file": "server_snapshot_active_remote.json",
+      "direction": "server"
+    },
+    {
+      "file": "server_result_accepted.json",
+      "direction": "server"
+    },
+    {
+      "file": "server_result_applied_u64max.json",
+      "direction": "server"
+    },
+    {
+      "file": "server_result_rejected.json",
+      "direction": "server"
+    },
+    {
+      "file": "server_error_unsupported_version.json",
+      "direction": "server"
+    },
+    {
+      "file": "server_error_wrong_protocol.json",
+      "direction": "server"
+    },
+    {
+      "file": "server_error_malformed_request.json",
+      "direction": "server"
+    },
+    {
+      "file": "server_error_hello_required.json",
+      "direction": "server"
+    },
+    {
+      "file": "server_error_instance_mismatch.json",
+      "direction": "server"
+    },
+    {
+      "file": "server_error_unsupported.json",
+      "direction": "server"
+    }
+  ],
+  "invalid": [
+    {
+      "file": "client_numeric_correlation.json",
+      "direction": "client",
+      "expect": "shape"
+    },
+    {
+      "file": "client_numeric_correlation_small.json",
+      "direction": "client",
+      "expect": "shape"
+    },
+    {
+      "file": "client_overflow_correlation.json",
+      "direction": "client",
+      "expect": "shape"
+    },
+    {
+      "file": "client_noncanonical_correlation.json",
+      "direction": "client",
+      "expect": "shape"
+    },
+    {
+      "file": "client_noncanonical_sign.json",
+      "direction": "client",
+      "expect": "shape"
+    },
+    {
+      "file": "client_empty_correlation.json",
+      "direction": "client",
+      "expect": "shape"
+    },
+    {
+      "file": "client_nil_instance.json",
+      "direction": "client",
+      "expect": "nil_instance"
+    },
+    {
+      "file": "client_uppercase_instance.json",
+      "direction": "client",
+      "expect": "shape"
+    },
+    {
+      "file": "client_malformed_instance.json",
+      "direction": "client",
+      "expect": "shape"
+    },
+    {
+      "file": "client_unknown_field.json",
+      "direction": "client",
+      "expect": "shape"
+    },
+    {
+      "file": "client_unknown_variant.json",
+      "direction": "client",
+      "expect": "shape"
+    },
+    {
+      "file": "client_duplicate_instance.json",
+      "direction": "client",
+      "expect": "shape"
+    },
+    {
+      "file": "client_duplicate_type.json",
+      "direction": "client",
+      "expect": "shape"
+    },
+    {
+      "file": "client_pause_with_revision.json",
+      "direction": "client",
+      "expect": "shape"
+    },
+    {
+      "file": "client_wrong_protocol.json",
+      "direction": "client",
+      "expect": "wrong_protocol"
+    },
+    {
+      "file": "client_empty_protocol.json",
+      "direction": "client",
+      "expect": "field_empty"
+    },
+    {
+      "file": "client_version_as_string.json",
+      "direction": "client",
+      "expect": "shape"
+    },
+    {
+      "file": "client_hello_zero_version.json",
+      "direction": "client",
+      "expect": "version_invalid"
+    },
+    {
+      "file": "client_hello_reversed.json",
+      "direction": "client",
+      "expect": "version_invalid"
+    },
+    {
+      "file": "server_hello_bad_negotiated.json",
+      "direction": "server",
+      "expect": "version_invalid"
+    },
+    {
+      "file": "server_hello_nil_instance.json",
+      "direction": "server",
+      "expect": "nil_instance"
+    },
+    {
+      "file": "server_hello_missing_instance.json",
+      "direction": "server",
+      "expect": "shape"
+    },
+    {
+      "file": "server_hello_uppercase_instance.json",
+      "direction": "server",
+      "expect": "shape"
+    },
+    {
+      "file": "server_hello_control_version.json",
+      "direction": "server",
+      "expect": "field_invalid_characters"
+    },
+    {
+      "file": "server_hello_oversize_version.json",
+      "direction": "server",
+      "expect": "field_too_large"
+    },
+    {
+      "file": "server_unknown_lifecycle.json",
+      "direction": "server",
+      "expect": "shape"
+    },
+    {
+      "file": "server_unknown_safety_field.json",
+      "direction": "server",
+      "expect": "shape"
+    },
+    {
+      "file": "server_unknown_destination_field.json",
+      "direction": "server",
+      "expect": "shape"
+    },
+    {
+      "file": "server_unknown_local_field.json",
+      "direction": "server",
+      "expect": "shape"
+    },
+    {
+      "file": "server_unknown_snapshot_field.json",
+      "direction": "server",
+      "expect": "shape"
+    },
+    {
+      "file": "server_result_unknown_field.json",
+      "direction": "server",
+      "expect": "shape"
+    },
+    {
+      "file": "server_control_host.json",
+      "direction": "server",
+      "expect": "field_invalid_characters"
+    },
+    {
+      "file": "server_oversize_host.json",
+      "direction": "server",
+      "expect": "field_too_large"
+    },
+    {
+      "file": "server_error_unknown_reason.json",
+      "direction": "server",
+      "expect": "shape"
+    },
+    {
+      "file": "server_error_bad_bounds.json",
+      "direction": "server",
+      "expect": "version_invalid"
+    },
+    {
+      "file": "server_error_unknown_field.json",
+      "direction": "server",
+      "expect": "shape"
+    },
+    {
+      "file": "server_error_reason_extra_key.json",
+      "direction": "server",
+      "expect": "shape"
+    },
+    {
+      "file": "oversize_payload.json",
+      "direction": "client",
+      "expect": "payload_too_large"
+    },
+    {
+      "file": "client_array_hello.json",
+      "direction": "client",
+      "expect": "shape"
+    },
+    {
+      "file": "server_array_readiness.json",
+      "direction": "server",
+      "expect": "shape"
+    },
+    {
+      "file": "server_numeric_destination.json",
+      "direction": "server",
+      "expect": "shape"
+    },
+    {
+      "file": "server_numeric_safety.json",
+      "direction": "server",
+      "expect": "shape"
+    },
+    {
+      "file": "server_array_outcome.json",
+      "direction": "server",
+      "expect": "shape"
+    },
+    {
+      "file": "server_numeric_outcome.json",
+      "direction": "server",
+      "expect": "shape"
+    },
+    {
+      "file": "server_numeric_error_kind.json",
+      "direction": "server",
+      "expect": "shape"
+    },
+    {
+      "file": "client_duplicate_correlation.json",
+      "direction": "client",
+      "expect": "shape"
+    },
+    {
+      "file": "server_duplicate_reason_kind.json",
+      "direction": "server",
+      "expect": "shape"
+    },
+    {
+      "file": "server_duplicate_safety.json",
+      "direction": "server",
+      "expect": "shape"
+    },
+    {
+      "file": "server_duplicate_destination.json",
+      "direction": "server",
+      "expect": "shape"
+    },
+    {
+      "file": "server_duplicate_outcome_kind.json",
+      "direction": "server",
+      "expect": "shape"
+    }
+  ]
+}
