@@ -1,74 +1,246 @@
-/* Read-only agent status surface (--utility-agent). Fills the native utility
- * window; no mock desk or tray. Scoped under .kvmu.u-agent, reusing the
- * utility tokens so the agent and fixture surfaces read as one product. */
+/* Read-only agent status surface (--utility-agent). Fills the native tray
+ * window (380x500 logical). Everything is scoped under .kvmu.u-agent; the
+ * agent page carries its own quieter token set so it can follow a Linear-like
+ * near-black / paper-white neutral scheme without touching the fixture
+ * preview, which keeps the shared utility tokens. */
 
-.kvmu.u-agent { background: var(--u-surface); }
+/* ---- tokens: light (default) ---- */
+.kvmu.u-agent {
+  --u-surface: #fcfcfd;
+  --u-raised: #f3f4f6;
+  --u-hover: #eceef1;
+  --u-text: #1b1c1f;
+  --u-text-2: #3c3f45;
+  --u-muted: #686c74;
+  --u-line: rgba(17, 19, 24, 0.08);
+  --u-line-strong: rgba(17, 19, 24, 0.16);
+  --u-accent: #2f8a5b;
+  --u-accent-soft: rgba(47, 138, 91, 0.1);
+  --u-on-accent: #fcfcfd;
+  --u-pending: #4b5bc4;
+  --u-pending-soft: rgba(75, 91, 196, 0.09);
+  --u-attention: #a15c07;
+  --u-attention-soft: rgba(161, 92, 7, 0.08);
+  --u-focus: #5e6ad2;
+  --u-ease: cubic-bezier(0.2, 0.8, 0.2, 1);
+  --u-agent-shadow: 0 1px 0 rgba(255, 255, 255, 0.9) inset, 0 1px 2px rgba(17, 19, 24, 0.06);
+  font-family: "Inter Variable", Inter, "Segoe UI Variable Text", "Segoe UI", -apple-system, system-ui, sans-serif;
+  font-feature-settings: "tnum" 1, "cv11" 1;
+  font-size: 13px;
+  line-height: 1.45;
+  background: var(--u-surface);
+  color-scheme: light;
+}
 
+.kvmu.u-agent[data-theme="dark"] {
+  --u-surface: #0f1012;
+  --u-raised: #17181b;
+  --u-hover: #1e1f23;
+  --u-text: #e8e9eb;
+  --u-text-2: #c4c6cb;
+  --u-muted: #8b9099;
+  --u-line: rgba(255, 255, 255, 0.07);
+  --u-line-strong: rgba(255, 255, 255, 0.14);
+  --u-accent: #4cb782;
+  --u-accent-soft: rgba(76, 183, 130, 0.12);
+  --u-on-accent: #0f1012;
+  --u-pending: #8f9bff;
+  --u-pending-soft: rgba(143, 155, 255, 0.1);
+  --u-attention: #e9a64f;
+  --u-attention-soft: rgba(233, 166, 79, 0.09);
+  --u-focus: #8f9bff;
+  --u-agent-shadow: 0 1px 0 rgba(255, 255, 255, 0.04) inset, 0 1px 2px rgba(0, 0, 0, 0.4);
+  color-scheme: dark;
+}
+
+@media (prefers-color-scheme: dark) {
+  .kvmu.u-agent:not([data-theme="light"]) {
+    --u-surface: #0f1012;
+    --u-raised: #17181b;
+    --u-hover: #1e1f23;
+    --u-text: #e8e9eb;
+    --u-text-2: #c4c6cb;
+    --u-muted: #8b9099;
+    --u-line: rgba(255, 255, 255, 0.07);
+    --u-line-strong: rgba(255, 255, 255, 0.14);
+    --u-accent: #4cb782;
+    --u-accent-soft: rgba(76, 183, 130, 0.12);
+    --u-on-accent: #0f1012;
+    --u-pending: #8f9bff;
+    --u-pending-soft: rgba(143, 155, 255, 0.1);
+    --u-attention: #e9a64f;
+    --u-attention-soft: rgba(233, 166, 79, 0.09);
+    --u-focus: #8f9bff;
+    --u-agent-shadow: 0 1px 0 rgba(255, 255, 255, 0.04) inset, 0 1px 2px rgba(0, 0, 0, 0.4);
+    color-scheme: dark;
+  }
+}
+
+@media (prefers-contrast: more) {
+  .kvmu.u-agent.u-agent { --u-line: var(--u-line-strong); --u-muted: var(--u-text-2); }
+}
+
+.kvmu.u-agent :focus-visible { outline: 2px solid var(--u-focus); outline-offset: 2px; border-radius: 6px; }
+
+/* ---- frame ---- */
 .kvmu .u-agent-panel {
-  display: grid; gap: 14px; align-content: start;
-  width: min(420px, 100%); margin: 0 auto; padding: 14px 16px 12px;
+  display: flex; flex-direction: column; min-height: 100vh;
+  width: min(440px, 100%); margin: 0 auto;
 }
-.kvmu .u-agent-panel[aria-busy="true"] .u-status,
-.kvmu .u-agent-panel[aria-busy="true"] .u-agent-facts,
-.kvmu .u-agent-panel[aria-busy="true"] .u-agent-ready { opacity: 0.62; transition: opacity 160ms var(--u-ease); }
-
-.kvmu .u-agent-badges { display: inline-flex; gap: 6px; flex-wrap: wrap; justify-content: flex-end; }
-.kvmu .u-badge[data-kind="agent"] { color: var(--u-accent); border-style: solid; }
-.kvmu .u-badge[data-kind="attention"] { color: var(--u-attention); border-style: solid; }
-.kvmu .u-badge[data-kind="pending"] { color: var(--u-pending); }
-
-.kvmu .u-agent-remedy {
-  padding: 9px 11px; border-radius: 8px; font-size: 12px; line-height: 1.45;
-  background: var(--u-raised); border-left: 3px solid var(--u-line-strong);
+.kvmu .u-agent-content {
+  flex: 1; display: flex; flex-direction: column; gap: 14px;
+  padding: 16px 16px 12px;
 }
-.kvmu .u-status[data-tone="attention"] + .u-agent-remedy { border-left-color: var(--u-attention); background: var(--u-attention-soft); }
 
-/* facts: label / value rows */
-.kvmu .u-agent-facts { display: grid; border-top: 1px solid var(--u-line); }
-.kvmu .u-agent-facts > div {
-  display: grid; grid-template-columns: 112px 1fr; gap: 10px; align-items: baseline;
-  padding: 6px 0; border-bottom: 1px solid var(--u-line);
+/* ---- header: product + quiet mode label, connection state ---- */
+.kvmu .u-agent-head {
+  display: flex; align-items: center; justify-content: space-between; gap: 12px;
+  min-height: 40px; padding: 8px 16px;
+  border-bottom: 1px solid var(--u-line);
 }
-.kvmu .u-agent-facts dt { color: var(--u-muted); font-size: 12px; }
-.kvmu .u-agent-facts dd { font-weight: 640; font-size: 12.5px; overflow-wrap: anywhere; }
-.kvmu .u-agent-facts dd[data-unknown] { color: var(--u-muted); font-weight: 600; font-style: italic; }
+.kvmu .u-agent-brand { display: flex; align-items: baseline; flex-wrap: wrap; gap: 2px 10px; min-width: 0; }
+.kvmu .u-agent-wordmark { font-size: 12.5px; font-weight: 600; letter-spacing: -0.01em; }
+.kvmu .u-agent-mode { display: inline-flex; align-items: center; gap: 4px; color: var(--u-muted); font-size: 11.5px; }
+.kvmu .u-agent-mode svg { align-self: center; opacity: 0.8; }
 
-/* readiness ledger: hollow dashed ring = not confirmed, filled = confirmed.
- * Shape carries the meaning, colour only reinforces it. */
-.kvmu .u-agent-ready { display: grid; gap: 6px; }
-.kvmu .u-agent-ready-head { display: flex; align-items: baseline; justify-content: space-between; gap: 8px; }
-.kvmu .u-agent-ready-head h2 { font-size: 12.5px; font-weight: 720; }
-.kvmu .u-agent-ready-head span { color: var(--u-muted); font-size: 11.5px; font-variant-numeric: tabular-nums; }
-.kvmu .u-agent-ready ul { list-style: none; margin: 0; padding: 0; display: grid; grid-template-columns: 1fr 1fr; gap: 4px 12px; }
-.kvmu .u-agent-ready li { display: grid; grid-template-columns: 16px 1fr; column-gap: 7px; align-items: center; min-width: 0; }
-.kvmu .u-agent-mark {
-  width: 14px; height: 14px; border-radius: 50%; display: grid; place-items: center;
-  border: 1.5px dashed var(--u-line-strong); color: var(--u-on-accent);
+.kvmu .u-agent-conn {
+  display: inline-flex; align-items: center; gap: 6px; flex: none;
+  color: var(--u-text-2); font-size: 11.5px; font-weight: 500; white-space: nowrap;
 }
-.kvmu .u-agent-ready li[data-confirmed] .u-agent-mark { border: 0; background: var(--u-accent); }
-.kvmu .u-agent-ready-label { font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.kvmu .u-agent-ready li:not([data-confirmed]) .u-agent-ready-label { color: var(--u-muted); }
-.kvmu .u-agent-ready-value { grid-column: 2; font-size: 10.5px; color: var(--u-muted); margin-top: -2px; }
-
-.kvmu .u-agent-quit { display: flex; margin: -6px -6px 0; }
-
-.kvmu .u-agent-foot {
-  display: flex; align-items: center; justify-content: space-between; gap: 10px;
-  padding-top: 10px; border-top: 1px solid var(--u-line);
+.kvmu .u-agent-dot {
+  width: 7px; height: 7px; border-radius: 50%;
+  background: var(--u-muted); box-shadow: 0 0 0 3px color-mix(in srgb, var(--u-muted) 16%, transparent);
 }
-.kvmu .u-agent-checked { color: var(--u-muted); font-size: 11.5px; font-variant-numeric: tabular-nums; }
+.kvmu .u-agent-conn[data-kind="agent"] .u-agent-dot { background: var(--u-accent); box-shadow: 0 0 0 3px var(--u-accent-soft); }
+.kvmu .u-agent-conn[data-kind="attention"] { color: var(--u-attention); }
+.kvmu .u-agent-conn[data-kind="attention"] .u-agent-dot { background: var(--u-attention); box-shadow: 0 0 0 3px var(--u-attention-soft); }
+.kvmu .u-agent-conn[data-kind="pending"] .u-agent-dot { background: transparent; box-shadow: inset 0 0 0 1.5px var(--u-pending); }
+.kvmu .u-agent-conn[data-kind="offline"] .u-agent-dot { background: transparent; box-shadow: inset 0 0 0 1.5px var(--u-muted); }
+
+/* ---- status: the one prominent block ---- */
+.kvmu .u-agent-status { display: grid; grid-template-columns: 32px 1fr; gap: 12px; align-items: start; }
+.kvmu .u-agent-glyph {
+  width: 32px; height: 32px; display: grid; place-items: center; border-radius: 8px;
+  color: var(--u-muted); background: var(--u-raised);
+  box-shadow: inset 0 0 0 1px var(--u-line);
+}
+.kvmu .u-agent-status[data-tone="active"] .u-agent-glyph { color: var(--u-accent); background: var(--u-accent-soft); box-shadow: none; }
+.kvmu .u-agent-status[data-tone="pending"] .u-agent-glyph { color: var(--u-pending); background: var(--u-pending-soft); box-shadow: none; }
+.kvmu .u-agent-status[data-tone="attention"] .u-agent-glyph { color: var(--u-attention); background: var(--u-attention-soft); box-shadow: none; }
+.kvmu .u-agent-status-text { min-width: 0; padding-top: 1px; }
+.kvmu .u-agent-headline { font-size: 15px; font-weight: 600; letter-spacing: -0.012em; line-height: 1.3; text-wrap: balance; }
+.kvmu .u-agent-detail { margin-top: 3px; color: var(--u-muted); font-size: 12.5px; line-height: 1.45; text-wrap: pretty; }
+.kvmu .u-agent-remedy { margin-top: 8px; color: var(--u-text-2); font-size: 12.5px; line-height: 1.45; text-wrap: pretty; }
+.kvmu .u-agent-status[data-tone="attention"] .u-agent-remedy { color: var(--u-attention); }
+
+/* ---- primary action (always disabled in this build) ---- */
+.kvmu .u-agent-action { display: grid; gap: 6px; }
+.kvmu.u-agent .u-unavailable { color: var(--u-muted); font-size: 11.5px; gap: 6px; }
+.kvmu.u-agent .u-unavailable svg { opacity: 0.85; }
+
+/* ---- buttons ---- */
+.kvmu .u-agent-btn {
+  appearance: none; display: inline-flex; align-items: center; justify-content: center; gap: 6px;
+  min-height: 28px; padding: 0 10px; border-radius: 6px; border: 1px solid transparent;
+  background: none; color: var(--u-text); font: inherit; font-size: 12.5px; font-weight: 500;
+  cursor: pointer; white-space: nowrap;
+  transition: background-color 120ms var(--u-ease), color 120ms var(--u-ease), border-color 120ms var(--u-ease);
+}
+.kvmu .u-agent-btn:disabled { cursor: not-allowed; }
+.kvmu .u-agent-primary {
+  width: 100%; min-height: 34px; border-color: var(--u-line-strong);
+  background: var(--u-raised); box-shadow: var(--u-agent-shadow);
+}
+.kvmu .u-agent-primary:disabled { color: var(--u-muted); box-shadow: none; border-color: var(--u-line); }
+.kvmu .u-agent-ghost { color: var(--u-text-2); }
+.kvmu .u-agent-ghost:hover { background: var(--u-hover); color: var(--u-text); }
+.kvmu .u-agent-ghost:active { background: var(--u-raised); }
+.kvmu .u-agent-quiet { color: var(--u-muted); }
+.kvmu .u-agent-quiet:disabled { opacity: 0.6; }
 .kvmu .u-agent-refresh-icon[data-spinning] { animation: u-agent-spin 900ms linear infinite; }
 @keyframes u-agent-spin { to { transform: rotate(360deg); } }
 
-.kvmu .u-agent-details { max-width: none; }
-.kvmu .u-agent-details code { overflow-wrap: anywhere; }
+/* ---- readiness: count + six-segment meter + compact checklist ----
+ * Hollow ring = not confirmed, filled check = confirmed. Shape carries the
+ * meaning; colour only reinforces it. */
+.kvmu .u-agent-ready { display: grid; gap: 8px; }
+.kvmu .u-agent-ready-head { display: flex; align-items: baseline; justify-content: space-between; gap: 8px; }
+.kvmu .u-agent-ready-head h2 { font-size: 12.5px; font-weight: 600; }
+.kvmu .u-agent-ready-count { color: var(--u-muted); font-size: 11.5px; font-variant-numeric: tabular-nums; }
+.kvmu .u-agent-meter { display: grid; grid-template-columns: repeat(6, 1fr); gap: 3px; }
+.kvmu .u-agent-meter > span { height: 3px; border-radius: 2px; background: var(--u-line-strong); }
+.kvmu .u-agent-meter > span[data-confirmed] { background: var(--u-accent); }
+.kvmu .u-agent-ready ul {
+  list-style: none; margin: 0; padding: 0;
+  display: grid; grid-template-columns: 1fr 1fr; gap: 5px 14px;
+}
+.kvmu .u-agent-ready li { display: flex; align-items: flex-start; gap: 7px; min-width: 0; }
+.kvmu .u-agent-mark {
+  flex: none; width: 12px; height: 12px; margin-top: 2px; border-radius: 50%;
+  display: grid; place-items: center;
+  box-shadow: inset 0 0 0 1.25px var(--u-line-strong); color: var(--u-on-accent);
+}
+.kvmu .u-agent-ready li[data-confirmed] .u-agent-mark { background: var(--u-accent); box-shadow: none; }
+.kvmu .u-agent-ready-label { font-size: 12px; color: var(--u-muted); line-height: 1.35; }
+.kvmu .u-agent-ready li[data-confirmed] .u-agent-ready-label { color: var(--u-text); }
 
+/* ---- secondary facts: quiet property grid ---- */
+.kvmu .u-agent-facts {
+  display: grid; grid-template-columns: 1fr 1fr; gap: 8px 14px;
+  padding-top: 12px; border-top: 1px solid var(--u-line);
+}
+.kvmu .u-agent-facts > div { min-width: 0; }
+.kvmu .u-agent-facts dt { color: var(--u-muted); font-size: 11.5px; }
+.kvmu .u-agent-facts dd { margin-top: 1px; font-size: 12.5px; font-weight: 500; overflow-wrap: anywhere; }
+.kvmu .u-agent-facts dd[data-unknown] { color: var(--u-muted); font-style: italic; }
+
+/* ---- technical disclosure ---- */
+.kvmu .u-agent-details { margin-top: auto; }
+.kvmu .u-agent-details summary {
+  display: inline-flex; align-items: center; gap: 4px; margin-left: -4px; padding: 3px 6px 3px 4px;
+  border-radius: 6px; list-style: none; cursor: pointer;
+  color: var(--u-muted); font-size: 12px; font-weight: 500;
+}
+.kvmu .u-agent-details summary::-webkit-details-marker { display: none; }
+.kvmu .u-agent-details summary:hover { color: var(--u-text); background: var(--u-hover); }
+.kvmu .u-agent-chevron { transition: transform 120ms var(--u-ease); }
+.kvmu .u-agent-details[open] .u-agent-chevron { transform: rotate(90deg); }
+.kvmu .u-agent-details ul {
+  list-style: none; margin: 6px 0 0; padding: 8px 10px; border-radius: 6px;
+  background: var(--u-raised); box-shadow: inset 0 0 0 1px var(--u-line);
+  display: grid; gap: 2px;
+}
+.kvmu .u-agent-details code { font-family: var(--u-mono); font-size: 11px; color: var(--u-text-2); overflow-wrap: anywhere; }
+
+/* ---- footer ---- */
+.kvmu .u-agent-foot {
+  display: flex; align-items: center; gap: 4px;
+  padding: 6px 10px 6px 16px; border-top: 1px solid var(--u-line);
+}
+.kvmu .u-agent-checked {
+  margin-right: auto; color: var(--u-muted); font-size: 11.5px; font-variant-numeric: tabular-nums;
+  min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+
+/* ---- dimming while a refresh is in flight (previous answer stays) ---- */
+.kvmu .u-agent-panel[aria-busy="true"] :is(.u-agent-status, .u-agent-ready, .u-agent-facts) {
+  opacity: 0.6; transition: opacity 160ms var(--u-ease);
+}
+
+/* ---- narrow windows / large text ---- */
 @media (max-width: 340px) {
-  .kvmu .u-agent-ready ul { grid-template-columns: 1fr; }
-  .kvmu .u-agent-facts > div { grid-template-columns: 1fr; gap: 0; }
+  .kvmu .u-agent-ready ul, .kvmu .u-agent-facts { grid-template-columns: 1fr; }
+  .kvmu .u-agent-foot { flex-wrap: wrap; }
+  .kvmu .u-agent-checked { flex-basis: 100%; }
 }
 
 @media (forced-colors: active) {
+  .kvmu .u-agent-glyph, .kvmu .u-agent-details ul { border: 1px solid CanvasText; }
+  .kvmu .u-agent-btn { border: 1px solid ButtonText; }
+  .kvmu .u-agent-btn:disabled { color: GrayText; border-color: GrayText; }
   .kvmu .u-agent-mark { border: 1px solid CanvasText; }
   .kvmu .u-agent-ready li[data-confirmed] .u-agent-mark { background: Highlight; color: HighlightText; }
+  .kvmu .u-agent-meter > span { background: GrayText; forced-color-adjust: none; }
+  .kvmu .u-agent-meter > span[data-confirmed] { background: Highlight; }
+  .kvmu .u-agent-dot { border: 1px solid CanvasText; }
 }

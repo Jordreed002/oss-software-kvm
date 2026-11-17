@@ -102,15 +102,22 @@ describe("AgentUtility", () => {
     expect(invoke).toHaveBeenCalledTimes(1);
     expect(invoke).toHaveBeenCalledWith("agent_status");
     expect(screen.getByText("Agent connected")).toBeInTheDocument();
-    expect(screen.getByText("Dev, read-only")).toBeInTheDocument();
+    expect(screen.getByText("Dev build, read-only")).toBeInTheDocument();
     expect(screen.getByText("0 of 6 confirmed")).toBeInTheDocument();
+    // Each readiness item states its confirmation in text, not only by shape.
+    const ready = within(screen.getByRole("region", { name: "Ready to share" })).getAllByRole("listitem");
+    expect(ready).toHaveLength(6);
+    for (const item of ready) expect(item).toHaveTextContent(/: not confirmed$/);
+    expect(ready[0]).toHaveTextContent("Settings saved: not confirmed");
     const input = within(screen.getByLabelText("Agent status")).getByText("Not confirmed");
     expect(input).toHaveAttribute("data-unknown");
 
     const resume = screen.getByRole("button", { name: /resume sharing/i });
     expect(resume).toBeDisabled();
     expect(resume).toHaveAccessibleDescription("The agent doesn’t offer Resume yet.");
-    expect(screen.getByRole("button", { name: /quit agent/i })).toBeDisabled();
+    const quit = screen.getByRole("button", { name: /quit agent/i });
+    expect(quit).toBeDisabled();
+    expect(quit).toHaveAccessibleDescription("The agent doesn’t offer Quit yet. The tray menu closes this window only.");
     expect(screen.getByRole("button", { name: "Refresh" })).toBeEnabled();
 
     // No fixture vocabulary or controls leak into the agent surface.
