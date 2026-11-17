@@ -4,28 +4,40 @@
 //! clients are rejected and first-instance creation refuses name collisions.
 //! This is a user boundary, NOT proof of a signed application's identity. A
 //! service must still negotiate the agent instance and apply command policy.
-//! Same-user malicious processes and cross-session policy require further review.
+//! Peers must share the current account SID and Windows session. This does not
+//! exclude malicious processes running as that user in that session.
 //! See Microsoft's Named Pipe Security and Access Rights documentation:
 //! <https://learn.microsoft.com/en-us/windows/win32/ipc/named-pipe-security-and-access-rights>
 #![allow(unsafe_code)]
 
-use std::{ffi::c_void, io, mem, ptr};
-use tokio::net::windows::named_pipe::{NamedPipeServer, ServerOptions};
+use std::{ffi::c_void, io, mem, os::windows::io::AsRawHandle, ptr, time::Duration};
+use tokio::net::windows::named_pipe::{
+    ClientOptions, NamedPipeClient, NamedPipeServer, ServerOptions,
+};
 use windows_sys::Win32::{
-    Foundation::{CloseHandle, LocalFree, HANDLE},
+    Foundation::{
+        CloseHandle, LocalFree, ERROR_FILE_NOT_FOUND, ERROR_INSUFFICIENT_BUFFER, ERROR_PIPE_BUSY,
+        HANDLE,
+    },
     Security::{
         Authorization::{
             ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW,
         },
         GetTokenInformation, TokenUser, SECURITY_ATTRIBUTES, TOKEN_QUERY, TOKEN_USER,
     },
-    System::Threading::{GetCurrentProcess, OpenProcessToken},
+    System::{
+        Pipes::{GetNamedPipeClientProcessId, GetNamedPipeServerProcessId},
+        RemoteDesktop::ProcessIdToSessionId,
+        Threading::{
+            GetCurrentProcess, OpenProcess, OpenProcessToken, PROCESS_QUERY_LIMITED_INFORMATION,
+        },
+    },
 };
 
-struct Token(HANDLE);
-impl Drop for Token {
+struct OwnedHandle(HANDLE);
+impl Drop for OwnedHandle {
     fn drop(&mut self) {
-        // SAFETY: uniquely owned token handle from OpenProcessToken.
+        // SAFETY: uniquely owned process or token handle returned by Windows.
         unsafe {
             CloseHandle(self.0);
         }
@@ -42,17 +54,23 @@ impl Drop for LocalBlock {
 }
 
 fn current_sid() -> io::Result<String> {
+    // SAFETY: the pseudo-handle remains valid and is borrowed, never closed.
+    token_sid(unsafe { GetCurrentProcess() })
+}
+
+// The handle is borrowed only for OpenProcessToken; callers keep its owner live.
+fn token_sid(process: HANDLE) -> io::Result<String> {
     let mut raw = ptr::null_mut();
-    // SAFETY: valid process pseudo-handle, output points to a live local handle.
-    if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &raw mut raw) } == 0 {
+    // SAFETY: borrowed live process handle, output points to a live local handle.
+    if unsafe { OpenProcessToken(process, TOKEN_QUERY, &raw mut raw) } == 0 {
         return Err(io::Error::last_os_error());
     }
-    let token = Token(raw);
+    let token = OwnedHandle(raw);
     let mut size = 0;
     // SAFETY: zero-size query intentionally requests the required buffer size.
-    unsafe {
-        GetTokenInformation(token.0, TokenUser, ptr::null_mut(), 0, &raw mut size);
-    }
+    let result =
+        unsafe { GetTokenInformation(token.0, TokenUser, ptr::null_mut(), 0, &raw mut size) };
+    validate_size_query(result, io::Error::last_os_error())?;
     if size < u32::try_from(mem::size_of::<TOKEN_USER>()).unwrap_or(u32::MAX) || size > 65_536 {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -99,6 +117,159 @@ fn current_sid() -> io::Result<String> {
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid SID text"))
 }
 
+fn validate_size_query(result: i32, error: io::Error) -> io::Result<()> {
+    if result == 0 && error.raw_os_error() == Some(ERROR_INSUFFICIENT_BUFFER.cast_signed()) {
+        Ok(())
+    } else if result == 0 {
+        Err(error)
+    } else {
+        Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "unexpected token size query success",
+        ))
+    }
+}
+
+#[derive(Debug)]
+struct Identity {
+    sid: String,
+    session: u32,
+}
+
+fn session_id(pid: u32) -> io::Result<u32> {
+    let mut session = 0;
+    // SAFETY: writable output, no retained pointer. Failure never yields identity.
+    if unsafe { ProcessIdToSessionId(pid, &raw mut session) } == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(session)
+}
+
+fn current_identity() -> io::Result<Identity> {
+    Ok(Identity {
+        sid: current_sid()?,
+        session: session_id(std::process::id())?,
+    })
+}
+
+fn process_identity(pid: u32) -> io::Result<Identity> {
+    if pid == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "unknown pipe peer PID",
+        ));
+    }
+    // SAFETY: asks only for limited query access, with no inherited handle.
+    let raw = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+    if raw.is_null() {
+        return Err(io::Error::last_os_error());
+    }
+    let process = OwnedHandle(raw);
+    // Keep the process handle alive through both queries, including the PID lookup.
+    Ok(Identity {
+        sid: token_sid(process.0)?,
+        session: session_id(pid)?,
+    })
+}
+
+fn require_identity(expected: &Identity, peer: io::Result<Identity>) -> io::Result<()> {
+    let peer = peer?;
+    if peer.sid != expected.sid || peer.session != expected.session {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "pipe peer user or session mismatch",
+        ));
+    }
+    Ok(())
+}
+
+fn verify_peer(pipe: &impl AsRawHandle, server_peer: bool, expected: &Identity) -> io::Result<()> {
+    let mut pid = 0;
+    // SAFETY: pipe borrows a live Tokio pipe handle and pid is writable. No
+    // ownership is transferred; neither API retains the output pointer.
+    let result = unsafe {
+        if server_peer {
+            GetNamedPipeServerProcessId(pipe.as_raw_handle().cast(), &raw mut pid)
+        } else {
+            GetNamedPipeClientProcessId(pipe.as_raw_handle().cast(), &raw mut pid)
+        }
+    };
+    if result == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    require_identity(expected, process_identity(pid))
+}
+
+fn endpoint_name(channel: &str, identity: &Identity) -> io::Result<String> {
+    if channel.is_empty()
+        || channel.len() > 64
+        || !channel
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-')
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "invalid pipe channel",
+        ));
+    }
+    let path = format!(
+        r"\\.\pipe\software-kvm-agent-{}-session-{}-{channel}",
+        identity.sid, identity.session
+    );
+    if path.encode_utf16().count() > 240 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "pipe path too long",
+        ));
+    }
+    Ok(path)
+}
+
+fn retryable_connect(error: &io::Error) -> bool {
+    matches!(error.raw_os_error(), Some(code) if code == ERROR_FILE_NOT_FOUND.cast_signed() || code == ERROR_PIPE_BUSY.cast_signed())
+}
+
+/// Connect to this user's session endpoint and verify its server before returning.
+/// Keeps Tokio's default identification SQOS. No protocol messages are sent.
+///
+/// # Errors
+/// Returns identity/API errors immediately. Only missing or busy pipes are retried
+/// within the caller's timeout; expiration returns `TimedOut`.
+pub async fn connect(channel: &str, timeout: Duration) -> io::Result<NamedPipeClient> {
+    let deadline = tokio::time::Instant::now()
+        .checked_add(timeout)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "timeout too large"))?;
+    let identity = current_identity()?;
+    let path = endpoint_name(channel, &identity)?;
+    loop {
+        if tokio::time::Instant::now() >= deadline {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "pipe connection timed out",
+            ));
+        }
+        match ClientOptions::new().open(&path) {
+            Ok(stream) => {
+                verify_peer(&stream, true, &identity)?;
+                if tokio::time::Instant::now() >= deadline {
+                    return Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "pipe connection timed out",
+                    ));
+                }
+                return Ok(stream);
+            }
+            Err(error) if retryable_connect(&error) => {
+                tokio::time::sleep_until(
+                    deadline.min(tokio::time::Instant::now() + Duration::from_millis(5)),
+                )
+                .await;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
 fn descriptor(sid: &str) -> io::Result<LocalBlock> {
     // sid comes only from ConvertSidToStringSidW, never from an external client.
     let sddl: Vec<u16> = format!("O:{sid}D:P(A;;GA;;;SY)(A;;GA;;;{sid})S:(ML;;NWNR;;;ME)")
@@ -126,7 +297,7 @@ fn descriptor(sid: &str) -> io::Result<LocalBlock> {
 pub struct UserPipe {
     server: NamedPipeServer,
     path: String,
-    sid: String,
+    identity: Identity,
     admission: std::sync::Arc<tokio::sync::Semaphore>,
     poisoned: bool,
 }
@@ -187,30 +358,13 @@ impl UserPipe {
     /// Rejects invalid labels, occupied names and security/API failures.
     /// Requires a Tokio runtime with I/O enabled.
     pub fn bind(channel: &str) -> io::Result<Self> {
-        if channel.is_empty()
-            || channel.len() > 64
-            || !channel
-                .bytes()
-                .all(|b| b.is_ascii_alphanumeric() || b == b'-')
-        {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "invalid pipe channel",
-            ));
-        }
-        let sid = current_sid()?;
-        let path = format!(r"\\.\pipe\software-kvm-agent-{sid}-{channel}");
-        if path.encode_utf16().count() > 240 {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "pipe path too long",
-            ));
-        }
-        let server = create_server(&path, &sid, true)?;
+        let identity = current_identity()?;
+        let path = endpoint_name(channel, &identity)?;
+        let server = create_server(&path, &identity.sid, true)?;
         Ok(Self {
             server,
             path,
-            sid,
+            identity,
             admission: std::sync::Arc::new(tokio::sync::Semaphore::new(1)),
             poisoned: false,
         })
@@ -245,12 +399,16 @@ impl UserPipe {
         // connected client or half-completed replacement operation.
         self.poisoned = true;
         self.server.connect().await?;
+        if let Err(error) = verify_peer(&self.server, false, &self.identity) {
+            let _ = self.server.disconnect();
+            return Err(error);
+        }
         // Tokio may defer closing a dropped overlapped pipe handle until its
         // cancellation completion is serviced. Keep the two-instance OS bound
         // and yield to the reactor instead of raising the instance limit.
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(250);
         let next = loop {
-            match create_server(&self.path, &self.sid, false) {
+            match create_server(&self.path, &self.identity.sid, false) {
                 Ok(server) => break server,
                 Err(error) if error.raw_os_error() == Some(231) => {
                     if tokio::time::Instant::now() >= deadline {
@@ -288,12 +446,118 @@ mod tests {
         )
     }
 
+    #[test]
+    fn identity_and_native_errors_fail_closed() {
+        let expected = current_identity().unwrap();
+        require_identity(&expected, process_identity(std::process::id())).unwrap();
+        assert!(process_identity(0).is_err());
+        assert!(require_identity(&expected, Err(io::Error::from_raw_os_error(5))).is_err());
+        for peer in [
+            Identity {
+                sid: "S-1-5-18".into(),
+                session: expected.session,
+            },
+            Identity {
+                sid: expected.sid.clone(),
+                session: expected.session.wrapping_add(1),
+            },
+        ] {
+            assert_eq!(
+                require_identity(&expected, Ok(peer)).unwrap_err().kind(),
+                io::ErrorKind::PermissionDenied
+            );
+        }
+        validate_size_query(0, io::Error::from_raw_os_error(122)).unwrap();
+        assert_eq!(
+            validate_size_query(0, io::Error::from_raw_os_error(5))
+                .unwrap_err()
+                .raw_os_error(),
+            Some(5)
+        );
+        assert!(validate_size_query(1, io::Error::from_raw_os_error(122)).is_err());
+        for code in [2, 231] {
+            assert!(retryable_connect(&io::Error::from_raw_os_error(code)));
+        }
+        for code in [5, 109, 123] {
+            assert!(!retryable_connect(&io::Error::from_raw_os_error(code)));
+        }
+        let name = endpoint_name("control", &expected).unwrap();
+        assert_eq!(
+            name,
+            endpoint_name("control", &current_identity().unwrap()).unwrap()
+        );
+        let other = Identity {
+            sid: expected.sid.clone(),
+            session: expected.session.wrapping_add(1),
+        };
+        assert_ne!(name, endpoint_name("control", &other).unwrap());
+    }
+
+    #[tokio::test]
+    async fn rejected_peer_disconnects_and_poisons_listener() {
+        let mut server = UserPipe::bind(&channel()).unwrap();
+        let mut client = ClientOptions::new().open(server.path()).unwrap();
+        let wrong = Identity {
+            sid: server.identity.sid.clone(),
+            session: server.identity.session.wrapping_add(1),
+        };
+        assert_eq!(
+            verify_peer(&client, true, &wrong).unwrap_err().kind(),
+            io::ErrorKind::PermissionDenied
+        );
+        server.identity = wrong;
+        assert_eq!(
+            server.accept().await.unwrap_err().kind(),
+            io::ErrorKind::PermissionDenied
+        );
+        assert_eq!(
+            server.accept().await.unwrap_err().kind(),
+            io::ErrorKind::BrokenPipe
+        );
+        let mut buffer = [0; 1];
+        let result = tokio::time::timeout(Duration::from_secs(1), client.read(&mut buffer))
+            .await
+            .unwrap();
+        assert!(matches!(result, Ok(0) | Err(_)));
+    }
+
+    #[tokio::test]
+    async fn connector_retries_missing_and_busy_with_deadline() {
+        let label = channel();
+        assert_eq!(
+            connect(&label, Duration::from_millis(10))
+                .await
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::TimedOut
+        );
+        let delayed = async {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            UserPipe::bind(&label).unwrap()
+        };
+        let (client, mut server) = tokio::join!(connect(&label, Duration::from_secs(1)), delayed);
+        let _client = client.unwrap();
+        let _connection = server.accept().await.unwrap();
+        let _pending = connect(&label, Duration::from_secs(1)).await.unwrap();
+        assert_eq!(
+            connect(&label, Duration::from_millis(10))
+                .await
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::TimedOut
+        );
+        assert_eq!(
+            connect(&label, Duration::ZERO).await.unwrap_err().kind(),
+            io::ErrorKind::TimedOut
+        );
+    }
+
     #[tokio::test]
     async fn same_user_roundtrip_and_collision_rejection() {
         let channel = channel();
         let mut server = UserPipe::bind(&channel).unwrap();
         assert!(UserPipe::bind(&channel).is_err());
-        let mut client = ClientOptions::new().open(server.path()).unwrap();
+        let mut client = connect(&channel, Duration::from_secs(1)).await.unwrap();
         let mut connection = server.accept().await.unwrap();
         let stream = connection.stream();
         crate::write_frame(&mut client, b"status", 16)
@@ -303,6 +567,11 @@ mod tests {
         assert_eq!(
             crate::read_frame(stream, &mut buffer).await.unwrap(),
             Some(b"status".as_slice())
+        );
+        crate::write_frame(stream, b"reply", 16).await.unwrap();
+        assert_eq!(
+            crate::read_frame(&mut client, &mut buffer).await.unwrap(),
+            Some(b"reply".as_slice())
         );
         assert!(server.accept().await.is_err());
         drop(connection);
