@@ -158,7 +158,7 @@ mod tests {
                 write_frame(&mut output, payload, 2).await,
                 Err(FrameError::InvalidLength)
             ));
-            assert!(output.is_empty());
+            assert_eq!(output, [] as [u8; 0]);
         }
     }
 }
