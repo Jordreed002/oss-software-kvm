@@ -964,6 +964,8 @@ mod tests {
     use std::sync::mpsc::sync_channel;
 
     use super::*;
+    #[cfg(not(target_os = "macos"))]
+    use crate::MacBackendError;
 
     const WINDOW: Duration = Duration::from_millis(200);
 

@@ -515,16 +515,22 @@ pub async fn poll_default_control_status() -> ControlStatusPoll {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
     use kvm_network::{LocalControlClient, LocalControlServerConfig};
+    #[cfg(unix)]
+    use kvm_protocol::MAX_CONTROL_FRAME_BYTES;
     use kvm_protocol::{
         ControlDeviceKind, ControlDeviceRoute, ControlPeerState, WireDeviceId, WireDisplayId,
-        WireHostId, WirePeerId, MAX_CONTROL_FRAME_BYTES,
+        WireHostId, WirePeerId,
     };
+    #[cfg(unix)]
     use std::path::PathBuf;
+    #[cfg(unix)]
     use std::time::Duration;
 
     /// Every await in these tests sits inside a `timeout` wrapper so a
     /// service bug fails the suite instead of hanging it (repo history).
+    #[cfg(unix)]
     const TEST_TIMEOUT: Duration = Duration::from_secs(5);
 
     fn host(n: u8) -> WireHostId {
