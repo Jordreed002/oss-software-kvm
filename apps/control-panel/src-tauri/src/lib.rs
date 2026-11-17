@@ -1,6 +1,7 @@
 mod control;
 mod nearby;
 mod setup;
+mod utility_preview;
 
 use setup::SetupService;
 use tauri::Manager;
@@ -12,6 +13,24 @@ use tauri::Manager;
 ///
 /// Panics if Tauri cannot initialize its native application runtime.
 pub fn run() {
+    let context = tauri::generate_context!();
+
+    // Development-only utility shell. Without the explicit flag the legacy
+    // console below starts exactly as before.
+    if utility_preview::requested(std::env::args()) {
+        if let Some(reason) =
+            utility_preview::unavailable_reason(cfg!(debug_assertions), tauri::is_dev())
+        {
+            eprintln!("software-kvm-control-panel: {reason}");
+            std::process::exit(2);
+        }
+        #[cfg(debug_assertions)]
+        {
+            utility_preview::run(context);
+            return;
+        }
+    }
+
     tauri::Builder::default()
         .setup(|app| {
             app.manage(SetupService::open(app.handle())?);
@@ -34,6 +53,6 @@ pub fn run() {
             setup::stop_runtime,
             control::control_status,
         ])
-        .run(tauri::generate_context!())
+        .run(context)
         .expect("control-panel runtime failed");
 }

@@ -9,3 +9,11 @@ export function shouldRenderUtilitySurface(isDev: boolean, search: string): bool
   if (!isDev) return false;
   return new URLSearchParams(search).get("surface") === "utility";
 }
+
+/** Whether the page is hosted by the native development tray shell
+ *  (`--utility-preview`) rather than a plain browser tab. Tauri injects
+ *  `__TAURI_INTERNALS__` into every webview it creates. This only selects
+ *  honest labelling; it does not imply an agent, capture or any IPC access. */
+export function isNativePreviewHost(win: object): boolean {
+  return "__TAURI_INTERNALS__" in win;
+}

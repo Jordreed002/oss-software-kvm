@@ -144,3 +144,22 @@ describe("UtilityPreview — settings and setup navigation", () => {
     expect(act).toHaveAccessibleDescription(/isn’t available in this preview/i);
   });
 });
+
+describe("UtilityPreview — host labelling", () => {
+  it("labels a browser tab as not connected to a native tray", () => {
+    render(<UtilityPreview />);
+    expect(screen.getByText(/not connected to a native tray or agent/i)).toBeInTheDocument();
+  });
+
+  it("labels the native tray shell without claiming an agent or input", () => {
+    const host = window as unknown as Record<string, unknown>;
+    host.__TAURI_INTERNALS__ = {};
+    try {
+      render(<UtilityPreview />);
+      expect(screen.getByText(/native tray preview — no agent connected, owns no input/i)).toBeInTheDocument();
+      expect(widget().textContent).not.toMatch(/controlling|ready to share/i);
+    } finally {
+      delete host.__TAURI_INTERNALS__;
+    }
+  });
+});

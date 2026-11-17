@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState, type KeyboardEvent, type PointerEvent, type ReactNode } from "react";
 import { X } from "lucide-react";
 import { FIXTURE_IDS, FIXTURE_LABELS, fixtureSnapshot, type FixtureId } from "./fixtures";
+import { isNativePreviewHost } from "./entry";
 import { describeStatus, unavailableSnapshot } from "./model";
 import { StatusGlyph } from "./parts";
 import { SettingsWindow, type SettingsSection } from "./SettingsWindow";
@@ -27,6 +28,7 @@ export default function UtilityPreview() {
   const [widgetOpen, setWidgetOpen] = useState(true);
   const [section, setSection] = useState<SettingsSection>("computers");
   const [step, setStep] = useState<SetupStep>("identify");
+  const [nativeHost] = useState(() => isNativePreviewHost(window));
 
   const snapshot = source === "none" ? unavailableSnapshot() : fixtureSnapshot(source);
   const status = describeStatus(snapshot);
@@ -77,7 +79,9 @@ export default function UtilityPreview() {
       <div className="u-previewbar" role="region" aria-label="Development preview controls">
         <p className="u-previewbar-title">
           <span className="u-badge" data-kind="preview">Dev preview</span>
-          Utility UI — not connected to a native tray or agent
+          {nativeHost
+            ? "Native tray preview — no agent connected, owns no input"
+            : "Utility UI — not connected to a native tray or agent"}
         </p>
         <label className="u-field">
           <span>Preview scenario</span>

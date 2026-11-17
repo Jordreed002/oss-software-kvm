@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { sendCommand } from "./commands";
-import { shouldRenderUtilitySurface } from "./entry";
+import { isNativePreviewHost, shouldRenderUtilitySurface } from "./entry";
 import { FIXTURE_IDS, fixtureSnapshot } from "./fixtures";
 import { describeStatus, primaryAction, unavailableSnapshot } from "./model";
 
@@ -11,6 +11,12 @@ describe("utility entry gate", () => {
     expect(shouldRenderUtilitySurface(true, "")).toBe(false);
     expect(shouldRenderUtilitySurface(true, "?surface=legacy")).toBe(false);
     expect(shouldRenderUtilitySurface(true, "?utility")).toBe(false);
+  });
+
+  it("detects the native preview host only from the injected Tauri global", () => {
+    expect(isNativePreviewHost({ __TAURI_INTERNALS__: {} })).toBe(true);
+    expect(isNativePreviewHost({})).toBe(false);
+    expect(isNativePreviewHost({ __TAURI__: {} })).toBe(false);
   });
 });
 
