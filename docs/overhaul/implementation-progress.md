@@ -8,7 +8,7 @@ This note governs current status where earlier checkpoints differ. Those checkpo
 
 Opus delivered the UI redesign in `3651210`, changing only `AgentUtility.tsx`, `agent.css` and `AgentUtility.test.tsx`. Root passed TypeScript checking, all 122 frontend tests and the production build. Native Windows observation confirmed the connected redesigned view, unknown input authority, readiness at 0 of 6 and disabled controls. The view fit the native window without scrolling. Earlier statements that the UI had never been observed are historical, superseded only by the connected baseline and redesigned render evidence. Unavailable-state behavior, recovery and tray reopening remain unverified. Refresh after stopping the agent was not executed.
 
-The user reported a yellow monitor border, likely the Windows capture-tool indicator. Root stopped screenshot inspection, reset the Node capture kernel and stopped its owned Vite, utility, agent and inspection-helper processes. Screenshot inspection and native GUI tools remain stopped. This documentation update resumes neither. No KVM capture or sharing was enabled by the UI validation.
+The user reported a yellow monitor border, likely the Windows capture-tool indicator. Root stopped screenshot inspection, reset the Node capture kernel and stopped its owned Vite, utility and agent processes. Screenshot inspection and native GUI tools remain stopped. This documentation update resumes neither. No KVM capture or sharing was enabled by the UI validation.
 
 Benchmark commit `4c392ec` accepts the Opus-reviewed corrections. Documentation commit `7a401f2` preserves the original `eb40c9b` dirty-run identity and measurement scope. This does not close a physical gate or accept numerical release budgets.
 
