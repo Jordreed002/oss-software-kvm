@@ -40,6 +40,63 @@ fn validate_directory(directory: &Path, uid: u32) -> io::Result<()> {
     Ok(())
 }
 
+/// Connects after validating the private directory, socket and server UID.
+/// This proves a user boundary only. A schema/instance handshake must precede
+/// commands, and trusted ancestors remain a caller precondition.
+///
+/// # Errors
+/// Rejects unsafe/replaced socket paths, different peer UIDs and expired or
+/// unrepresentable budgets. Filesystem metadata checks are synchronous setup
+/// work; the deadline bounds the asynchronous connection, not a stalled disk.
+pub async fn connect(directory: &Path, budget: std::time::Duration) -> io::Result<UnixStream> {
+    if budget.is_zero() {
+        return Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            "socket connection budget expired",
+        ));
+    }
+    let deadline = tokio::time::Instant::now()
+        .checked_add(budget)
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "socket connection budget too large",
+            )
+        })?;
+    let uid = effective_uid();
+    validate_directory(directory, uid)?;
+    let path = directory.join("control.sock");
+    let before = fs::symlink_metadata(&path)?;
+    if !before.file_type().is_socket() || before.uid() != uid || before.mode() & 0o077 != 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "socket path rejected",
+        ));
+    }
+    let stream = tokio::time::timeout_at(deadline, UnixStream::connect(&path))
+        .await
+        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "socket connection timed out"))??;
+    if stream.peer_cred()?.uid() != uid {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "socket server UID rejected",
+        ));
+    }
+    let after = fs::symlink_metadata(&path)?;
+    if !after.file_type().is_socket()
+        || before.dev() != after.dev()
+        || before.ino() != after.ino()
+        || after.uid() != uid
+        || after.mode() & 0o077 != 0
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "socket path changed while connecting",
+        ));
+    }
+    Ok(stream)
+}
+
 /// Private filesystem listener admitting one client at a time.
 pub struct UserSocket {
     listener: UnixListener,
@@ -186,7 +243,9 @@ mod tests {
         assert!(UserSocket::bind(&directory.0).is_err());
         assert_eq!(fs::metadata(&directory.0).unwrap().mode() & 0o777, 0o700);
         assert_eq!(fs::metadata(server.path()).unwrap().mode() & 0o777, 0o600);
-        let mut client = UnixStream::connect(server.path()).await.unwrap();
+        let mut client = connect(&directory.0, std::time::Duration::from_secs(1))
+            .await
+            .unwrap();
         let mut connection = server.accept().await.unwrap();
         assert_eq!(
             server.accept().await.unwrap_err().kind(),
@@ -234,6 +293,39 @@ mod tests {
         fs::write(&path, b"preserve").unwrap();
         drop(server);
         assert_eq!(fs::read(&path).unwrap(), b"preserve");
+        fs::remove_file(path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn connector_rejects_symlink_and_invalid_budgets() {
+        let directory = Directory::new();
+        fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&directory.0)
+            .unwrap();
+        let path = directory.0.join("control.sock");
+        std::os::unix::fs::symlink("missing", &path).unwrap();
+        assert_eq!(
+            connect(&directory.0, std::time::Duration::from_secs(1))
+                .await
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::PermissionDenied
+        );
+        assert_eq!(
+            connect(&directory.0, std::time::Duration::ZERO)
+                .await
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::TimedOut
+        );
+        assert_eq!(
+            connect(&directory.0, std::time::Duration::MAX)
+                .await
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::InvalidInput
+        );
         fs::remove_file(path).unwrap();
     }
 }
