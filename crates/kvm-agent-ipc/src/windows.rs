@@ -194,10 +194,13 @@ fn verify_peer(pipe: &impl AsRawHandle, server_peer: bool, expected: &Identity) 
             GetNamedPipeClientProcessId(pipe.as_raw_handle().cast(), &raw mut pid)
         }
     };
-    if result == 0 {
-        return Err(io::Error::last_os_error());
-    }
-    require_identity(expected, process_identity(pid))
+    let peer = if result == 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        process_identity(pid)
+    };
+    require_identity(expected, peer)
+        .map_err(|error| io::Error::new(io::ErrorKind::PermissionDenied, error))
 }
 
 fn endpoint_name(channel: &str, identity: &Identity) -> io::Result<String> {
@@ -309,6 +312,14 @@ pub struct UserConnection {
     _permit: tokio::sync::OwnedSemaphorePermit,
 }
 
+impl Drop for UserPipe {
+    fn drop(&mut self) {
+        // A cancelled/failed accept may still own a connected client. Force
+        // it off even when no UserConnection was returned to the owner.
+        let _ = self.server.disconnect();
+    }
+}
+
 impl Drop for UserConnection {
     fn drop(&mut self) {
         // Force pending writes to fail. mio deliberately leaves writes alive
@@ -410,8 +421,9 @@ impl UserPipe {
         let next = loop {
             match create_server(&self.path, &self.identity.sid, false) {
                 Ok(server) => break server,
-                Err(error) if error.raw_os_error() == Some(231) => {
+                Err(error) if error.raw_os_error() == Some(ERROR_PIPE_BUSY.cast_signed()) => {
                     if tokio::time::Instant::now() >= deadline {
+                        let _ = self.server.disconnect();
                         return Err(io::Error::new(
                             io::ErrorKind::TimedOut,
                             "pipe handle retirement timed out",
@@ -419,7 +431,10 @@ impl UserPipe {
                     }
                     tokio::time::sleep(std::time::Duration::from_millis(1)).await;
                 }
-                Err(error) => return Err(error),
+                Err(error) => {
+                    let _ = self.server.disconnect();
+                    return Err(error);
+                }
             }
         };
         let stream = mem::replace(&mut self.server, next);
@@ -450,7 +465,10 @@ mod tests {
     fn identity_and_native_errors_fail_closed() {
         let expected = current_identity().unwrap();
         require_identity(&expected, process_identity(std::process::id())).unwrap();
-        assert!(process_identity(0).is_err());
+        assert_eq!(
+            process_identity(0).unwrap_err().kind(),
+            io::ErrorKind::PermissionDenied
+        );
         assert!(require_identity(&expected, Err(io::Error::from_raw_os_error(5))).is_err());
         for peer in [
             Identity {
@@ -639,5 +657,51 @@ mod tests {
         .await
         .unwrap();
         assert!(matches!(result, Ok(0) | Err(_)));
+    }
+
+    #[tokio::test]
+    async fn unknown_peer_is_classified_as_untrusted() {
+        let server = UserPipe::bind(&channel()).unwrap();
+        let error = verify_peer(&server.server, false, &server.identity).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+        assert!(
+            error.get_ref().is_some(),
+            "preserve the native failure as a source"
+        );
+    }
+
+    #[tokio::test]
+    async fn final_reply_survives_slow_reader_when_owner_waits_for_eof() {
+        let name = channel();
+        let mut listener = UserPipe::bind(&name).unwrap();
+        let (written, ready) = tokio::sync::oneshot::channel();
+        let serve = async {
+            let mut connection = listener.accept().await.unwrap();
+            crate::write_frame(connection.stream(), b"final status", 32)
+                .await
+                .unwrap();
+            written.send(()).unwrap();
+            let mut eof = [0_u8; 1];
+            let count =
+                tokio::time::timeout(Duration::from_secs(1), connection.stream().read(&mut eof))
+                    .await
+                    .unwrap()
+                    .unwrap();
+            assert_eq!(count, 0);
+            // Drop now forces disconnect only AFTER the client consumed its
+            // response and closed. A successful write alone is insufficient.
+        };
+        let request = async {
+            let mut client = connect(&name, Duration::from_secs(1)).await.unwrap();
+            ready.await.unwrap();
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            let mut storage = [0_u8; 32];
+            assert_eq!(
+                crate::read_frame(&mut client, &mut storage).await.unwrap(),
+                Some(b"final status".as_slice())
+            );
+            drop(client);
+        };
+        tokio::join!(serve, request);
     }
 }
