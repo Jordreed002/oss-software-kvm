@@ -690,6 +690,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "kvm-agent-ipc"
+version = "0.1.0"
+dependencies = [
+ "tokio",
+]
+
+[[package]]
 name = "kvm-agent-model"
 version = "0.1.0"
 
