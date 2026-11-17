@@ -2,6 +2,12 @@
 
 These endpoints are prototypes. Do not expose mutating commands until the remaining authorization and protocol gates below are satisfied. User identity is not installed-application identity.
 
+## Native Darwin verification at f0a6321
+
+The linked Apple Silicon Mac executed the exact source archive for `f0a632102168d5f8203f92772f8b7832bb99565f`, SHA-256 `10a4db911e41b80759ce0ab903dbe992445ab9e2b5f3b102a4c4e08611ec2fd1`, on macOS 27.0.1 and Rust/Cargo 1.97.1. All 107 focused tests passed, including `private_fixture_acl_policy` and `status_roundtrip_uses_verified_native_socket`; strict all-target clippy passed offline. The canonical status socket was 90 bytes. No dependencies downloaded, and the source artifact's 413 files remained unchanged. The original Mac checkout and its four modified files were preserved byte-for-byte.
+
+This supersedes earlier pending-native-Darwin notes for these ACL/socket tests. It does not certify signed application identity, hostile-user access policies, installed lifecycle, native capture/injection, physical latency or a release. Final Opus review accepted the API and owner for read-only prototype status; mutating command exposure remains gated.
+
 ## Windows review and corrections
 
 Follow-up Opus review of `6ccda8d` accepted the account/session checks for read-only status integration. It did not accept mutating commands or claim process-signature, elevation, Low-IL or second-user acceptance. Coordinator subsequently normalized peer-verification failures to `PermissionDenied` while retaining the native error source, disconnected clients on listener-replacement failures, forced disconnect on listener Drop, and strengthened the PID-zero error test. A new slow-reader regression proves that an owner waiting for client EOF preserves the final reply before forced disconnect. This is a required owner protocol pattern, not an automatic guarantee supplied by writing a frame.

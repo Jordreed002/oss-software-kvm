@@ -18,12 +18,12 @@ cd "$repo"
 # Missing toolchains/components must fail, never trigger rustup installation.
 export RUSTUP_AUTO_INSTALL=0
 run() { printf '\nRunning:'; printf ' %s' "$@"; printf '\n'; "$@"; }
-core() { run cargo "$@" -p kvm-foundation -p kvm-agent-model -p kvm-agent-ipc; }
+core() { run cargo "$@" -p kvm-foundation -p kvm-agent-model -p kvm-agent-ipc -p kvm-agent-api -p kvm-agent; }
 printf '%s\n' 'Software checks only; no physical/native input certification.'
-run cargo fmt -p kvm-foundation -p kvm-agent-model -p kvm-agent-ipc -- --check
+run cargo fmt -p kvm-foundation -p kvm-agent-model -p kvm-agent-ipc -p kvm-agent-api -p kvm-agent -- --check
 core test --locked --offline --lib --tests
 # Package options must precede the rustc/clippy argument separator.
-run cargo clippy --locked --offline -p kvm-foundation -p kvm-agent-model -p kvm-agent-ipc --all-targets -- -D warnings
+run cargo clippy --locked --offline -p kvm-foundation -p kvm-agent-model -p kvm-agent-ipc -p kvm-agent-api -p kvm-agent --all-targets -- -D warnings
 if "$macos"; then
     installed=$(rustup target list --installed)
     found=false
@@ -33,7 +33,7 @@ $installed
 " in
             *"
 $target
-"*) found=true; run cargo clippy --locked --offline -p kvm-foundation -p kvm-agent-model -p kvm-agent-ipc --all-targets --target "$target" -- -D warnings ;;
+"*) found=true; run cargo clippy --locked --offline -p kvm-foundation -p kvm-agent-model -p kvm-agent-ipc -p kvm-agent-api -p kvm-agent --all-targets --target "$target" -- -D warnings ;;
         esac
     done
     if ! "$found"; then printf '%s\n' 'Skipping macOS: no Apple target installed.'; fi

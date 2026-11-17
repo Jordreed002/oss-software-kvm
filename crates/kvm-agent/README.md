@@ -24,6 +24,7 @@ total connection lifetime. Requests must follow request/reply lockstep.
 Repeated Hello or excess requests close without a reply, and unread pipelined
 responses can be discarded. Failure never produces a fabricated idle snapshot.
 
-Current evidence covers software tests, native Windows/Linux endpoint round
-trips and a separate-process Windows status smoke check. Native macOS execution,
-installed lifecycle, physical input and performance acceptance remain pending.
+Current evidence covers software tests, native Windows/Linux/macOS endpoint round
+trips and separate-process Windows/Linux status smoke checks. The Darwin ACL fixture
+also passed on native Apple Silicon. Installed lifecycle, physical input and
+performance acceptance remain pending.

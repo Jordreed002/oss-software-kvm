@@ -26,7 +26,7 @@ Push-Location -LiteralPath $repo
 try {
     $env:RUSTUP_AUTO_INSTALL = '0'
     Write-Host 'Software checks only; no physical/native input certification.'
-    $packages = @('-p', 'kvm-foundation', '-p', 'kvm-agent-model', '-p', 'kvm-agent-ipc')
+    $packages = @('-p', 'kvm-foundation', '-p', 'kvm-agent-model', '-p', 'kvm-agent-ipc', '-p', 'kvm-agent-api', '-p', 'kvm-agent')
     Invoke-Check cargo (@('fmt') + $packages + @('--', '--check'))
     Invoke-Check cargo (@('test', '--locked', '--offline') + $packages + @('--lib', '--tests'))
     Invoke-Check cargo (@('clippy', '--locked', '--offline') + $packages + @('--all-targets', '--', '-D', 'warnings'))
