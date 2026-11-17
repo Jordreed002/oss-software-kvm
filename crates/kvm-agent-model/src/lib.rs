@@ -149,6 +149,19 @@ impl Lifecycle {
         self.cleanup_failed
     }
 
+    /// Whether cancelled preparation must still finish/fence before a drain
+    /// can run. A status client can distinguish this from cleanup in progress.
+    #[must_use]
+    pub const fn waiting_for_preparation(&self) -> bool {
+        matches!(
+            self.state,
+            State::Draining {
+                preparing: true,
+                ..
+            }
+        )
+    }
+
     /// Necessary but insufficient for suppression: current peer health,
     /// authority and exact-session queue reservation are additional checks.
     #[must_use]
@@ -510,5 +523,33 @@ mod tests {
         assert_eq!(model.retry_cleanup(), Err(Rejected::DrainAttemptExhausted));
         assert_eq!(model, before);
         assert!(!model.permits_admission());
+    }
+
+    #[test]
+    fn future_cleanup_attempt_cannot_complete_current_attempt() {
+        let (mut model, _) = active();
+        let current = drain(model.pause());
+        let forged = DrainTicket {
+            attempt: current.attempt + 1,
+            ..current
+        };
+        let before = model.clone();
+        assert_eq!(model.drained(forged, true), Err(Rejected::StaleCompletion));
+        assert_eq!(model, before);
+        model.drained(current, true).unwrap();
+    }
+
+    #[test]
+    fn cleanup_retry_cannot_skip_preparation_fence() {
+        let mut model = Lifecycle::new(1);
+        let ticket = start(&mut model);
+        assert_eq!(model.pause(), Effect::CancelPrepare(ticket));
+        assert!(model.waiting_for_preparation());
+        let before = model.clone();
+        assert_eq!(model.retry_cleanup(), Err(Rejected::NoCleanupRetry));
+        assert_eq!(model, before);
+        let cleanup = drain(model.prepared(ticket, false, READY).unwrap());
+        assert!(!model.waiting_for_preparation());
+        model.drained(cleanup, true).unwrap();
     }
 }
