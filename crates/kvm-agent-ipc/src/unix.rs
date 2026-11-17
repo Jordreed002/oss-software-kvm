@@ -3,11 +3,13 @@
 //! The caller must choose a stable application-owned runtime directory beneath
 //! trusted ancestors. This validates the immediate directory, not every ancestor
 //! against concurrent rename. Peer UID checks establish a user boundary, not
-//! signed application identity. No stale socket is deleted automatically.
+//! signed application identity. A lifetime lock permits recovery of an owned
+//! socket only after an asynchronous probe confirms connection refusal.
 
 use std::os::unix::{
     ffi::OsStrExt,
-    fs::{DirBuilderExt, FileTypeExt, MetadataExt, PermissionsExt},
+    fs::{DirBuilderExt, FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt},
+    io::AsRawFd,
 };
 use std::{
     fs, io,
@@ -38,6 +40,84 @@ fn validate_directory(directory: &Path, uid: u32) -> io::Result<()> {
         ));
     }
     Ok(())
+}
+
+#[allow(unsafe_code)]
+fn lock_directory(directory: &Path, uid: u32) -> io::Result<fs::File> {
+    let file = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(directory.join("agent.lock"))?;
+    let metadata = file.metadata()?;
+    if !metadata.is_file()
+        || metadata.uid() != uid
+        || metadata.mode() & 0o077 != 0
+        || metadata.nlink() != 1
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "runtime lock file rejected",
+        ));
+    }
+    // SAFETY: file owns a valid fd. Nonblocking flock never waits for another
+    // agent and is released by the OS when this file/process closes.
+    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+        let error = io::Error::last_os_error();
+        return Err(if error.kind() == io::ErrorKind::WouldBlock {
+            io::Error::new(
+                io::ErrorKind::AddrInUse,
+                "agent instance already owns runtime directory",
+            )
+        } else {
+            error
+        });
+    }
+    Ok(file)
+}
+
+async fn retire_stale(path: &Path, uid: u32) -> io::Result<()> {
+    let before = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error),
+    };
+    if !before.file_type().is_socket() || before.uid() != uid {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "existing socket path is not an owned socket",
+        ));
+    }
+    match tokio::time::timeout(
+        std::time::Duration::from_millis(100),
+        UnixStream::connect(path),
+    )
+    .await
+    {
+        Ok(Err(error)) if error.kind() == io::ErrorKind::ConnectionRefused => {}
+        _ => {
+            return Err(io::Error::new(
+                io::ErrorKind::AddrInUse,
+                "socket is active or stale state cannot be confirmed",
+            ))
+        }
+    }
+    let after = fs::symlink_metadata(path)?;
+    if !after.file_type().is_socket()
+        || after.uid() != uid
+        || before.dev() != after.dev()
+        || before.ino() != after.ino()
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "stale socket path changed",
+        ));
+    }
+    // The lifetime lock excludes other compliant owners. Same-UID malicious
+    // replacement remains outside this prototype's trust model.
+    fs::remove_file(path)
 }
 
 /// Connects after validating the private directory, socket and server UID.
@@ -97,7 +177,8 @@ pub async fn connect(directory: &Path, budget: std::time::Duration) -> io::Resul
     Ok(stream)
 }
 
-/// Private filesystem listener admitting one client at a time.
+/// Mode-restricted listener admitting one client at a time.
+/// macOS extended ACL and ancestor validation remain production gates.
 pub struct UserSocket {
     listener: UnixListener,
     path: PathBuf,
@@ -105,6 +186,7 @@ pub struct UserSocket {
     device: u64,
     inode: u64,
     admission: Arc<Semaphore>,
+    _lock: fs::File,
 }
 
 impl std::fmt::Debug for UserSocket {
@@ -128,13 +210,20 @@ impl UserConnection {
 }
 
 impl UserSocket {
-    /// Creates a 0700 directory if absent; rejects unsafe existing directories.
-    /// Binds control.sock without unlinking existing files, sockets or symlinks.
+    /// Creates a 0700 directory if absent and requires a user-owned private mode.
+    /// Holds a lifetime lock; recovers only an owned, confirmed stale socket.
+    /// Never unlinks regular files or symlinks. Requires a Tokio I/O runtime.
     ///
     /// # Errors
     /// Rejects untrusted immediate directories, excessive path length, occupied
     /// paths and native failures. Ancestor trust is a caller precondition.
-    pub fn bind(directory: &Path) -> io::Result<Self> {
+    pub async fn bind(directory: &Path) -> io::Result<Self> {
+        if !directory.is_absolute() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "absolute runtime directory required",
+            ));
+        }
         let uid = effective_uid();
         match fs::DirBuilder::new().mode(0o700).create(directory) {
             Ok(()) => {}
@@ -142,6 +231,7 @@ impl UserSocket {
             Err(error) => return Err(error),
         }
         validate_directory(directory, uid)?;
+        let lock = lock_directory(directory, uid)?;
         let path = directory.join("control.sock");
         // Conservative common limit fits macOS sockaddr_un (104 bytes).
         if path.as_os_str().as_bytes().len() > 100 {
@@ -150,6 +240,7 @@ impl UserSocket {
                 "runtime socket path too long",
             ));
         }
+        retire_stale(&path, uid).await?;
         let listener = UnixListener::bind(&path)?;
         let metadata = fs::symlink_metadata(&path)?;
         if !metadata.file_type().is_socket() || metadata.uid() != uid {
@@ -165,6 +256,7 @@ impl UserSocket {
             device: metadata.dev(),
             inode: metadata.ino(),
             admission: Arc::new(Semaphore::new(1)),
+            _lock: lock,
         };
         // Directory privacy protects the bind-to-chmod interval.
         fs::set_permissions(&socket.path, fs::Permissions::from_mode(0o600))?;
@@ -181,7 +273,9 @@ impl UserSocket {
     ///
     /// # Errors
     /// Returns `WouldBlock` while a connection is held; rejects unknown/different
-    /// peer UIDs. The owner must enforce API negotiation and read/write deadlines.
+    /// peer UIDs. Cancelling accept releases its permit and is recoverable; a
+    /// rejected UID is non-terminal. A pending accept also owns admission. The
+    /// owner must enforce API negotiation and read/write deadlines.
     pub async fn accept(&self) -> io::Result<UserConnection> {
         let permit = self.admission.clone().try_acquire_owned().map_err(|_| {
             io::Error::new(io::ErrorKind::WouldBlock, "socket client already active")
@@ -232,6 +326,7 @@ mod tests {
     }
     impl Drop for Directory {
         fn drop(&mut self) {
+            let _ = fs::remove_file(self.0.join("agent.lock"));
             let _ = fs::remove_dir(&self.0);
         }
     }
@@ -239,8 +334,13 @@ mod tests {
     #[tokio::test]
     async fn private_socket_roundtrip_and_collision() {
         let directory = Directory::new();
-        let server = UserSocket::bind(&directory.0).unwrap();
-        assert!(UserSocket::bind(&directory.0).is_err());
+        let server = UserSocket::bind(&directory.0).await.unwrap();
+        let inode = fs::symlink_metadata(server.path()).unwrap().ino();
+        assert_eq!(
+            UserSocket::bind(&directory.0).await.unwrap_err().kind(),
+            io::ErrorKind::AddrInUse
+        );
+        assert_eq!(fs::symlink_metadata(server.path()).unwrap().ino(), inode);
         assert_eq!(fs::metadata(&directory.0).unwrap().mode() & 0o777, 0o700);
         assert_eq!(fs::metadata(server.path()).unwrap().mode() & 0o777, 0o600);
         let mut client = connect(&directory.0, std::time::Duration::from_secs(1))
@@ -278,7 +378,7 @@ mod tests {
         fs::create_dir(&directory.0).unwrap();
         fs::set_permissions(&directory.0, fs::Permissions::from_mode(0o755)).unwrap();
         assert_eq!(
-            UserSocket::bind(&directory.0).unwrap_err().kind(),
+            UserSocket::bind(&directory.0).await.unwrap_err().kind(),
             io::ErrorKind::PermissionDenied
         );
         assert_eq!(fs::metadata(&directory.0).unwrap().mode() & 0o777, 0o755);
@@ -287,7 +387,7 @@ mod tests {
     #[tokio::test]
     async fn drop_does_not_remove_replacement_file() {
         let directory = Directory::new();
-        let server = UserSocket::bind(&directory.0).unwrap();
+        let server = UserSocket::bind(&directory.0).await.unwrap();
         let path = server.path().to_owned();
         fs::remove_file(&path).unwrap();
         fs::write(&path, b"preserve").unwrap();
@@ -327,5 +427,70 @@ mod tests {
             io::ErrorKind::InvalidInput
         );
         fs::remove_file(path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn stale_socket_recovered_only_when_lock_is_free() {
+        let directory = Directory::new();
+        fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&directory.0)
+            .unwrap();
+        let path = directory.0.join("control.sock");
+        let stale = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        drop(stale);
+        let server = UserSocket::bind(&directory.0).await.unwrap();
+        let client = connect(&directory.0, std::time::Duration::from_secs(1))
+            .await
+            .unwrap();
+        let connection = server.accept().await.unwrap();
+        drop(connection);
+        drop(client);
+        drop(server);
+        assert!(!path.exists());
+        assert!(directory.0.join("agent.lock").exists());
+        let next = UserSocket::bind(&directory.0).await.unwrap();
+        drop(next);
+    }
+
+    #[tokio::test]
+    async fn regular_file_is_preserved_and_relative_path_rejected() {
+        let directory = Directory::new();
+        fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&directory.0)
+            .unwrap();
+        let path = directory.0.join("control.sock");
+        fs::write(&path, b"preserve").unwrap();
+        assert_eq!(
+            UserSocket::bind(&directory.0).await.unwrap_err().kind(),
+            io::ErrorKind::PermissionDenied
+        );
+        assert_eq!(fs::read(&path).unwrap(), b"preserve");
+        fs::remove_file(path).unwrap();
+        assert_eq!(
+            UserSocket::bind(Path::new("relative-runtime"))
+                .await
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::InvalidInput
+        );
+    }
+
+    #[tokio::test]
+    async fn cancelled_accept_releases_admission() {
+        let directory = Directory::new();
+        let server = UserSocket::bind(&directory.0).await.unwrap();
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(5), server.accept())
+                .await
+                .is_err()
+        );
+        let client = connect(&directory.0, std::time::Duration::from_secs(1))
+            .await
+            .unwrap();
+        let connection = server.accept().await.unwrap();
+        drop(connection);
+        drop(client);
     }
 }
