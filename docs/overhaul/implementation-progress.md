@@ -94,3 +94,56 @@ That version used 2,000 warmup calls and 10,000 individually timed samples per o
 Earlier collector verification passed seven tests covering arguments, missing tools, explicit toolchain selection, unmeasured fields, output protection, non-overwrite behavior, symlinked parent protection and CLI behavior without native tools on PATH. Collector smoke checks parsed stdout and a new ignored JSON file and confirmed overwrite rejection. Coordinator reran the seven tests before `7848029` acceptance. This remains historical tooling evidence.
 
 Future updates must attach integrated SHA and actual review/check evidence. Delegation, fixtures and software microbenchmarks do not close native or physical phase gates.
+
+## Windows IPC peer checks delivery, 2026-11-17
+
+Bounded implementation delivered against inspected HEAD `ff80d16c4a3d5cbcb9fa24b4388787ab4a202b53`. Only `crates/kvm-agent-ipc/src/windows.rs`, its Windows dependency features and this ledger changed. No commits or branches were created. The independent GLM API lane remains in progress and was not edited.
+
+Client and server query the named-pipe peer PID, open the process with limited query access, query its token user SID and Windows session, and require both to match the current process. Unknown PID, native query errors and mismatches fail closed. SYSTEM has no peer-validation exception for this per-user agent, although the existing creation DACL still includes SYSTEM. Owned process/token handles and LocalAlloc buffers have narrow RAII lifetimes and explicit unsafe safety comments. The first token-size query now requires ERROR_INSUFFICIENT_BUFFER and preserves other native errors.
+
+Both sides use one deterministic endpoint-name helper containing account SID, Windows session ID and validated channel. The async client connector accepts a caller timeout, retries only ERROR_FILE_NOT_FOUND and ERROR_PIPE_BUSY, retains Tokio's default identification SQOS, and validates the server immediately after opening, before returning the stream. It sends no messages. Its deadline bounds retry waits and checks expiration around native calls; synchronous Windows identity/open calls cannot be preempted by the async timer. Server rejection disconnects the client and retains terminal poison behavior. Cancellation and existing connection admission/rotation behavior remain covered.
+
+Actual native Windows validation passed 12 tests, strict all-target clippy, and the macOS cfg/type check below. The initial shared-workspace command `cargo test --locked --offline -p kvm-agent-ipc --all-targets` stopped before compilation because Cargo required a lockfile update with the concurrent untracked API member present. To preserve ownership and leave the shared lockfile untouched, validation copied the exact IPC crate, root workspace manifest/lints and starting lockfile to `C:\Users\jordr\AppData\Local\Temp\kvm-ipc-validation-66c31927a0394efe971f1cb602f5d184`. Its initial `cargo test --offline --manifest-path <copy>/Cargo.toml -p kvm-agent-ipc --all-targets` resolved that copy's lockfile and passed. Strict clippy initially found three numeric cast warnings; these were fixed before the final successful commands:
+
+```powershell
+cargo fmt -p kvm-agent-ipc
+cargo test --locked --offline --manifest-path C:\Users\jordr\AppData\Local\Temp\kvm-ipc-validation-66c31927a0394efe971f1cb602f5d184/Cargo.toml -p kvm-agent-ipc --all-targets
+cargo clippy --locked --offline --manifest-path C:\Users\jordr\AppData\Local\Temp\kvm-ipc-validation-66c31927a0394efe971f1cb602f5d184/Cargo.toml -p kvm-agent-ipc --all-targets -- -D warnings
+cargo check --locked --offline --manifest-path C:\Users\jordr\AppData\Local\Temp\kvm-ipc-validation-66c31927a0394efe971f1cb602f5d184/Cargo.toml -p kvm-agent-ipc --target aarch64-apple-darwin --tests
+```
+
+Tests include real current-user/current-session client/server bidirectional frame exchange, collision rejection, missing/busy connector timeout and delayed availability, identity query error propagation, zero PID rejection, mismatched SID/session helpers, endpoint session separation, and native server-rejection disconnect/poison behavior using an intentionally mismatched expected session. Those mismatch cases do not establish second-user, other-session process or LowIL coverage. No users were created, privileges changed or capture launched. The macOS check compiled types/tests only; it did not run on macOS.
+
+Review and integrated workspace rerun remain coordinator work. Signed application identity and exclusion of malicious same-user/same-session processes are not provided. Read-back owner/ACL/label checks, second-user/LowIL and remote adversarial tests, approved integrity/logon policy, protocol authorization/deadlines, installed agent lifecycle and all native capture/injection and physical performance acceptance remain open. No agent command, send success or native input delivery is claimed by this endpoint work.
+
+## Rebuild check scripts checkpoint, 2026-11-17
+
+This checkpoint supersedes the earlier pending delivery/review wording for code now accepted in `08dac0e`, `6ccda8d` and `19f54d8`. Earlier Sol ledger entries and benchmark identities above remain historical evidence. `6ccda8d` contains Windows client/server SID and session validation and endpoint namespacing. `19f54d8` contains the validated Unix client connector. The protected Unix directory and same-UID checks establish a user boundary, not signed application identity. Windows SID/session matching likewise does not exclude malicious processes in the same user/session.
+
+New bounded tooling is delivered in `scripts/check-rebuild.ps1` and `scripts/check-rebuild.sh`. It needs existing Cargo/rustup, rustfmt and clippy, with no script dependencies. Default checks select only `kvm-foundation`, `kvm-agent-model` and `kvm-agent-ipc`: package-focused format checking, locked offline library/integration tests and strict all-target clippy. Tests deliberately omit custom benchmark targets. The scripts stop at the first failing command and reject unknown options. Rustup automatic installation is disabled for their duration. Missing tools/components or unavailable locked offline dependencies fail without installation.
+
+Run from any directory, including paths with spaces:
+
+```powershell
+& 'C:\dev\oss-software-kvm\scripts\check-rebuild.ps1'
+& 'C:\dev\oss-software-kvm\scripts\check-rebuild.ps1' -MacOS
+```
+
+```sh
+sh /path/to/oss-software-kvm/scripts/check-rebuild.sh
+sh /path/to/oss-software-kvm/scripts/check-rebuild.sh --macos
+```
+
+`-MacOS` / `--macos` runs strict all-target clippy for each installed Apple target, or reports an explicit skip. It never installs targets or executes macOS code. `-Panel` / `--panel` explicitly selects existing frontend test/build commands and requires prepared npm dependencies. `-Tauri` / `--tauri` independently selects fmt, locked offline library/integration tests and strict all-target clippy for `apps/control-panel/src-tauri/Cargo.toml`, which is outside the root workspace. Neither optional panel lane was run in this increment. No command launches capture, an application, a server or benchmarks, or changes configuration.
+
+Actual root-workspace script verification in this increment:
+
+- Windows `powershell -NoProfile -File scripts/check-rebuild.ps1 -MacOS` passed focused fmt, IPC 12, model 14, foundation 23 unit tests and one allocator integration test, strict host all-target clippy and strict Apple Silicon all-target cross-clippy. Cargo emitted a nonfatal incremental-cache access-denied note during test compilation; the checks completed successfully.
+- Ubuntu WSL `sh /mnt/c/dev/oss-software-kvm/scripts/check-rebuild.sh --macos` passed focused fmt, IPC 9, model 14, foundation 23 unit tests and one allocator integration test, and strict Linux all-target clippy. This is a newly observed Linux clippy pass, independent of the rerun pending at assignment. No Apple target was installed, so that option reported a skip.
+- Windows help and unknown-option rejection and POSIX unknown-option rejection were exercised. POSIX syntax and help were checked separately. Core checks resolve the repository from the script location, not the caller's directory.
+
+WSL used only existing isolated `CARGO_HOME=target/wsl-tools/cargo`, `RUSTUP_HOME=target/wsl-tools/rustup` and `CARGO_TARGET_DIR=target/wsl-check`, with absolute `/mnt/c/dev/oss-software-kvm/` prefixes and its Cargo bin directory on PATH. Bootstrap/check helpers and toolchains under ignored `target` are local validation artifacts, not shipped tooling. Windows Rust 1.97.1 and Linux Rust 1.100.0 differ. These correctness checks are not controlled same-toolchain performance comparisons, and no benchmarks were run.
+
+GLM API task `214f83f0` remains in progress and unaccepted, with Opus review required. Its untracked crate and possible shared uncommitted `Cargo.lock` entry were not edited or staged by this lane. No commits, branches, manifests, lockfiles, application code or UI were changed by this increment.
+
+Remaining gates include macOS execution, agent-command integration, native capture/injection, hardware latency/release/energy/resource measurement, adversarial endpoint policy tests, signed application identity, installed lifecycle and release acceptance. These scripts provide no physical or native input certification. Earlier metadata collector and lifecycle benchmark work remains delivered with its recorded scope and limitations.
