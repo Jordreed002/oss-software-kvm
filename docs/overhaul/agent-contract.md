@@ -48,6 +48,14 @@ Do not let command floods starve cleanup or input processing. Each queue has a c
 
 Forced termination is not acknowledged cleanup. Recovery guidance must distinguish killed, drained and unknown states. Late events/commands from a retired generation cannot reactivate it.
 
+### Preparation cancellation and cleanup attempts
+
+The lifecycle model requires an explicit fence before cleanup of cancelled startup can complete. Pause during preparation issues `CancelPrepare`, closes admission immediately and stays draining. The owner cancels and joins the preparation task, including late resource acquisitions, before reporting `prepared`. That completion then issues the final `Drain`. An early sweep cannot certify teardown while preparation is outstanding.
+
+Drain attempts have identities distinct from session-generation tickets. Repeated Pause/Failsafe calls do not spawn overlapping drains. Failed cleanup remains visibly unconfirmed and requires an explicit retry with a new attempt ID. Success from an old attempt cannot clear a later failure or generation. Safety-latch visibility is independent of lifecycle phase, including during failed cleanup.
+
+Each model is constructed with a fresh owner instance epoch, which must remain unique while old tasks or results can exist. The installed agent must source that identity securely; an in-process replacement cannot reset operation numbering without changing the epoch. The model does not implement cancellation, joining or native resource cleanup itself.
+
 ## Configuration and enrollment
 
 Use draft/validate/commit transactions with expected revisions and atomic durable writes. Apply layout only after inventories and peer revision confirmation agree. Initially stop/edit/validate/restart is acceptable; do not implement unsafe partial live mutation for visual responsiveness.
