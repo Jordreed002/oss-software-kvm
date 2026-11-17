@@ -21,7 +21,40 @@ Observed branch: `overhaul/widget-app-planning`. Inspected HEAD: `5b1688cbc95af3
 
 Coordinator integration addendum: the lifecycle model now has 14 passing tests, including forged future cleanup attempts and retry during an outstanding preparation fence, plus a `waiting_for_preparation` status accessor. New `kvm-agent-ipc` provides bounded, caller-buffer framing only; its five tests cover fragmented reads, exact boundaries, rejected lengths before body reads, partial frames and rejected writes. Both packages pass actual-workspace strict clippy. The framing layer implements no native endpoint or authorization, so the native-agent gate stays open. These checks extend the earlier checkpoint; they do not retroactively change the recorded benchmark build identity.
 
+Held-control implementation delivery, 2026-11-17: `crates/kvm-foundation/src/held.rs` and minimal `src/lib.rs` exports are delivered in the working tree, awaiting coordinator verification. No acceptance, commit or branch change is claimed. Accepted foundation remains `f4ddbf3`; lifecycle evidence remains 14 tests and IPC framing `453912b` remains five tests. Native transport and capture remain pending.
+
+`HeldSet<T: Copy + Eq, N>` stores device-specific keys/buttons inline without allocation, unsafe code or synchronization. Duplicate presses consume no slot, full insertion preserves existing work, and cleanup freezes press/release mutation. Peek retains work until the owner confirms the exact current token and control. Finish requires an empty ledger. Debug output redacts controls and tokens. The owner must supply fresh tokens across owner/session cleanup generations. Confirmation records the owner's acknowledgement of exact work, not polling, queue admission, native delivery or transport proof. Motion and scroll have no ledger representation.
+
+Actual-workspace checks passed for this delivery:
+
+```text
+cargo fmt --all -- --check
+cargo test --locked --offline -p kvm-foundation
+cargo clippy --locked --offline -p kvm-foundation --all-targets -- -D warnings
+```
+
+Tests passed: 23 foundation unit tests, including the six new tests below, one existing queue allocator integration test, and zero doc tests. The existing allocator test covers the queue only; held storage's allocation-free implementation follows directly from its inline array operations.
+
+```text
+held::tests::full_duplicate_and_release_are_lossless
+held::tests::distinct_devices_and_control_families_have_distinct_slots
+held::tests::zero_capacity_can_complete_empty_cleanup
+held::tests::cleanup_freezes_mutations_and_failed_send_retains_head
+held::tests::stale_acknowledgements_cannot_change_a_new_cleanup
+held::tests::debug_redacts_controls_devices_and_opaque_tokens
+```
+
 ## Phase gates
+
+## Native and held-state integration checkpoint
+
+- `08dac0e`: Sol's bounded held-input ledger accepted after coordinator source review, 23 foundation unit tests plus the allocation integration test, and strict workspace clippy. The ledger itself has six tests covering sealed cleanup, retained pending releases and stale acknowledgements. Native delivery is not established by ledger acknowledgement.
+- `d850edf`: Opus native utility preview shell accepted as development-only groundwork. Coordinator reran six Tauri preview tests, all 85 frontend tests and the production build. Runtime flag selects a shell owning no legacy setup/discovery/capture. Native desktop behavior has not been launched/observed and macOS paths have not been compiled. Single-instance and real tray anchoring remain absent.
+- `dcd1466`: Windows user-scoped named-pipe listener prototype. Seven IPC tests and strict clippy pass, including actual same-user Windows roundtrip, occupied-name rejection and sequential client rotation. A protected DACL is constructed for the process user and SYSTEM, remote clients are rejected, and listener admission is bounded. Opus native/security review is pending. Installed-agent identity, cross-user authorization tests, cross-session policy, Unix/macOS endpoint implementation and agent-command integration remain incomplete.
+
+These are intermediate implementations, not physical input-path or release acceptance. The serialized API is still in its GLM implementation lane and requires Opus review before acceptance.
+
+## Phase gates continued
 
 | Phase | Actual state | Outstanding evidence |
 | --- | --- | --- |
