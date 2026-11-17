@@ -435,4 +435,111 @@ mod tests {
         let (result, ()) = tokio::join!(serve, request);
         assert_eq!(result, Ok(()));
     }
+
+    async fn request_reply(
+        client: &mut tokio::io::DuplexStream,
+        request: &ClientMessage,
+    ) -> ServerMessage {
+        let bytes = kvm_agent_api::encode_client(request).unwrap();
+        kvm_agent_ipc::write_frame(client, &bytes, MAX_PAYLOAD_BYTES)
+            .await
+            .unwrap();
+        let mut storage = vec![0; MAX_PAYLOAD_BYTES];
+        let reply = kvm_agent_ipc::read_frame(client, &mut storage)
+            .await
+            .unwrap()
+            .unwrap();
+        kvm_agent_api::decode_server(reply).unwrap()
+    }
+
+    async fn request_limit(extra_request: bool) -> Result<(), ServiceError> {
+        let agent = Agent::new();
+        let before = agent.snapshot();
+        let (mut client, mut server) = tokio::io::duplex(256);
+        let serve = agent.serve_connection(&mut server, std::time::Duration::from_secs(1));
+        let request = async {
+            let ServerMessage::Hello(hello) = request_reply(&mut client, &hello()).await else {
+                panic!("expected Hello")
+            };
+            for id in 0..7 {
+                let query = ClientMessage::SnapshotRequest(SnapshotRequest {
+                    instance: hello.instance,
+                    correlation_id: CorrelationId::new(id),
+                });
+                let ServerMessage::Snapshot(reply) = request_reply(&mut client, &query).await
+                else {
+                    panic!("expected snapshot")
+                };
+                assert_eq!(reply.correlation_id, CorrelationId::new(id));
+                assert_eq!(reply.snapshot, before);
+            }
+            if extra_request {
+                let query = ClientMessage::SnapshotRequest(SnapshotRequest {
+                    instance: hello.instance,
+                    correlation_id: CorrelationId::new(8),
+                });
+                let bytes = kvm_agent_api::encode_client(&query).unwrap();
+                kvm_agent_ipc::write_frame(&mut client, &bytes, MAX_PAYLOAD_BYTES)
+                    .await
+                    .unwrap();
+            }
+            drop(client);
+        };
+        let (result, ()) = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            tokio::join!(serve, request)
+        })
+        .await
+        .unwrap();
+        assert_eq!(agent.snapshot(), before);
+        result
+    }
+
+    #[tokio::test]
+    async fn eight_requests_complete_when_client_closes() {
+        assert_eq!(request_limit(false).await, Ok(()));
+    }
+
+    #[tokio::test]
+    async fn ninth_request_is_rejected_without_changing_owner() {
+        assert_eq!(request_limit(true).await, Err(ServiceError::Protocol));
+    }
+
+    #[tokio::test]
+    async fn eof_before_hello_is_clean_without_changing_owner() {
+        let agent = Agent::new();
+        let before = agent.snapshot();
+        let (client, mut server) = tokio::io::duplex(32);
+        drop(client);
+        assert_eq!(
+            agent
+                .serve_connection(&mut server, std::time::Duration::from_secs(1))
+                .await,
+            Ok(())
+        );
+        assert_eq!(agent.snapshot(), before);
+    }
+
+    #[tokio::test]
+    async fn repeated_hello_closes_with_protocol_error() {
+        let agent = Agent::new();
+        let (mut client, mut server) = tokio::io::duplex(256);
+        let serve = agent.serve_connection(&mut server, std::time::Duration::from_secs(1));
+        let request = async {
+            assert!(matches!(
+                request_reply(&mut client, &hello()).await,
+                ServerMessage::Hello(_)
+            ));
+            let bytes = kvm_agent_api::encode_client(&hello()).unwrap();
+            kvm_agent_ipc::write_frame(&mut client, &bytes, MAX_PAYLOAD_BYTES)
+                .await
+                .unwrap();
+            drop(client);
+        };
+        let (result, ()) = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            tokio::join!(serve, request)
+        })
+        .await
+        .unwrap();
+        assert_eq!(result, Err(ServiceError::Protocol));
+    }
 }
