@@ -1,0 +1,13 @@
+# Replacement local API first contract
+
+Implementation direction for the first serialized contract. This is a new protocol namespace, independent of legacy IPC and peer frames. The transport must authenticate endpoint/client identities; decoding JSON does not authorize commands.
+
+Use a new `kvm-agent-api` crate with serde/serde_json and UUID serialization. Local JSON payloads are capped at 16 KiB before decoding. Numeric 64-bit request IDs and revisions travel as canonical decimal strings to prevent JavaScript precision loss. Reject noncanonical strings, overflow, JSON numeric representations, unknown fields, invalid UUIDs and nil instance IDs. Native owners supply cryptographically fresh instance IDs; the codec generates none.
+
+Protocol name: `software-kvm-agent`, schema version 1. Messages are tagged snake_case enums. The first request is Hello with inclusive minimum/maximum schema versions. Negotiate only valid overlapping ranges; reject unsupported versions explicitly. Mutations and snapshot requests include expected agent instance and correlation ID; mutations also include expected committed revision. Initial commands are Pause, Resume, Failsafe and Quit. No topology/enrollment settings commands until their owning services exist.
+
+Server replies separate Hello, Snapshot and CommandResult. A command outcome is Accepted, Applied with resulting revision, or Rejected with structured reason. A client timeout is unconfirmed and must not be converted to rejection or success. State includes instance, snapshot revision, lifecycle, separate safety latch, separate cleanup failure, input destination and readiness/capabilities. Use typed supported/unsupported values rather than inferring capabilities from command names. Initially only read-only status is supported by a future idle-agent stub; no native capability is fabricated.
+
+The initial snapshot may represent unknown input destination and unconfirmed prerequisites. Do not report confirmed local authority merely because the process is paused. Mutations must be matched to an authorized endpoint instance and revision before dispatch. Request deduplication and snapshot-event reconciliation belong to the owner, not this serialization crate.
+
+Provide bounded encode/decode entry points for both directions and common JSON fixtures. Size checks must also cover encoding. Avoid retaining payload-bearing parse errors in diagnostics. Tests cover u64 maximum roundtrip, rejection of values above JavaScript's exact numeric range when represented as JSON numbers, version mismatch/reversed ranges, oversized payloads, unknown fields/variants, nil identity and exact serialized outcomes. These are software contract tests, not transport, authentication or native acceptance.
