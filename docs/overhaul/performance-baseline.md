@@ -2,6 +2,16 @@
 
 Status on 2026-11-17: metadata tooling accepted in `7848029`; current batched software lifecycle measurements and superseded history recorded below. Physical and native performance measurements remain unmeasured. No numerical performance budgets have been accepted here.
 
+## Current availability and resumed benchmark lane, 2026-11-17
+
+Git inspection found clean HEAD `207c911c9fc26d1d27e475944066e10ce20223a1` on `overhaul/widget-app-planning` before this documentation update. Windows is available now. Mac access is planned later for physical validation; current two-host physical access is not established. Prior native Mac software tests and read-only process smoke remain historical evidence at their recorded source revisions in `implementation-progress.md`. No native Mac input-engine execution is recorded.
+
+The user explicitly resumed UI integration and queue benchmarking, superseding the earlier cancelled/pending-clarification status for those lanes. Opus task `taskb33643de` owns real read-only agent integration in `apps/control-panel/`. GLM task `task1cf09185` owns the bounded microbenchmark under `crates/kvm-input-engine/benches/` and the benchmark entry in `crates/kvm-input-engine/Cargo.toml`. Future coordinator-owned Opus review remains required. No results or acceptance are recorded yet for the resumed benchmark lane. No numerical budgets are guessed from correctness checks or historical lifecycle timings.
+
+The standalone input engine is accepted in `207c911`. Recorded focused checks, `cargo test --locked --offline -p kvm-input-engine`, pass 38 tests on each of Windows and Linux. Expanded `scripts/check-rebuild.ps1 -MacOS` checks pass 147 Windows tests, focused formatting, strict host clippy and strict Apple Silicon cross-clippy. Expanded `scripts/check-rebuild.sh` checks pass 148 Linux tests, formatting and strict all-target clippy. Both scripts now select six rebuild packages, including `kvm-input-engine`; their defaults do not run benchmarks. Apple cross-clippy targets `aarch64-apple-darwin` and provides no native execution evidence. These are recorded coordinator results, not checks rerun by this documentation task.
+
+Physical latency, jitter, release, energy and resource acceptance remain unmeasured. Standalone queue timings will not certify the native input path or physical performance. The identity-storage delegation remains separately cancelled; `docs/adr/0005-native-identity-storage.md` is a contract only, with no implementation delivery claimed.
+
 ## Metadata collector
 
 Requires Node.js 18 or newer. No npm dependencies or installation step. Run from the repository root on Windows, macOS or Linux:
@@ -49,8 +59,8 @@ Reference machines and the final support matrix still need coordinator confirmat
 
 | Machine row | Architecture | Availability and measurements |
 | --- | --- | --- |
-| Windows 11 reference desktop/laptop | x86_64 proposed; ARM64 decision pending | Machine designation, power mode, hardware and all metrics unmeasured |
-| macOS reference Apple Silicon | aarch64 proposed | Machine designation, macOS version, hardware and all metrics unmeasured |
+| Windows 11 reference desktop/laptop | x86_64 proposed; ARM64 decision pending | Windows available now; reference machine designation, power mode, hardware and physical metrics unmeasured |
+| macOS reference Apple Silicon | aarch64 proposed | Mac access planned later for physical validation; reference designation and physical metrics unmeasured. Historical native software evidence is recorded separately. |
 | macOS Intel if retained in support scope | x86_64 decision pending | Machine availability and all metrics unmeasured |
 
 Run standalone microbenchmarks per approved machine. For physical tests, pair Windows and macOS and exercise both directions. Cross wired/Wi-Fi, hidden/visible UI, paused/connected-idle/active sharing, keyboard/pointer/combined input, representative 125/500/1000 Hz devices where available, mixed DPI and multiple displays. Include clipboard/diagnostic contention, CPU load, reconnects and controlled delay/loss/reordering. Record device rate, topology, network, power mode, encryption/authentication state and measurement method. Any unsupported or unavailable matrix cell stays unmeasured with a reason.
@@ -144,9 +154,9 @@ All batch state/effect assertions passed. No native or cross-host measurements.
 
 Coordinator evidence separately reports actual-workspace `cargo test --locked --offline -p kvm-agent-model -p kvm-foundation` passing 12 + 17 + 1 tests and `cargo clippy --locked --offline -p kvm-agent-model -p kvm-foundation --all-targets -- -D warnings` passing. These checks were not rerun here. The accepted foundation includes a counting allocator integration test with a positive control for its tested queue construction/steady-state operations. That evidence does not establish allocation behavior of a native agent or the full input path.
 
-No supported performance comparison follows from the superseded single-call timing and this batch method. Physical/native metrics, browser/native UI validation and installed-agent acceptance remain unmeasured. There is no real native agent yet.
+No supported performance comparison follows from the superseded single-call timing and this batch method. Physical/native metrics, browser/native UI validation and installed-agent acceptance remain unmeasured. At that measurement checkpoint there was no real native agent. Later accepted read-only agent and Mac process-smoke evidence is recorded in `implementation-progress.md`; it does not establish physical input or performance acceptance.
 
-## Rebuild correctness checks, 2026-11-17
+## Historical rebuild correctness checks, 2026-11-17
 
 `scripts/check-rebuild.ps1` and `scripts/check-rebuild.sh` now provide package-focused fmt, locked offline library/integration tests and strict all-target clippy for the three approved rebuild packages. Their defaults do not execute benchmarks. Panel and separately excluded Tauri checks require explicit independent options. Optional macOS cross-clippy uses installed targets only and reports a skip if none exist. These scripts launch no capture, application or server, change no configuration and provide no physical/native input certification. Usage and exact correctness evidence are recorded in `implementation-progress.md` under the rebuild check scripts checkpoint.
 

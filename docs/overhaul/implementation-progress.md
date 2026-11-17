@@ -2,6 +2,27 @@
 
 Evidence checkpoint: 2026-11-17. This ledger records delivered work and acceptance evidence. It does not estimate completion percentages or close physical gates from software checks.
 
+## Current superseding checkpoint, 2026-11-17
+
+This checkpoint supersedes earlier cancelled or pending-clarification status for UI integration and queue benchmarking only. The user explicitly resumed both lanes. Windows is available now; Mac access is planned later for physical validation. Earlier native Mac software tests and process smoke remain valid historical evidence for their recorded revisions. They do not establish current Mac availability or access to two physical hosts.
+
+Git inspection for this update found branch `overhaul/widget-app-planning`, HEAD `207c911c9fc26d1d27e475944066e10ce20223a1`, and a clean working tree before these documentation edits. Commit `207c911` accepts the reviewed standalone input-engine component in `crates/kvm-input-engine/` and adds it to both rebuild check scripts.
+
+| Lane | Current status and scope | Remaining evidence |
+| --- | --- | --- |
+| Read-only agent UI integration | Resumed. Opus task `taskb33643de` owns `apps/control-panel/` integration with the real read-only agent. | Implementation, checks and review acceptance are not yet recorded for this resumed assignment. |
+| Bounded queue microbenchmark | Resumed. GLM task `task1cf09185` owns only `crates/kvm-input-engine/benches/` and its `Cargo.toml` benchmark entry. | No results yet. Future coordinator-owned Opus review is required; delegation is not acceptance. |
+| Bounded input admission | Accepted in `207c911`; focused tests pass 38 cases each on Windows and Linux. | No native Mac input-engine execution, running-agent integration or physical/performance certification. |
+| Native identity storage | Separate delegation remains cancelled. Only `docs/adr/0005-native-identity-storage.md` defines the contract. | No identity-storage implementation or native credential access is delivered. The user's resumption does not include this lane. |
+
+Recorded coordinator checks for the accepted input-engine source are `scripts/check-rebuild.ps1 -MacOS` with 147 Windows tests, focused formatting, strict host clippy and Apple Silicon cross-clippy, and `scripts/check-rebuild.sh` with 148 Linux tests, formatting and strict all-target clippy. The focused command is `cargo test --locked --offline -p kvm-input-engine`, with 38 passing tests per host. Apple cross-clippy compiles checks for `aarch64-apple-darwin`; it does not execute native Mac tests. This documentation task inspected git and source only and reran none of those checks.
+
+No benchmark results exist yet for the resumed lane, and no numerical budgets are inferred. Historical lifecycle measurements retain their original build identities in `performance-baseline.md`. Native capture/injection, authenticated two-host sharing, installed lifecycle and physical latency, release, resource and energy acceptance remain open.
+
+## Historical checkpoints
+
+The sections below preserve the earlier delivery sequence. Their then-current status, HEAD and dirty-state descriptions are historical; the checkpoint above governs current lane ownership and availability.
+
 ## Approval and base
 
 The user approved a ground-up Rust rebuild with selective reuse and performance as a primary requirement. ADR `docs/adr/0003-ground-up-rebuild.md` records the accepted direction and ownership. Acceptance supersedes older proposed/planning status text in the recommendation and strategy documents.
@@ -256,4 +277,4 @@ Coordinator-owned Opus review conditionally accepted the delivered runtime behav
 
 The standard rebuild scripts now include kvm-input-engine. Expanded Windows checks pass 147 tests, focused formatting, strict host clippy and Apple Silicon cross-clippy. Expanded Linux checks pass 148 tests, formatting and strict all-target clippy. These checks cover the corrected source. Native macOS execution of the input-engine crate is not yet recorded. No benchmark or physical-input claim follows.
 
-Acceptance is for the standalone bounded admission component only. It is not linked into the running agent and does not implement authentication, native suppression, cross-thread publication, held-input delivery or teardown fences. Owners must use fresh nonzero instance identities, preserve a predecessor generation floor on same-identity replacement, and prohibit concurrent engines with the same instance/peer. Agent UUIDs must not be silently truncated into this crate's u64 identity. UI, benchmark and identity-storage implementation assignments that were cancelled remain stopped pending clarification.
+Acceptance is for the standalone bounded admission component only. It is not linked into the running agent and does not implement authentication, native suppression, cross-thread publication, held-input delivery or teardown fences. Owners must use fresh nonzero instance identities, preserve a predecessor generation floor on same-identity replacement, and prohibit concurrent engines with the same instance/peer. Agent UUIDs must not be silently truncated into this crate's u64 identity. At this acceptance checkpoint, the cancelled UI, benchmark and identity-storage assignments were stopped pending clarification. The dated superseding checkpoint above records the later resumption of UI integration and queue benchmarking; identity storage remains cancelled.
