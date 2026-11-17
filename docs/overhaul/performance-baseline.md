@@ -2,15 +2,100 @@
 
 Status on 2026-11-17: metadata tooling accepted in `7848029`; current batched software lifecycle measurements and superseded history recorded below. Physical and native performance measurements remain unmeasured. No numerical performance budgets have been accepted here.
 
-## Current availability and resumed benchmark lane, 2026-11-17
+## Accepted benchmark implementation, 2026-11-17
 
-Git inspection found clean HEAD `207c911c9fc26d1d27e475944066e10ce20223a1` on `overhaul/widget-app-planning` before this documentation update. Windows is available now. Mac access is planned later for physical validation; current two-host physical access is not established. Prior native Mac software tests and read-only process smoke remain historical evidence at their recorded source revisions in `implementation-progress.md`. No native Mac input-engine execution is recorded.
+Coordinator-owned Opus review conditionally accepted the benchmark mechanics. The coordinator addressed all required framing corrections and committed the implementation in `4c392ec`: pair labels identify best-case occupancy, the mixed engine pair explicitly measures only the head-stage path, fault rows print the observed Windows timer-quantization caveat, outcome checksums and truncated decimal display are described accurately, and the wraparound check accounts for all warmup and measured operations. The corrected optimized benchmark and strict all-target clippy passed. This accepts a repeatable microbenchmark implementation, not a release budget or physical performance claim.
 
-The user explicitly resumed UI integration and queue benchmarking, superseding the earlier cancelled/pending-clarification status for those lanes. Opus task `taskb33643de` owns real read-only agent integration in `apps/control-panel/`. GLM task `task1cf09185` owns the bounded microbenchmark under `crates/kvm-input-engine/benches/` and the benchmark entry in `crates/kvm-input-engine/Cargo.toml`. Future coordinator-owned Opus review remains required. No results or acceptance are recorded yet for the resumed benchmark lane. No numerical budgets are guessed from correctness checks or historical lifecycle timings.
+The numeric record below remains the original dirty run at `eb40c9b`; it is not relabelled as a measurement of `4c392ec`. Its mixed engine pair never exercised the engine's internal ring at sustained occupancy. Fault-batch statistics are coarse quantized observations. Future comparisons must retain those scope distinctions and use equivalent builds and conditions.
 
-The standalone input engine is accepted in `207c911`. Recorded focused checks, `cargo test --locked --offline -p kvm-input-engine`, pass 38 tests on each of Windows and Linux. Expanded `scripts/check-rebuild.ps1 -MacOS` checks pass 147 Windows tests, focused formatting, strict host clippy and strict Apple Silicon cross-clippy. Expanded `scripts/check-rebuild.sh` checks pass 148 Linux tests, formatting and strict all-target clippy. Both scripts now select six rebuild packages, including `kvm-input-engine`; their defaults do not run benchmarks. Apple cross-clippy targets `aarch64-apple-darwin` and provides no native execution evidence. These are recorded coordinator results, not checks rerun by this documentation task.
+## Pre-review availability checkpoint at eb40c9b, 2026-11-17
 
-Physical latency, jitter, release, energy and resource acceptance remain unmeasured. Standalone queue timings will not certify the native input path or physical performance. The identity-storage delegation remains separately cancelled; `docs/adr/0005-native-identity-storage.md` is a contract only, with no implementation delivery claimed.
+Inspected HEAD is `eb40c9bc5c4faa4d61090060aecd815ba6a7fd11` on `overhaul/widget-app-planning`. Before these documentation edits, `crates/kvm-input-engine/Cargo.toml` was modified and `crates/kvm-input-engine/benches/` was untracked, containing `input_path.rs`. The GLM benchmark delivery remains unaccepted pending coordinator-owned Opus review `62489094`. Root independently ran the benchmark and correctness checks below. Historical GLM-reported benchmark results belong to their own run; the root results below do not replace or independently verify those historical numbers. No GLM raw artifact or exact historical numeric summary was supplied for this documentation update, so none is reconstructed here.
+
+The Opus read-only utility-agent UI is accepted in `eb40c9b` for development use only. Root passed TypeScript checking, 122 frontend tests, production build, 33 Tauri library tests and strict all-target Tauri clippy on Windows. No browser, native GUI, live-window roundtrip or Mac UI validation was performed. Windows is available now; Mac physical access is planned later. Current two-host physical access is not established. Earlier native Mac software tests and process smoke retain their historical revisions in `implementation-progress.md`.
+
+The standalone input engine remains accepted in `207c911`, with 38 focused tests on Windows and Linux. Earlier expanded script results remain 147 Windows tests and 148 Linux tests, formatting and strict clippy, including Apple Silicon cross-clippy on Windows. Cross-clippy provides no native Mac execution evidence. Identity-storage delegation remains cancelled; ADR 0005 is only a contract. Physical latency, jitter, release, resource and energy acceptance remain open, with no physical gate closure or accepted numerical budgets.
+
+## Independent root input-path run at eb40c9b, 2026-11-17
+
+Evidence files are ignored local artifacts, not committed results:
+
+```text
+target/performance/input-path-65688360949d4d01871cbe3ea43018f6/metadata.json
+target/performance/input-path-65688360949d4d01871cbe3ea43018f6/raw.txt
+```
+
+Metadata collection time is `2026-11-17T09:24:44.419Z`. Build identity is HEAD `eb40c9bc5c4faa4d61090060aecd815ba6a7fd11`, branch `overhaul/widget-app-planning`, dirty `true`, with the benchmark manifest/source changes listed above. This is a dirty benchmark build against the accepted committed runtime, not a clean committed benchmark revision. Metadata reports Windows `win32` release `10.0.26200`, x64, Intel Core i7-13700K, 24 logical CPUs and 34,122,776,576 bytes of total machine memory. The probed toolchain is `stable-x86_64-pc-windows-msvc`, rustc `1.97.1 (8bab26f4f 2026-07-14)`, full compiler commit `8bab26f4f68e0e26f0bb7960be334d5b520ea452`, host `x86_64-pc-windows-msvc`, LLVM `22.1.6`, and Cargo `1.97.1 (c980f4866 2026-06-30)`. Node is `v24.12.0`, V8 `13.6.233.17-node.37`, Git `2.40.0.windows.1` and rustup `1.29.0 (28d1352db 2026-03-05)`.
+
+Root reports successful commands from the repository root, using Cargo's optimized bench profile for the benchmark:
+
+```text
+cargo bench --locked --offline -p kvm-input-engine --bench input_path
+cargo test --locked --offline -p kvm-input-engine
+cargo clippy --locked --offline -p kvm-input-engine --all-targets -- -D warnings
+```
+
+The focused tests passed 38 cases and strict clippy passed. This documentation task reran none of these commands. The collector's benchmark and physical-measurement fields remain `unmeasured`; it does not ingest the separate raw output.
+
+Source inspection confirms a dependency-free `harness = false` benchmark with synthetic events and event-age clock, one thread, three warmup batches and 30 timed samples per scenario. `Instant` times whole loops. Median is the midpoint of the two middle sorted batch durations; p95 is nearest rank, sample 29 of 30. Inputs and mutable state cross `black_box`; outcomes feed asserted checksums. Loop and barrier overhead remain included. Pools and fault-engine construction are outside timing. Outcome checksums and additional FIFO, route, fault and retention assertions pass outside timed batches.
+
+The raw summary below preserves operation units and whole-batch results. The first three scenarios use 4,096 pairs per batch; stale rejection and held-set scenarios use 2,048 pairs. Each pair is one reported operation containing two calls. Each fault scenario uses 512 distinct engines and one terminal fault call per engine. The printed amortized ns/op values divide batch statistics by these operation counts and truncate to two decimals. They are not individual-call or per-event latency percentiles.
+
+This is one unpinned Windows run with uncontrolled scheduling and no repeated-run evidence or accepted budgets. Typical 512-operation fault batches span only 7-10 QPC ticks at 100 ns per tick: full rejection min/median/p95 is 900/900/1,000 ns; expiry min/median is 700/800 ns, with p95 4,100 ns. These coarse durations cannot resolve reliable operation-level differences. No physical capture, network, native injection, encryption, per-event tail or speedup claim follows.
+
+Unchanged raw summary:
+
+```text
+input-path microbenchmark: synthetic events, synthetic clock, one thread
+timing unit: whole batch; stats: min/median/p95 (nearest-rank p95)
+scope: userspace admission data structures only; no physical capture,
+network, native injection or encryption is measured or claimed
+
+[ring_fifo_enqueue_consume_pair] 1 op = one push + one pop (capacity 64)
+  warmup_batches=3 measured_samples=30 ops_per_batch=4096
+  whole_batch_ns: min=7_300 median=7_300 p95=8_600
+  amortized_ns_per_op: min 7_300 / 4096 = 1.78
+  amortized_ns_per_op: median 7_300 / 4096 = 1.78
+  amortized_ns_per_op: p95 8_600 / 4096 = 2.09
+[ring_fifo_sustained_wraparound] 1 op = one pop + one push at full occupancy (capacity 8)
+  warmup_batches=3 measured_samples=30 ops_per_batch=4096
+  whole_batch_ns: min=6_500 median=7_600 p95=7_900
+  amortized_ns_per_op: min 6_500 / 4096 = 1.58
+  amortized_ns_per_op: median 7_600 / 4096 = 1.85
+  amortized_ns_per_op: p95 7_900 / 4096 = 1.92
+[engine_enqueue_consume_mixed_pair] 1 op = one enqueue + one consume (capacity 16, mixed families)
+  warmup_batches=3 measured_samples=30 ops_per_batch=4096
+  whole_batch_ns: min=21_700 median=21_700 p95=21_800
+  amortized_ns_per_op: min 21_700 / 4096 = 5.29
+  amortized_ns_per_op: median 21_700 / 4096 = 5.29
+  amortized_ns_per_op: p95 21_800 / 4096 = 5.32
+[engine_stale_epoch_rejection] 1 op = one stale enqueue + one stale consume (valid event, queue holds 1)
+  warmup_batches=3 measured_samples=30 ops_per_batch=2048
+  whole_batch_ns: min=3_500 median=3_500 p95=4_200
+  amortized_ns_per_op: min 3_500 / 2048 = 1.70
+  amortized_ns_per_op: median 3_500 / 2048 = 1.70
+  amortized_ns_per_op: p95 4_200 / 2048 = 2.05
+[engine_full_rejection] 1 op = one overflow enqueue into a full queue (capacity 16)
+  warmup_batches=3 measured_samples=30 ops_per_batch=512
+  whole_batch_ns: min=900 median=900 p95=1_000
+  amortized_ns_per_op: min 900 / 512 = 1.75
+  amortized_ns_per_op: median 900 / 512 = 1.75
+  amortized_ns_per_op: p95 1_000 / 512 = 1.95
+[engine_queued_age_expiry_retention] 1 op = one consume one nanosecond past the age bound (2 entries held)
+  warmup_batches=3 measured_samples=30 ops_per_batch=512
+  whole_batch_ns: min=700 median=800 p95=4_100
+  amortized_ns_per_op: min 700 / 512 = 1.36
+  amortized_ns_per_op: median 800 / 512 = 1.56
+  amortized_ns_per_op: p95 4_100 / 512 = 8.00
+[held_set_press_release_pair] 1 op = one press + one release of a fresh key (capacity 16)
+  warmup_batches=3 measured_samples=30 ops_per_batch=2048
+  whole_batch_ns: min=7_300 median=7_400 p95=38_900
+  amortized_ns_per_op: min 7_300 / 2048 = 3.56
+  amortized_ns_per_op: median 7_400 / 2048 = 3.61
+  amortized_ns_per_op: p95 38_900 / 2048 = 18.99
+
+done: every semantic check passed outside the timed batches
+```
 
 ## Metadata collector
 
