@@ -799,6 +799,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "kvm-input-engine"
+version = "0.1.0"
+dependencies = [
+ "kvm-foundation",
+]
+
+[[package]]
 name = "kvm-macos"
 version = "0.1.0"
 dependencies = [
