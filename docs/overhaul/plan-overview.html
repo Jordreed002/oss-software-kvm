@@ -1,0 +1,171 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="The proposed Software KVM rebuild for Windows and macOS: a compact tray app, a new Rust backend and performance-led delivery.">
+  <title>Software KVM rebuild plan</title>
+  <style>
+    * { box-sizing: border-box; }
+    html { scroll-behavior: smooth; }
+    body { margin: 0; color: var(--foreground, #202e32); font: 15px/1.6 var(--font-sans, "Segoe UI", sans-serif); }
+    main { max-width: 980px; margin: 0 auto; }
+    a { color: var(--primary, #16715e); text-underline-offset: 3px; }
+    a:hover { text-decoration-thickness: 2px; }
+    :focus-visible { outline: 3px solid var(--ring, #16715e); outline-offset: 4px; }
+    .eyebrow, .number, .caption { font-family: var(--font-mono, Consolas, monospace); font-size: 11px; letter-spacing: .06em; }
+    .eyebrow { color: var(--muted-foreground, #637277); text-transform: uppercase; }
+    header { padding: 30px 0 25px; border-bottom: 1px solid var(--border, #d8e0dd); }
+    .meta { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; }
+    .status { padding: 3px 9px; border: 1px solid var(--border, #d8e0dd); border-radius: 5px; color: var(--muted-foreground, #637277); font-size: 11px; }
+    h1, h2, h3, p { margin: 0; }
+    h1 { font-family: "Palatino Linotype", Palatino, Georgia, serif; font-size: clamp(34px, 6vw, 55px); line-height: 1.1; font-weight: 500; letter-spacing: -.04em; margin: 16px 0; }
+    .intro { max-width: 720px; font-size: 17px; line-height: 1.65; }
+    .platforms { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 18px; }
+    .platforms span { background: var(--secondary, #ecf2ed); border-radius: 5px; padding: 5px 10px; font-size: 12px; }
+    nav { display: flex; flex-wrap: wrap; gap: 8px 20px; margin-top: 20px; font-size: 12px; }
+    section { padding: 25px 0; border-bottom: 1px solid var(--border, #d8e0dd); scroll-margin-top: 12px; }
+    .section-head { display: flex; align-items: baseline; gap: 13px; margin-bottom: 15px; }
+    .number { color: var(--primary, #16715e); }
+    h2 { font-size: 21px; line-height: 1.3; font-weight: 600; letter-spacing: -.02em; }
+    h3 { font-size: 14px; line-height: 1.5; margin-bottom: 6px; }
+    .muted, .caption { color: var(--muted-foreground, #637277); }
+    .grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; }
+    .card { background: var(--card, #f1f5f1); padding: 16px; border: 1px solid var(--border, #d8e0dd); border-radius: var(--radius, 9px); }
+    .card p { font-size: 13px; }
+    .rule { border-left: 3px solid var(--primary, #16715e); padding: 2px 0 2px 14px; margin-top: 16px; font-size: 13px; }
+    .architecture { display: grid; grid-template-columns: 1fr 38px 1fr; align-items: center; margin-top: 16px; }
+    .architecture .card { height: 100%; }
+    .arrow { text-align: center; color: var(--primary, #16715e); font-size: 24px; }
+    .caption { margin-top: 10px; line-height: 1.6; letter-spacing: 0; }
+    .path { display: flex; gap: 4px; align-items: stretch; margin: 15px 0 10px; }
+    .path div { flex: 1; min-width: 0; text-align: center; background: var(--secondary, #ecf2ed); padding: 13px 5px; border-radius: 5px; font-size: 12px; }
+    .path span { display: grid; align-items: center; color: var(--muted-foreground, #637277); }
+    .requirements { margin: 10px 0 0; padding-left: 18px; font-size: 13px; }
+    .requirements li { padding: 3px 0; }
+    .metric { display: grid; grid-template-columns: 130px 1fr; gap: 12px; padding: 10px 0; border-bottom: 1px solid var(--border, #d8e0dd); font-size: 13px; }
+    .metric:last-child { border: 0; }
+    .metric strong { font-weight: 600; }
+    details { border-top: 1px solid var(--border, #d8e0dd); }
+    details:last-child { border-bottom: 1px solid var(--border, #d8e0dd); }
+    summary { display: flex; align-items: baseline; gap: 12px; cursor: pointer; padding: 13px 0; list-style: none; font-size: 14px; font-weight: 600; }
+    summary::-webkit-details-marker { display: none; }
+    summary::after { content: "+"; margin-left: auto; color: var(--primary, #16715e); font-size: 17px; }
+    details[open] summary::after { content: "−"; }
+    .detail { padding: 0 26px 16px; font-size: 13px; max-width: 800px; }
+    .gate { margin-top: 8px; padding-left: 12px; border-left: 2px solid var(--primary, #16715e); }
+    .toolbar { display: flex; justify-content: flex-end; margin: -5px 0 6px; }
+    button { background: transparent; color: var(--primary, #16715e); border: 1px solid var(--border, #d8e0dd); padding: 5px 9px; border-radius: 4px; font: inherit; font-size: 11px; cursor: pointer; }
+    button:hover { background: var(--secondary, #ecf2ed); }
+    footer { padding: 20px 0 30px; font-size: 11px; color: var(--muted-foreground, #637277); }
+    footer p + p { margin-top: 7px; }
+    .sources { display: flex; flex-wrap: wrap; gap: 8px 18px; margin-top: 10px; }
+    @media (max-width: 540px) {
+      header { padding-top: 18px; } .grid, .architecture { grid-template-columns: 1fr; }
+      .arrow { transform: rotate(90deg); padding: 5px; } .intro { font-size: 15px; }
+      .path { flex-wrap: wrap; } .path div { flex: 1 1 25%; } .path span { display: none; }
+      .metric { grid-template-columns: 100px 1fr; } .detail { padding-left: 0; }
+      h2 { font-size: 19px; } summary { gap: 8px; }
+    }
+    @media (prefers-reduced-motion: reduce) { html { scroll-behavior: auto; } }
+    @media print {
+      body { color: #000; font-size: 10pt; } nav, button { display: none; }
+      section, article, details { break-inside: avoid; } .detail { display: block; }
+      h1 { font-size: 32pt; } main { max-width: none; }
+    }
+  </style>
+</head>
+<body>
+<main>
+  <header>
+    <div class="meta"><span class="eyebrow">Software KVM / rebuild brief</span><span class="status">Proposed plan · 17 November 2026</span></div>
+    <h1>A smaller app.<br>A new Rust foundation.</h1>
+    <p class="intro">Rebuild Software KVM from the ground up around a compact desktop utility, with performance driving the backend design. Keep useful existing parts only when they earn their place through review, tests and measurements.</p>
+    <div class="platforms"><span>Windows 11 · tray widget</span><span>macOS · menu-bar popover</span><span>Two computers · one LAN</span></div>
+    <nav aria-label="Document sections"><a href="#experience">Experience</a><a href="#rust">Rust rebuild</a><a href="#performance">Performance</a><a href="#delivery">Delivery</a><a href="#release">Release &amp; decisions</a></nav>
+  </header>
+
+  <section id="experience">
+    <div class="section-head"><span class="number">01</span><h2>The everyday experience</h2></div>
+    <div class="grid">
+      <article class="card"><h3>A widget when you need it</h3><p>Open the tray or menu-bar icon to see connection state, the actual input destination and Pause/Resume. A compact surface around 360 logical pixels wide replaces the daily dashboard.</p></article>
+      <article class="card"><h3>Focused windows for longer tasks</h3><p>Setup covers permissions, verified pairing, display arrangement and an input test. Settings and troubleshooting open separately. Multiple monitors, keyboard mapping and optional plain-text clipboard remain in scope.</p></article>
+    </div>
+    <p class="rule"><strong>Close</strong> dismisses the window. <strong>Pause</strong> restores local input and pauses clipboard sharing. <strong>Quit</strong> stops sharing and both processes after confirmed cleanup. Launch at login is opt-in.</p>
+    <p class="caption">Light/dark themes, keyboard navigation, screen readers, high contrast, reduced motion and text scaling are part of the first implementation.</p>
+  </section>
+
+  <section id="rust">
+    <div class="section-head"><span class="number">02</span><h2>Rebuild the Rust application</h2></div>
+    <p>Design fresh ownership, concurrency, module and protocol boundaries. Rebuild capture, routing, injection, session coordination, configuration and native lifecycle around explicit contracts. Existing crates are reference material, not an automatic starting structure.</p>
+    <div class="architecture" aria-label="Proposed two-process architecture">
+      <article class="card"><h3>Native shell + new frontend</h3><p>Tray/menu bar, windows, presentation, settings drafts and update orchestration. Tauri and React are proposed, subject to the shell performance spike.</p></article>
+      <div class="arrow" aria-label="Authenticated versioned local API">↔</div>
+      <article class="card"><h3>New Rust background agent</h3><p>Identity, pairing, committed configuration, topology and input authority. Available while sharing is off, with no active capture until enabled.</p></article>
+    </div>
+    <p class="rule">Reuse is selective: mapping tables, geometry, parsers, native bindings and credential adapters are candidates. Each reused part needs a recorded contract, safety review, tests and performance evidence.</p>
+    <p class="caption">Keep the legacy build for comparison, import and rollback. Only one capture engine may own a user desktop at a time. Production code implementation has not started.</p>
+  </section>
+
+  <section id="performance">
+    <div class="section-head"><span class="number">03</span><h2>Performance is an architecture requirement</h2></div>
+    <p>Prove the smallest authenticated two-host input path early. Measure responsiveness and smoothness before expanding the feature set.</p>
+    <div class="path" aria-label="Critical input path"><div>Native capture</div><span aria-hidden="true">→</span><div>Route &amp; order</div><span aria-hidden="true">→</span><div>Secure transport</div><span aria-hidden="true">→</span><div>Native injection</div></div>
+    <div class="metric"><strong>Latency &amp; jitter</strong><span>Track p50, p95 and p99, plus p99.9 when sample counts support it. Measure movement gaps, queue age and key/button release delays.</span></div>
+    <div class="metric"><strong>Small footprint</strong><span>Measure allocations, CPU, memory, wakeups and energy separately for the agent, native shell and webview. No hidden UI polling or animation.</span></div>
+    <div class="metric"><strong>Real conditions</strong><span>Test both directions, wired and Wi-Fi, UI open/closed, high-rate input, mixed DPI, packet impairment and CPU contention.</span></div>
+    <ul class="requirements">
+      <li>Bound capture work and queues. Keep blocking I/O, logging and UI work outside input callbacks.</li>
+      <li>Avoid steady-state per-event allocations in capture/routing; measure and document exceptions.</li>
+      <li>Protect ordered key/button events. Tune pointer coalescing and pacing from smoothness data.</li>
+      <li>Keep encryption and safety enabled in benchmarks. Use physical measurements for end-to-end claims.</li>
+    </ul>
+    <p class="rule"><strong>Budgets come before architecture approval.</strong> Phase 0 sets numeric input-latency and resource targets on named machines. Matching an inadequate old baseline is insufficient. Warm widget opening has a proposed p95 target of 150 ms; this is a target, not a measured result.</p>
+  </section>
+
+  <section id="delivery">
+    <div class="section-head"><span class="number">04</span><h2>The delivery sequence</h2></div>
+    <div class="toolbar"><button type="button" id="toggle-phases" aria-controls="phases" hidden>Expand all phases</button></div>
+    <div id="phases">
+      <details open><summary><span class="number">0</span>Baseline, architecture &amp; visual direction</summary><div class="detail"><p>Measure the existing build, design new Rust contracts, start the reuse register, produce two visual variants and prototype the installed shell and native permissions on both platforms.</p><p class="gate"><strong>Gate:</strong> agreed platform matrix, ownership model and numeric performance/safety budgets before committing to the architecture.</p></div></details>
+      <details><summary><span class="number">1</span>New Rust foundation &amp; fast input path</summary><div class="detail"><p>Implement a minimal two-host authenticated capture-to-injection path, fresh state/session ownership and native adapters. Build emergency release alongside normal delivery.</p><p class="gate"><strong>Gate:</strong> both directions pass ordering and recovery tests and meet the initial latency/smoothness budgets.</p></div></details>
+      <details><summary><span class="number">2</span>Background agent &amp; local control</summary><div class="detail"><p>Add idle operation, identity, verified enrollment, topology, persistence and a versioned local API. Command acceptance, application and failure are distinct outcomes.</p><p class="gate"><strong>Gate:</strong> headless pairing and layout sync; one configuration writer; delayed commands and event gaps recover safely; control-plane load stays within input budgets.</p></div></details>
+      <details><summary><span class="number">3</span>New tray shell, widget &amp; setup</summary><div class="detail"><p>Build the compact everyday UI, native menus, supervision, onboarding and focused settings. Validate placement, focus, mixed DPI and assistive technology.</p><p class="gate"><strong>Gate:</strong> 100 open/dismiss cycles leave sharing unchanged; native Pause/Quit work through webview failure; visible and hidden resource targets pass.</p></div></details>
+      <details><summary><span class="number">4</span>Security &amp; migration acceptance</summary><div class="detail"><p>Review enrollment, harden local endpoint identity/authorization, integrate OS credential storage and import old settings and trust with interruption recovery. Release diagnostics use local IPC.</p><p class="gate"><strong>Gate:</strong> unauthorized clients rejected, no unauthenticated release LAN diagnostics, and interrupted migration preserves identity or requires explained verified re-pairing.</p></div></details>
+      <details><summary><span class="number">5</span>Lifecycle, physical acceptance &amp; soak</summary><div class="detail"><p>Test held input during pause/quit, peer loss, crashes, lock/sleep, user switching, display changes and permission revocation. Measure under load with the UI visible and hidden.</p><p class="gate"><strong>Gate:</strong> 100 combined lifecycle/fault transitions per receiving OS without stuck input or competing capture owners; a 24-hour two-host soak and the full performance matrix pass.</p></div></details>
+      <details><summary><span class="number">6</span>Installed release &amp; cutover</summary><div class="detail"><p>Package a compatible shell/agent pair, sign Windows artifacts, sign/notarize macOS, and validate startup, upgrade, uninstall and rollback. Start with signed manual releases.</p><p class="gate"><strong>Gate:</strong> clean install and paired upgrade/recovery pass on the approved hardware matrix. Stop legacy capture before enabling new capture. Add user-approved in-app updates after safe replacement and rollback are proven.</p></div></details>
+    </div>
+  </section>
+
+  <section id="release">
+    <div class="section-head"><span class="number">05</span><h2>Safety, release &amp; decisions</h2></div>
+    <div class="grid">
+      <article class="card"><h3>Safety remains independent of the UI</h3><p>Emergency recovery, held-input tracking and destination-side cleanup survive renderer failure. Agent restart begins paused. Wake, unlock, permission recovery and safety faults require explicit Resume initially.</p></article>
+      <article class="card"><h3>Ship on both platforms</h3><p>Per-user Windows install and signed/notarized macOS app are proposed. Validate real permissions, startup, firewall behavior, updates and uninstall on installed builds. No telemetry upload is proposed.</p></article>
+    </div>
+    <p class="rule"><strong>Decide during phase 0:</strong> supported OS versions and CPU architectures; final app/helper identifiers; test-machine access; signing ownership and budget; numeric performance gates; legacy peer compatibility and migration policy.</p>
+    <p class="caption">Pinned desktop widget, multi-peer UI, WAN control, video/audio and privileged login-screen control are outside the initial scope. Calendar estimates follow the first measured end-to-end slice.</p>
+  </section>
+  <footer>
+    <p>Branch: <code>overhaul/widget-app-planning</code> · Planning summary · Ground-up Rust scope and performance priority reflect the latest user instructions.</p>
+    <p>The original independent proposals favored selective refactoring. That recommendation has been superseded by the requested Rust rebuild; the models have not re-reviewed the revised scope.</p>
+    <div class="sources"><a href="recommended-plan.md">Full recommendation</a><a href="rust-rebuild-strategy.md">Rust &amp; performance strategy</a><a href="plan-comparison.md">Original plan comparison</a></div>
+    <p>Self-contained HTML. No external fonts, scripts, analytics or network requests. Source links work when this file stays beside the planning documents.</p>
+  </footer>
+</main>
+<script>
+  const phaseButton = document.getElementById('toggle-phases');
+  const phases = Array.from(document.querySelectorAll('#phases details'));
+  phaseButton.hidden = false;
+  const updateLabel = () => { phaseButton.textContent = phases.every(item => item.open) ? 'Collapse all phases' : 'Expand all phases'; };
+  phases.forEach(item => item.addEventListener('toggle', updateLabel));
+  phaseButton.addEventListener('click', () => {
+    const expand = !phases.every(item => item.open);
+    phases.forEach(item => { item.open = expand; });
+    updateLabel();
+  });
+  window.addEventListener('beforeprint', () => { phases.forEach(item => { item.dataset.prePrintOpen = String(item.open); item.open = true; }); });
+  window.addEventListener('afterprint', () => { phases.forEach(item => { item.open = item.dataset.prePrintOpen === 'true'; delete item.dataset.prePrintOpen; }); });
+</script>
+</body>
+</html>
