@@ -21,6 +21,8 @@ fs2 = "0.4"
 hex = "0.4"
 hostname = "0.4"
 if-addrs = "0.14"
+kvm-agent = { path = "../../../crates/kvm-agent" }
+kvm-agent-api = { path = "../../../crates/kvm-agent-api" }
 kvm-config = { path = "../../../crates/kvm-config" }
 kvm-daemon = { path = "../../../crates/kvm-daemon" }
 kvm-network = { path = "../../../crates/kvm-network" }

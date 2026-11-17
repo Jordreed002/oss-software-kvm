@@ -1896,6 +1896,39 @@ dependencies = [
 ]
 
 [[package]]
+name = "kvm-agent"
+version = "0.1.0"
+dependencies = [
+ "kvm-agent-api",
+ "kvm-agent-ipc",
+ "kvm-agent-model",
+ "tokio",
+ "uuid",
+]
+
+[[package]]
+name = "kvm-agent-api"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "uuid",
+]
+
+[[package]]
+name = "kvm-agent-ipc"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "tokio",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "kvm-agent-model"
+version = "0.1.0"
+
+[[package]]
 name = "kvm-config"
 version = "0.1.0"
 dependencies = [
@@ -3484,6 +3517,8 @@ dependencies = [
  "hex",
  "hostname",
  "if-addrs 0.14.0",
+ "kvm-agent",
+ "kvm-agent-api",
  "kvm-config",
  "kvm-daemon",
  "kvm-macos",

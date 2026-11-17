@@ -15,19 +15,29 @@ use tauri::Manager;
 pub fn run() {
     let context = tauri::generate_context!();
 
-    // Development-only utility shell. Without the explicit flag the legacy
+    // Development-only utility shells. Without an explicit flag the legacy
     // console below starts exactly as before.
-    if utility_preview::requested(std::env::args()) {
-        if let Some(reason) =
-            utility_preview::unavailable_reason(cfg!(debug_assertions), tauri::is_dev())
-        {
-            eprintln!("software-kvm-control-panel: {reason}");
+    match utility_preview::select(std::env::args()) {
+        utility_preview::Selection::Legacy => {}
+        utility_preview::Selection::Conflict => {
+            eprintln!(
+                "software-kvm-control-panel: {}",
+                utility_preview::CONFLICT_REASON
+            );
             std::process::exit(2);
         }
-        #[cfg(debug_assertions)]
-        {
-            utility_preview::run(context);
-            return;
+        utility_preview::Selection::Utility(mode) => {
+            if let Some(reason) =
+                utility_preview::unavailable_reason(mode, cfg!(debug_assertions), tauri::is_dev())
+            {
+                eprintln!("software-kvm-control-panel: {reason}");
+                std::process::exit(2);
+            }
+            #[cfg(debug_assertions)]
+            {
+                utility_preview::run(context, mode);
+                return;
+            }
         }
     }
 

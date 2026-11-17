@@ -30,6 +30,20 @@ npm run tauri dev
 The console automatically finds `target/release/kvm-runtime`. To use a different build, set
 `SOFTWARE_KVM_RUNTIME` to its absolute path before starting the console.
 
+### Development-only utility shells
+
+Two opt-in tray shells for the replacement utility UI. Each needs a debug build served by the
+Vite dev server and refuses to start otherwise; passing both flags is refused too. Neither starts
+the legacy setup service, discovery, runtime or input capture.
+
+- `npm run tauri -- dev -- -- --utility-preview` shows hand-written preview fixtures. It
+  registers no IPC commands.
+- `npm run tauri -- dev -- -- --utility-agent` reads the status of a separately running
+  replacement agent. It registers one read-only command, `agent_status`, which only the
+  `utility-agent` window may call. Status is read when the window opens and when you select
+  Refresh; there's no polling. Every pause, resume and quit control stays disabled. Quitting
+  from the tray closes only the utility, not the agent.
+
 ## Pair the two computers
 
 1. Put both computers on the same trusted private Wi-Fi network. A DHCP reservation for each

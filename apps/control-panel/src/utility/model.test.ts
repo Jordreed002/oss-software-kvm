@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { sendCommand } from "./commands";
-import { isNativePreviewHost, shouldRenderUtilitySurface } from "./entry";
+import { isNativePreviewHost, selectUtilitySurface, shouldRenderUtilitySurface } from "./entry";
 import { FIXTURE_IDS, fixtureSnapshot } from "./fixtures";
 import { describeStatus, primaryAction, unavailableSnapshot } from "./model";
 
@@ -11,6 +11,17 @@ describe("utility entry gate", () => {
     expect(shouldRenderUtilitySurface(true, "")).toBe(false);
     expect(shouldRenderUtilitySurface(true, "?surface=legacy")).toBe(false);
     expect(shouldRenderUtilitySurface(true, "?utility")).toBe(false);
+  });
+
+  it("routes the agent surface separately and only in development", () => {
+    expect(selectUtilitySurface(true, "?surface=utility-agent")).toBe("utility-agent");
+    expect(selectUtilitySurface(true, "?surface=utility")).toBe("utility");
+    expect(selectUtilitySurface(false, "?surface=utility-agent")).toBeNull();
+    expect(selectUtilitySurface(true, "")).toBeNull();
+    expect(selectUtilitySurface(true, "?surface=Utility-Agent")).toBeNull();
+    expect(selectUtilitySurface(true, "?surface=utility-agent-x")).toBeNull();
+    // The fixture gate must not open for the agent surface, and vice versa.
+    expect(shouldRenderUtilitySurface(true, "?surface=utility-agent")).toBe(false);
   });
 
   it("detects the native preview host only from the injected Tauri global", () => {

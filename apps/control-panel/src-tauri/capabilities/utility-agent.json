@@ -1,0 +1,7 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "utility-agent",
+  "description": "Development-only read-only agent status window (--utility-agent). Grants only listening for the window-opened event; the agent_status app command additionally checks the calling window label.",
+  "windows": ["utility-agent"],
+  "permissions": ["core:event:allow-listen", "core:event:allow-unlisten"]
+}

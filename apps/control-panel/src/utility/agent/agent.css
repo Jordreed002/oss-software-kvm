@@ -1,0 +1,74 @@
+/* Read-only agent status surface (--utility-agent). Fills the native utility
+ * window; no mock desk or tray. Scoped under .kvmu.u-agent, reusing the
+ * utility tokens so the agent and fixture surfaces read as one product. */
+
+.kvmu.u-agent { background: var(--u-surface); }
+
+.kvmu .u-agent-panel {
+  display: grid; gap: 14px; align-content: start;
+  width: min(420px, 100%); margin: 0 auto; padding: 14px 16px 12px;
+}
+.kvmu .u-agent-panel[aria-busy="true"] .u-status,
+.kvmu .u-agent-panel[aria-busy="true"] .u-agent-facts,
+.kvmu .u-agent-panel[aria-busy="true"] .u-agent-ready { opacity: 0.62; transition: opacity 160ms var(--u-ease); }
+
+.kvmu .u-agent-badges { display: inline-flex; gap: 6px; flex-wrap: wrap; justify-content: flex-end; }
+.kvmu .u-badge[data-kind="agent"] { color: var(--u-accent); border-style: solid; }
+.kvmu .u-badge[data-kind="attention"] { color: var(--u-attention); border-style: solid; }
+.kvmu .u-badge[data-kind="pending"] { color: var(--u-pending); }
+
+.kvmu .u-agent-remedy {
+  padding: 9px 11px; border-radius: 8px; font-size: 12px; line-height: 1.45;
+  background: var(--u-raised); border-left: 3px solid var(--u-line-strong);
+}
+.kvmu .u-status[data-tone="attention"] + .u-agent-remedy { border-left-color: var(--u-attention); background: var(--u-attention-soft); }
+
+/* facts: label / value rows */
+.kvmu .u-agent-facts { display: grid; border-top: 1px solid var(--u-line); }
+.kvmu .u-agent-facts > div {
+  display: grid; grid-template-columns: 112px 1fr; gap: 10px; align-items: baseline;
+  padding: 6px 0; border-bottom: 1px solid var(--u-line);
+}
+.kvmu .u-agent-facts dt { color: var(--u-muted); font-size: 12px; }
+.kvmu .u-agent-facts dd { font-weight: 640; font-size: 12.5px; overflow-wrap: anywhere; }
+.kvmu .u-agent-facts dd[data-unknown] { color: var(--u-muted); font-weight: 600; font-style: italic; }
+
+/* readiness ledger: hollow dashed ring = not confirmed, filled = confirmed.
+ * Shape carries the meaning, colour only reinforces it. */
+.kvmu .u-agent-ready { display: grid; gap: 6px; }
+.kvmu .u-agent-ready-head { display: flex; align-items: baseline; justify-content: space-between; gap: 8px; }
+.kvmu .u-agent-ready-head h2 { font-size: 12.5px; font-weight: 720; }
+.kvmu .u-agent-ready-head span { color: var(--u-muted); font-size: 11.5px; font-variant-numeric: tabular-nums; }
+.kvmu .u-agent-ready ul { list-style: none; margin: 0; padding: 0; display: grid; grid-template-columns: 1fr 1fr; gap: 4px 12px; }
+.kvmu .u-agent-ready li { display: grid; grid-template-columns: 16px 1fr; column-gap: 7px; align-items: center; min-width: 0; }
+.kvmu .u-agent-mark {
+  width: 14px; height: 14px; border-radius: 50%; display: grid; place-items: center;
+  border: 1.5px dashed var(--u-line-strong); color: var(--u-on-accent);
+}
+.kvmu .u-agent-ready li[data-confirmed] .u-agent-mark { border: 0; background: var(--u-accent); }
+.kvmu .u-agent-ready-label { font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.kvmu .u-agent-ready li:not([data-confirmed]) .u-agent-ready-label { color: var(--u-muted); }
+.kvmu .u-agent-ready-value { grid-column: 2; font-size: 10.5px; color: var(--u-muted); margin-top: -2px; }
+
+.kvmu .u-agent-quit { display: flex; margin: -6px -6px 0; }
+
+.kvmu .u-agent-foot {
+  display: flex; align-items: center; justify-content: space-between; gap: 10px;
+  padding-top: 10px; border-top: 1px solid var(--u-line);
+}
+.kvmu .u-agent-checked { color: var(--u-muted); font-size: 11.5px; font-variant-numeric: tabular-nums; }
+.kvmu .u-agent-refresh-icon[data-spinning] { animation: u-agent-spin 900ms linear infinite; }
+@keyframes u-agent-spin { to { transform: rotate(360deg); } }
+
+.kvmu .u-agent-details { max-width: none; }
+.kvmu .u-agent-details code { overflow-wrap: anywhere; }
+
+@media (max-width: 340px) {
+  .kvmu .u-agent-ready ul { grid-template-columns: 1fr; }
+  .kvmu .u-agent-facts > div { grid-template-columns: 1fr; gap: 0; }
+}
+
+@media (forced-colors: active) {
+  .kvmu .u-agent-mark { border: 1px solid CanvasText; }
+  .kvmu .u-agent-ready li[data-confirmed] .u-agent-mark { background: Highlight; color: HighlightText; }
+}
