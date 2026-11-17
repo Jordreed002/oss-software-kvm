@@ -1,10 +1,91 @@
 //! Per-user Unix endpoint prototype, including macOS.
 //!
-//! The caller must choose a stable application-owned runtime directory beneath
-//! trusted ancestors. This validates the immediate directory, not every ancestor
-//! against concurrent rename. Peer UID checks establish a user boundary, not
-//! signed application identity. A lifetime lock permits recovery of an owned
-//! socket only after an asynchronous probe confirms connection refusal.
+//! Canonical ancestors must be root/euid-owned and not group/other writable,
+//! except trusted-owned sticky directories. Checks are snapshots, not protection
+//! against malicious same-UID rename/replacement. Peer UID is not code identity.
+//! The lifetime lock and asynchronous stale probe coordinate compliant owners.
+
+#[cfg(target_os = "macos")]
+mod macos_acl;
+
+#[allow(clippy::unnecessary_wraps)] // macOS validation is fallible; keep one call contract.
+fn validate_acl(path: &Path, private: bool) -> io::Result<()> {
+    #[cfg(target_os = "macos")]
+    return macos_acl::validate_path(path, private);
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (path, private);
+        Ok(())
+    }
+}
+
+// Reject the final symlink before canonicalization; system ancestor aliases
+// such as macOS /var are allowed, then only canonical absolute paths are used.
+fn resolve_directory(directory: &Path, uid: u32, create: bool) -> io::Result<PathBuf> {
+    if !directory.is_absolute() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "absolute runtime directory required",
+        ));
+    }
+    // Normalize trailing separators/dots before lstat so a final symlink
+    // cannot be hidden by a trailing slash. Reject parent traversal outright.
+    if directory
+        .components()
+        .any(|part| part == std::path::Component::ParentDir)
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "runtime parent traversal rejected",
+        ));
+    }
+    let normalized: PathBuf = directory.components().collect();
+    let directory = normalized.as_path();
+    if fs::symlink_metadata(directory).is_ok_and(|m| m.file_type().is_symlink()) {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "runtime directory symlink rejected",
+        ));
+    }
+    let parent = directory.parent().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "runtime directory needs a parent",
+        )
+    })?;
+    let name = directory.file_name().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "runtime directory needs a name",
+        )
+    })?;
+    let parent = fs::canonicalize(parent)?;
+    let mut ancestors: Vec<_> = parent.ancestors().collect();
+    ancestors.reverse();
+    for ancestor in ancestors {
+        let metadata = fs::symlink_metadata(ancestor)?;
+        if !metadata.is_dir()
+            || (metadata.uid() != 0 && metadata.uid() != uid)
+            || (metadata.mode() & 0o022 != 0 && metadata.mode() & 0o1000 == 0)
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "untrusted runtime ancestor",
+            ));
+        }
+        validate_acl(ancestor, false)?;
+    }
+    let directory = parent.join(name);
+    if create {
+        match fs::DirBuilder::new().mode(0o700).create(&directory) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+            Err(error) => return Err(error),
+        }
+    }
+    validate_directory(&directory, uid)?;
+    Ok(directory)
+}
 
 use std::os::unix::{
     ffi::OsStrExt,
@@ -32,14 +113,14 @@ fn validate_directory(directory: &Path, uid: u32) -> io::Result<()> {
     if !metadata.is_dir()
         || metadata.file_type().is_symlink()
         || metadata.uid() != uid
-        || metadata.mode() & 0o077 != 0
+        || metadata.mode() & 0o777 != 0o700
     {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
             "runtime directory must be private and user-owned",
         ));
     }
-    Ok(())
+    validate_acl(directory, true)
 }
 
 #[allow(unsafe_code)]
@@ -62,6 +143,8 @@ fn lock_directory(directory: &Path, uid: u32) -> io::Result<fs::File> {
             "runtime lock file rejected",
         ));
     }
+    #[cfg(target_os = "macos")]
+    macos_acl::validate_fd(file.as_raw_fd())?;
     // SAFETY: file owns a valid fd. Nonblocking flock never waits for another
     // agent and is released by the OS when this file/process closes.
     if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
@@ -90,6 +173,7 @@ async fn retire_stale(path: &Path, uid: u32) -> io::Result<()> {
             "existing socket path is not an owned socket",
         ));
     }
+    validate_acl(path, true)?;
     match tokio::time::timeout(
         std::time::Duration::from_millis(100),
         UnixStream::connect(path),
@@ -115,6 +199,7 @@ async fn retire_stale(path: &Path, uid: u32) -> io::Result<()> {
             "stale socket path changed",
         ));
     }
+    validate_acl(path, true)?;
     // The lifetime lock excludes other compliant owners. Same-UID malicious
     // replacement remains outside this prototype's trust model.
     fs::remove_file(path)
@@ -122,7 +207,7 @@ async fn retire_stale(path: &Path, uid: u32) -> io::Result<()> {
 
 /// Connects after validating the private directory, socket and server UID.
 /// This proves a user boundary only. A schema/instance handshake must precede
-/// commands, and trusted ancestors remain a caller precondition.
+/// commands. Ancestor checks cannot exclude malicious same-UID replacement.
 ///
 /// # Errors
 /// Rejects unsafe/replaced socket paths, different peer UIDs and expired or
@@ -144,7 +229,7 @@ pub async fn connect(directory: &Path, budget: std::time::Duration) -> io::Resul
             )
         })?;
     let uid = effective_uid();
-    validate_directory(directory, uid)?;
+    let directory = resolve_directory(directory, uid, false)?;
     let path = directory.join("control.sock");
     let before = fs::symlink_metadata(&path)?;
     if !before.file_type().is_socket() || before.uid() != uid || before.mode() & 0o077 != 0 {
@@ -153,6 +238,7 @@ pub async fn connect(directory: &Path, budget: std::time::Duration) -> io::Resul
             "socket path rejected",
         ));
     }
+    validate_acl(&path, true)?;
     let stream = tokio::time::timeout_at(deadline, UnixStream::connect(&path))
         .await
         .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "socket connection timed out"))??;
@@ -174,11 +260,12 @@ pub async fn connect(directory: &Path, budget: std::time::Duration) -> io::Resul
             "socket path changed while connecting",
         ));
     }
+    validate_acl(&path, true)?;
     Ok(stream)
 }
 
 /// Mode-restricted listener admitting one client at a time.
-/// macOS extended ACL and ancestor validation remain production gates.
+/// Checks canonical ancestors and, on macOS, extended ACLs.
 pub struct UserSocket {
     listener: UnixListener,
     path: PathBuf,
@@ -216,22 +303,11 @@ impl UserSocket {
     ///
     /// # Errors
     /// Rejects untrusted immediate directories, excessive path length, occupied
-    /// paths and native failures. Ancestor trust is a caller precondition.
+    /// paths and native failures. Same-UID replacement remains possible.
     pub async fn bind(directory: &Path) -> io::Result<Self> {
-        if !directory.is_absolute() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "absolute runtime directory required",
-            ));
-        }
         let uid = effective_uid();
-        match fs::DirBuilder::new().mode(0o700).create(directory) {
-            Ok(()) => {}
-            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
-            Err(error) => return Err(error),
-        }
-        validate_directory(directory, uid)?;
-        let lock = lock_directory(directory, uid)?;
+        let directory = resolve_directory(directory, uid, true)?;
+        let lock = lock_directory(&directory, uid)?;
         let path = directory.join("control.sock");
         // Conservative common limit fits macOS sockaddr_un (104 bytes).
         if path.as_os_str().as_bytes().len() > 100 {
@@ -260,6 +336,7 @@ impl UserSocket {
         };
         // Directory privacy protects the bind-to-chmod interval.
         fs::set_permissions(&socket.path, fs::Permissions::from_mode(0o600))?;
+        validate_acl(&socket.path, true)?;
         Ok(socket)
     }
 
@@ -329,6 +406,108 @@ mod tests {
             let _ = fs::remove_file(self.0.join("agent.lock"));
             let _ = fs::remove_dir(&self.0);
         }
+    }
+
+    #[tokio::test]
+    async fn nonsticky_writable_ancestor_is_rejected() {
+        let parent = Directory::new();
+        fs::DirBuilder::new().mode(0o700).create(&parent.0).unwrap();
+        fs::set_permissions(&parent.0, fs::Permissions::from_mode(0o777)).unwrap();
+        let child = parent.0.join("private");
+        assert_eq!(
+            UserSocket::bind(&child).await.unwrap_err().kind(),
+            io::ErrorKind::PermissionDenied
+        );
+        assert!(!child.exists());
+    }
+
+    #[tokio::test]
+    async fn direct_directory_symlink_is_rejected() {
+        let directory = Directory::new();
+        let alias = Directory::new();
+        fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&directory.0)
+            .unwrap();
+        std::os::unix::fs::symlink(&directory.0, &alias.0).unwrap();
+        assert_eq!(
+            UserSocket::bind(&alias.0).await.unwrap_err().kind(),
+            io::ErrorKind::PermissionDenied
+        );
+        assert_eq!(
+            connect(&alias.0, std::time::Duration::from_secs(1))
+                .await
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::PermissionDenied
+        );
+        fs::remove_file(&alias.0).unwrap();
+    }
+
+    #[tokio::test]
+    async fn canonical_trusted_path_and_drop_survive_removed_ancestor_alias() {
+        let parent = Directory::new();
+        let alias = Directory::new();
+        fs::DirBuilder::new().mode(0o700).create(&parent.0).unwrap();
+        std::os::unix::fs::symlink(&parent.0, &alias.0).unwrap();
+        let child = Directory(parent.0.join("private"));
+        let server = UserSocket::bind(&alias.0.join("private")).await.unwrap();
+        let expected = fs::canonicalize(&child.0).unwrap().join("control.sock");
+        assert!(server.path().is_absolute());
+        assert_eq!(server.path(), expected);
+        fs::remove_file(&alias.0).unwrap();
+        let client = connect(&child.0, std::time::Duration::from_secs(1))
+            .await
+            .unwrap();
+        drop(client);
+        drop(server);
+        assert!(!expected.exists());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn private_fixture_acl_policy() {
+        let directory = Directory::new();
+        fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&directory.0)
+            .unwrap();
+        // Only this private fixture is modified; never system directories.
+        let chmod = |args: &[&str]| {
+            assert!(std::process::Command::new("/bin/chmod")
+                .args(args)
+                .arg(&directory.0)
+                .status()
+                .unwrap()
+                .success());
+        };
+        chmod(&["-N"]);
+        validate_acl(&directory.0, true).unwrap(); // NULL/ENOENT means no ACL
+        let file = fs::File::open(&directory.0).unwrap();
+        macos_acl::validate_fd(file.as_raw_fd()).unwrap();
+        assert_eq!(
+            validate_acl(&directory.0.join("missing"), true)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::NotFound
+        );
+        chmod(&["+a", "everyone deny delete"]);
+        validate_acl(&directory.0, false).unwrap();
+        assert_eq!(
+            validate_acl(&directory.0, true).unwrap_err().kind(),
+            io::ErrorKind::PermissionDenied
+        );
+        chmod(&["-N"]);
+        chmod(&["+a", "everyone allow read"]);
+        assert_eq!(
+            validate_acl(&directory.0, false).unwrap_err().kind(),
+            io::ErrorKind::PermissionDenied
+        );
+        assert_eq!(
+            validate_acl(&directory.0, true).unwrap_err().kind(),
+            io::ErrorKind::PermissionDenied
+        );
+        chmod(&["-N"]);
     }
 
     #[tokio::test]

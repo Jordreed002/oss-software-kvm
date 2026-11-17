@@ -1,1 +1,2 @@
 *.rs text eol=lf
+crates/kvm-agent-api/fixtures/** -text

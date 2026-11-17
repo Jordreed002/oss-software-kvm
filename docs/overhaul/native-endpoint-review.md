@@ -29,6 +29,16 @@ Remaining before mutation exposure:
 
 ## Unix and macOS prototype
 
+### Canonical path and ACL review, 2026-11-17
+
+Opus accepted the current canonical ancestor checks, direct symlink refusal and lifetime-lock/stale-recovery ordering for Linux read-only prototype status. The new path checks operate on canonical absolute paths and reject untrusted writable ancestors. Same-UID malicious replacement remains outside this prototype boundary.
+
+The review found that Darwin returns NULL with ENOENT for an existing object without an extended ACL. The initial guard incorrectly rejected that normal case. Coordinator corrected retrieval to clear thread-local errno, accept only NULL/ENOENT as absent ACL, and keep other failures closed. Path checks take metadata before retrieval and recheck device/inode and symlink status afterward, so a vanished path cannot pass as an absent ACL. The lock-file descriptor remains open through its ACL check. The macOS fixture now covers absent directory and descriptor ACLs and missing-path refusal as well as deny/allow policy.
+
+Primary source for absent-ACL behavior: Apple's [ACL retrieval implementation](https://github.com/apple-oss-distributions/Libc/blob/main/posix1e/acl_file.c) and [FILESEC_ACL property lookup](https://github.com/apple-oss-distributions/Libc/blob/main/gen/filesec.c).
+
+After correction, focused Windows tests and strict host/Apple Silicon all-target clippy passed. Linux's fifteen IPC tests and the lifecycle/foundation tests passed again. This does not close native macOS acceptance: execute the ACL fixture and bind/connect tests under the real Darwin temporary directory before claiming macOS runtime support. No mutation exposure is accepted by this checkpoint.
+
 Current integration addendum: `6ccda8d` implements Windows client/server peer PID-to-SID/session checks, session-scoped endpoint names and a bounded verified connector. Coordinator actual-workspace Windows tests pass with 12 cases and strict clippy; the macOS cross-target check also passes. These changes have not yet received the follow-up Opus security review. They establish the implemented account/session checks, not signed binary identity or second-user/Low-IL acceptance. The numbered Windows gates above record the original review and remain open where additional evidence is required.
 
 The Unix listener creates or validates a user-owned directory without group/other permissions, binds a 0600 socket, checks accepted peer UID, limits accepted connections and deletes only its own matching socket inode on Drop. Existing socket paths are never unlinked to obtain ownership.
